@@ -245,6 +245,8 @@ if ($tailMode) {
         $offset -= $termHeight;
     } elseif ($char === 's' || $char === 'S') {
         $offset += $termHeight;
+    } elseif ($char === ' ') {
+        $offset += $termHeight; // Spacebar scrolls one page down
     } elseif ($char === '/') {
         shell_exec('stty sane');
         $searchTerm = getInput("Search (plain text): ");
