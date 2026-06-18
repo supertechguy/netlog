@@ -125,10 +125,10 @@ _MAC_BOLD = [True, True, True, True, False, False, False, False]
 
 def load_oui(path):
     if not path.exists():
-        print("OUI file not found. Downloading from IEEE...", file=sys.stderr)
+        print("OUI file not found. Downloading from Wireshark...", file=sys.stderr)
         try:
             req = urllib.request.Request(
-                "https://standards-oui.ieee.org/oui/oui.txt",
+                "https://www.wireshark.org/download/automated/data/manuf",
                 headers={"User-Agent": "Mozilla/5.0"}
             )
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -139,9 +139,15 @@ def load_oui(path):
     vendors = {}
     with open(path, errors='replace') as f:
         for line in f:
-            m = re.match(r'^([0-9A-F]{6})\s+\(base 16\)\s+(.+)$', line, re.I)
-            if m:
-                vendors[m.group(1).upper()] = m.group(2).strip()
+            if line.startswith('#') or not line.strip():
+                continue
+            # Wireshark manuf format: 00:11:22\tShortName\tFull Vendor Name
+            parts = line.split('\t')
+            if len(parts) >= 2:
+                mac = parts[0].strip().replace(':', '').upper()
+                if len(mac) == 6:  # 24-bit OUI only
+                    name = parts[2].strip() if len(parts) >= 3 else parts[1].strip()
+                    vendors[mac] = name
     return vendors
 
 def load_color_map(path):
