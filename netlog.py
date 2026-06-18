@@ -12,6 +12,11 @@ import hashlib
 import ipaddress
 import urllib.request
 import urllib.parse
+import array
+import mmap
+import gzip
+import os
+import tempfile
 from collections import Counter
 from pathlib import Path
 
@@ -26,6 +31,8 @@ try:
     HAS_GEOIP = True
 except ImportError:
     HAS_GEOIP = False
+
+LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # bytes — above this, use mmap index
 
 SCRIPT_DIR   = Path(__file__).parent
 OUI_FILE     = SCRIPT_DIR / 'oui.txt'
@@ -93,6 +100,19 @@ SEV_LEVEL = {
     'NOTICE':5,'INFO':6,'INFORMATIONAL':6,'DEBUG':7,
 }
 
+# ── Event-type patterns (priority order: deny > error > allow > start > end) ──
+
+_EV_DENY  = re.compile(
+    r'\b(?:den(?:y|ied)|drop(?:ped)?|block(?:ed)?|reject(?:ed)?|refus(?:e|ed)|discard(?:ed)?)\b', re.I)
+_EV_ERROR = re.compile(
+    r'\b(?:err(?:or)?|fail(?:ed|ure)?|invalid|corrupt(?:ed)?)\b', re.I)
+_EV_ALLOW = re.compile(
+    r'\b(?:allow(?:ed)?|permit(?:ted)?|accept(?:ed)?|pass(?:ed)?|forward(?:ed)?)\b', re.I)
+_EV_START = re.compile(
+    r'\b(?:built|start(?:ed)?|open(?:ed)?|established|connect(?:ed)?)\b', re.I)
+_EV_END   = re.compile(
+    r'\b(?:teardown|clos(?:e|ed)|expir(?:e|ed)|terminat(?:ed)?|reset)\b', re.I)
+
 # ── Color constants ───────────────────────────────────────────────────────────
 
 ANSI_MAC    = ['1;31','1;33','1;35','1;36','0;37','0;33','0;36','0;35']
@@ -103,16 +123,27 @@ ANSI_PORT   = '0;33'
 ANSI_IFACE  = '0;35'
 ANSI_SEV    = {0:'1;37;41',1:'1;37;41',2:'1;31',3:'0;31',4:'1;33',5:'0;36',6:'0;32',7:'2;37'}
 
-_P_MAC   = 1   # pairs 1-8
-_P_IP4   = 9
-_P_SRCH  = 10
-_P_STAT  = 11
-_P_KEYS  = 12
-_P_IP6   = 13
-_P_SEV   = 14  # pairs 14-21 (8 severity levels)
-_P_PORT  = 22
-_P_IFACE = 23
-_P_DEDUP = 24
+ANSI_EV_DENY  = '1;31'   # bold red
+ANSI_EV_ERROR = '1;33'   # bold yellow
+ANSI_EV_ALLOW = '1;32'   # bold green
+ANSI_EV_START = '0;36'   # cyan
+ANSI_EV_END   = '2;37'   # dim white
+
+_P_MAC      = 1    # pairs 1-8
+_P_IP4      = 9
+_P_SRCH     = 10
+_P_STAT     = 11
+_P_KEYS     = 12
+_P_IP6      = 13
+_P_SEV      = 14   # pairs 14-21 (8 severity levels)
+_P_PORT     = 22
+_P_IFACE    = 23
+_P_DEDUP    = 24
+_P_EV_DENY  = 25
+_P_EV_ERROR = 26
+_P_EV_ALLOW = 27
+_P_EV_START = 28
+_P_EV_END   = 29
 
 _MAC_CURSES = [
     curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_MAGENTA,
@@ -120,6 +151,22 @@ _MAC_CURSES = [
     curses.COLOR_CYAN, curses.COLOR_MAGENTA,
 ]
 _MAC_BOLD = [True, True, True, True, False, False, False, False]
+
+# (pattern, glyph, ansi_code, curses_pair, bold) — priority: deny > error > allow > start > end
+_EV_TABLE = [
+    (_EV_DENY,  '✗ ', ANSI_EV_DENY,  _P_EV_DENY,  True),
+    (_EV_ERROR, '! ', ANSI_EV_ERROR, _P_EV_ERROR, True),
+    (_EV_ALLOW, '✓ ', ANSI_EV_ALLOW, _P_EV_ALLOW, True),
+    (_EV_START, '↑ ', ANSI_EV_START, _P_EV_START, False),
+    (_EV_END,   '↓ ', ANSI_EV_END,   _P_EV_END,   False),
+]
+
+def _event_type(text):
+    """Return (glyph, ansi, pair, bold) for the first matching event category, or None."""
+    for pat, glyph, ansi, pair, bold in _EV_TABLE:
+        if pat.search(text):
+            return glyph, ansi, pair, bold
+    return None
 
 # ── OUI / color-map ───────────────────────────────────────────────────────────
 
@@ -154,14 +201,17 @@ def load_color_map(path):
     if path.exists():
         try:
             d = json.loads(path.read_text())
-            return d.get('map', {}), d.get('index', 0)
+            return d.get('map', {}), d.get('index', 0), d.get('col_hidden', {})
         except Exception:
             pass
-    return {}, 0
+    return {}, 0, {}
 
-def save_color_map(path, mac_map, idx):
+def save_color_map(path, mac_map, idx, col_hidden=None):
+    data = {'map': mac_map, 'index': idx}
+    if col_hidden:
+        data['col_hidden'] = col_hidden
     try:
-        path.write_text(json.dumps({'map': mac_map, 'index': idx}, indent=2))
+        path.write_text(json.dumps(data, indent=2))
     except OSError:
         pass
 
@@ -394,8 +444,9 @@ def _collect_segments(line, vendors, mac_map, ctr, search_term=None, search_is_r
 # ── ANSI rendering (piped / tail) ─────────────────────────────────────────────
 
 def highlight_ansi(line, vendors, mac_map, ctr, search_term=None, search_is_regex=False):
+    ev   = _event_type(line)
     segs = _collect_segments(line, vendors, mac_map, ctr, search_term, search_is_regex)
-    out  = []
+    out  = [_a(ev[0], ev[1]) if ev else '  ']
     prev = 0
     for s, e, disp, ansi, _pair, _bold in segs:
         out.append(line[prev:s])
@@ -436,11 +487,105 @@ def dedup_lines(lines):
 def as_view(lines):
     return [(l, 1) for l in lines]
 
+# ── Column helpers ────────────────────────────────────────────────────────────
+
+def _file_base(path):
+    """Base name before the first dot: firewall.log.10.gz → firewall"""
+    name = Path(path).name
+    dot  = name.find('.')
+    return name[:dot] if dot != -1 else name
+
+def _strip_cols(text, n):
+    """Remove the first n columns (delimited by runs of space/tab/comma)."""
+    if n <= 0:
+        return text
+    pos = 0
+    L   = len(text)
+    for _ in range(n):
+        while pos < L and text[pos] in ' \t,':
+            pos += 1
+        if pos >= L:
+            return ''
+        while pos < L and text[pos] not in ' \t,':
+            pos += 1
+    while pos < L and text[pos] in ' \t,':
+        pos += 1
+    return text[pos:]
+
+# ── Large-file buffered access ────────────────────────────────────────────────
+
+class LargeFile:
+    """Wraps a huge file with a mmap + byte-offset index so only the visible
+    window is ever held in memory.  Index cost: 8 bytes per line."""
+
+    def __init__(self, path):
+        self._f   = open(path, 'rb')
+        self._mm  = mmap.mmap(self._f.fileno(), 0, access=mmap.ACCESS_READ)
+        size      = len(self._mm)
+        offs      = array.array('Q', [0])
+        pos       = 0
+        while pos < size:
+            nl = self._mm.find(b'\n', pos)
+            if nl == -1:
+                break
+            offs.append(nl + 1)
+            pos = nl + 1
+        # Drop the phantom empty entry produced by a trailing newline
+        if offs and offs[-1] >= size:
+            offs.pop()
+        self._offs = offs
+
+    def __len__(self):
+        return len(self._offs)
+
+    def _line(self, i):
+        start = self._offs[i]
+        end   = self._offs[i + 1] if i + 1 < len(self._offs) else len(self._mm)
+        return self._mm[start:end].rstrip(b'\r\n').decode('utf-8', errors='replace')
+
+    def __getitem__(self, key):
+        n = len(self._offs)
+        if isinstance(key, slice):
+            return [self._line(i) for i in range(*key.indices(n))]
+        if key < 0:
+            key += n
+        return self._line(key)
+
+    def __iter__(self):
+        for i in range(len(self._offs)):
+            yield self._line(i)
+
+    def close(self):
+        self._mm.close()
+        self._f.close()
+
+
+class LargeFileView:
+    """Adapts a LargeFile to the (text, count) tuple interface used by
+    _render and collect_stats, reading only requested lines from disk."""
+
+    def __init__(self, lf):
+        self._lf = lf
+
+    def __len__(self):
+        return len(self._lf)
+
+    def __getitem__(self, key):
+        if isinstance(key, slice):
+            return [(t, 1) for t in self._lf[key]]
+        return (self._lf[key], 1)
+
+    def __iter__(self):
+        for text in self._lf:
+            yield (text, 1)
+
+
 # ── Statistics ────────────────────────────────────────────────────────────────
 
-def collect_stats(view, vendors):
+def collect_stats(view, vendors, progress_cb=None):
     ip4, ip6, macs, ports, sevs = Counter(), Counter(), Counter(), Counter(), Counter()
-    for text, count in view:
+    total = len(view)
+    for i, (text, count) in enumerate(view):
         for m in MAC_RE.finditer(text):
             norm   = m.group().upper().replace(':', '').replace('-', '')
             vendor = vendors.get(norm[:6], 'Unknown')
@@ -459,6 +604,8 @@ def collect_stats(view, vendors):
                     ports[key] += count
         for m in SEV_RE.finditer(text):
             sevs[m.group().upper()] += count
+        if progress_cb and i % 200 == 0:
+            progress_cb(i, total)
     return ip4, ip6, macs, ports, sevs
 
 # ── Curses setup ──────────────────────────────────────────────────────────────
@@ -485,15 +632,34 @@ def _init_colors():
     ]
     for i, (fg, bg) in enumerate(sev_pairs):
         curses.init_pair(_P_SEV + i, fg, bg)
-    curses.init_pair(_P_PORT,  curses.COLOR_YELLOW,  -1)
-    curses.init_pair(_P_IFACE, curses.COLOR_MAGENTA, -1)
-    curses.init_pair(_P_DEDUP, curses.COLOR_BLACK,   curses.COLOR_WHITE)
+    curses.init_pair(_P_PORT,     curses.COLOR_YELLOW,  -1)
+    curses.init_pair(_P_IFACE,    curses.COLOR_MAGENTA, -1)
+    curses.init_pair(_P_DEDUP,    curses.COLOR_BLACK,   curses.COLOR_WHITE)
+    curses.init_pair(_P_EV_DENY,  curses.COLOR_RED,     -1)
+    curses.init_pair(_P_EV_ERROR, curses.COLOR_YELLOW,  -1)
+    curses.init_pair(_P_EV_ALLOW, curses.COLOR_GREEN,   -1)
+    curses.init_pair(_P_EV_START, curses.COLOR_CYAN,    -1)
+    curses.init_pair(_P_EV_END,   curses.COLOR_WHITE,   -1)
 
 # ── Curses line drawing ───────────────────────────────────────────────────────
 
 def _draw_line(win, y, text, count, vendors, mac_map, ctr,
-               search_term, search_is_regex, width, show_ln, linenum, dedup_on):
-    x = 0
+               search_term, search_is_regex, width, show_ln, linenum, dedup_on, hidden_cols=0):
+    # Detect event type from original text BEFORE column stripping so the
+    # glyph still reflects the event even when the keyword column is hidden.
+    ev      = _event_type(text)
+    glyph   = ev[0] if ev else '  '
+    ev_attr = (curses.color_pair(ev[2]) | curses.A_BOLD) if (ev and ev[3]) else \
+              (curses.color_pair(ev[2]) if ev else 0)
+    try:
+        win.addstr(y, 0, glyph, ev_attr)
+    except curses.error:
+        return
+    x = 2  # glyph is always 2 display columns
+
+    if hidden_cols:
+        text = _strip_cols(text, hidden_cols)
+
     if show_ln:
         prefix = f'{linenum+1:6} '
         try:
@@ -542,18 +708,24 @@ def _draw_line(win, y, text, count, vendors, mac_map, ctr,
 # ── Curses status bar ─────────────────────────────────────────────────────────
 
 def _draw_status(win, height, width, term, is_regex, filt, offset, total,
-                 dedup_on, show_ln, alert_pat):
+                 dedup_on, show_ln, alert_pat, large_file=False, hidden_cols=0):
     mode  = "REGEX" if is_regex else "TEXT"
     parts = [f"[Search: {term or 'None'} ({mode})]"]
-    if filt:      parts.append(f"Filter: {filt}")
-    if dedup_on:  parts.append("DEDUP")
-    if show_ln:   parts.append("#")
-    if alert_pat: parts.append(f"ALERT:{alert_pat}")
+    if large_file:  parts.append("[LARGE FILE]")
+    if hidden_cols: parts.append(f"[COLS HIDDEN: {hidden_cols}]")
+    if filt:        parts.append(f"Filter: {filt}")
+    if dedup_on:    parts.append("DEDUP")
+    if show_ln:     parts.append("#")
+    if alert_pat:   parts.append(f"ALERT:{alert_pat}")
     end   = min(offset + height - 2, total)
     line1 = "  ".join(parts) + f"  {offset+1}-{end}/{total}"
-    line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  "
-             "/=text  r=regex  n/p=match  f=filter  "
-             "d=dedup  #=linenum  x=stats  e=export  c=clear  q=quit")
+    if large_file:
+        line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  "
+                 "/=text  r=regex  h/u=hide-col  x=stats  c=clear  q=quit")
+    else:
+        line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  "
+                 "/=text  r=regex  n/p=match  f=filter  "
+                 "d=dedup  #=linenum  h/u=hide-col  x=stats  e=export  c=clear  q=quit")
     try:
         win.addstr(height - 2, 0, line1[:width - 1], curses.color_pair(_P_STAT))
         win.clrtoeol()
@@ -564,7 +736,7 @@ def _draw_status(win, height, width, term, is_regex, filt, offset, total,
 
 # ── Curses full render ────────────────────────────────────────────────────────
 
-def _render(win, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, dedup_on):
+def _render(win, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, dedup_on, hidden_cols=0):
     height, width = win.getmaxyx()
     win.erase()
     for i in range(height - 2):
@@ -573,12 +745,38 @@ def _render(win, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, d
             break
         text, count = view[idx]
         _draw_line(win, i, text, count, vendors, mac_map, ctr,
-                   term, is_regex, width, show_ln, idx, dedup_on)
+                   term, is_regex, width, show_ln, idx, dedup_on, hidden_cols)
 
 # ── Stats popup ───────────────────────────────────────────────────────────────
 
 def _draw_stats(stdscr, view, vendors):
-    ip4, ip6, macs, ports, sevs = collect_stats(view, vendors)
+    height, width = stdscr.getmaxyx()
+    total = len(view)
+
+    if total > 200:
+        bw   = min(50, width - 4)
+        bh   = 5
+        by_  = (height - bh) // 2
+        bx_  = (width  - bw) // 2
+        bwin = curses.newwin(bh, bw, by_, bx_)
+        bar_w = bw - 4
+
+        def _progress(done, tot):
+            pct  = done / tot if tot else 1.0
+            fill = int(pct * bar_w)
+            bwin.erase()
+            bwin.box()
+            bwin.addstr(0, 2, " Computing Statistics ", curses.A_BOLD)
+            bwin.addstr(2, 2, f"[{'#' * fill}{' ' * (bar_w - fill)}]")
+            bwin.addstr(3, 2, f"{int(pct * 100):3d}%  {done:,} / {tot:,} lines")
+            bwin.refresh()
+
+        _progress(0, total)
+        ip4, ip6, macs, ports, sevs = collect_stats(view, vendors, _progress)
+        del bwin
+    else:
+        ip4, ip6, macs, ports, sevs = collect_stats(view, vendors)
+
     height, width = stdscr.getmaxyx()
     pw  = min(72, width - 4)
     ph  = min(38, height - 4)
@@ -649,21 +847,25 @@ def _read_line(stdscr, prompt):
 
 # ── Interactive TUI ───────────────────────────────────────────────────────────
 
-def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None):
+def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, file_base=None):
     _init_colors()
     curses.curs_set(0)
     stdscr.keypad(True)
 
-    filtered = lines[:]
-    dedup_on = False
-    show_ln  = False
-    offset   = 0
-    term     = None
-    is_regex = False
-    matches  = []
-    filt     = None
+    large_file  = isinstance(lines, LargeFile)
+    filtered    = lines if large_file else lines[:]
+    dedup_on    = False
+    show_ln     = False
+    offset      = 0
+    term        = None
+    is_regex    = False
+    matches     = []
+    filt        = None
+    hidden_cols = (col_hidden or {}).get(file_base or '', 0)
 
     def get_view():
+        if large_file:
+            return LargeFileView(lines)
         return dedup_lines(filtered) if dedup_on else as_view(filtered)
 
     view = get_view()
@@ -672,9 +874,9 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None):
         height, width = stdscr.getmaxyx()
         page = max(1, height - 2)
 
-        _render(stdscr, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, dedup_on)
+        _render(stdscr, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, dedup_on, hidden_cols)
         _draw_status(stdscr, height, width, term, is_regex, filt, offset, len(view),
-                     dedup_on, show_ln, alert_pat)
+                     dedup_on, show_ln, alert_pat, large_file, hidden_cols)
         stdscr.refresh()
 
         ch = stdscr.getch()
@@ -698,8 +900,9 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None):
             t = _read_line(stdscr, "Search (plain text): ")
             if t:
                 term, is_regex = t, False
-                matches = find_matches(view, term, False)
-                if matches: offset = matches[0]
+                if not large_file:
+                    matches = find_matches(view, term, False)
+                    if matches: offset = matches[0]
 
         elif ch == ord('r'):
             t = _read_line(stdscr, "Search (regex): ")
@@ -707,8 +910,9 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None):
                 try:
                     re.compile(t, re.I)
                     term, is_regex = t, True
-                    matches = find_matches(view, term, True)
-                    if matches: offset = matches[0]
+                    if not large_file:
+                        matches = find_matches(view, term, True)
+                        if matches: offset = matches[0]
                 except re.error as e:
                     h, w = stdscr.getmaxyx()
                     stdscr.addstr(h - 2, 0, f"Invalid regex: {e}  (press any key)"[:w-1],
@@ -716,69 +920,102 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None):
                     stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
 
         elif ch == ord('n'):
-            if term and matches:
+            if not large_file and term and matches:
                 for ln in matches:
                     if ln > offset: offset = ln; break
 
         elif ch == ord('p'):
-            if term and matches:
+            if not large_file and term and matches:
                 for ln in reversed(matches):
                     if ln < offset: offset = ln; break
 
         elif ch == ord('f'):
-            t = _read_line(stdscr, "Filter (prefix r: for regex): ")
-            if t:
-                filt = t
-                if t.startswith('r:'):
-                    pat = t[2:]
-                    try:
-                        filtered = [l for l in lines if re.search(pat, l, re.I)]
-                    except re.error:
-                        filtered = lines[:]
-                        filt = None
-                else:
-                    tl = t.lower()
-                    filtered = [l for l in lines if tl in l.lower()]
-                view    = get_view()
-                offset  = 0
-                matches = find_matches(view, term, is_regex) if term else []
+            if large_file:
+                h, w = stdscr.getmaxyx()
+                stdscr.addstr(h - 2, 0, "Filter not available in large file mode  (press any key)"[:w-1],
+                              curses.color_pair(_P_STAT))
+                stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
+            else:
+                t = _read_line(stdscr, "Filter (prefix r: for regex): ")
+                if t:
+                    filt = t
+                    if t.startswith('r:'):
+                        pat = t[2:]
+                        try:
+                            filtered = [l for l in lines if re.search(pat, l, re.I)]
+                        except re.error:
+                            filtered = lines[:]
+                            filt = None
+                    else:
+                        tl = t.lower()
+                        filtered = [l for l in lines if tl in l.lower()]
+                    view    = get_view()
+                    offset  = 0
+                    matches = find_matches(view, term, is_regex) if term else []
 
         elif ch == ord('d'):
-            dedup_on = not dedup_on
-            view    = get_view()
-            offset  = max(0, min(offset, max(0, len(view) - 1)))
-            matches = find_matches(view, term, is_regex) if term else []
+            if large_file:
+                h, w = stdscr.getmaxyx()
+                stdscr.addstr(h - 2, 0, "Dedup not available in large file mode  (press any key)"[:w-1],
+                              curses.color_pair(_P_STAT))
+                stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
+            else:
+                dedup_on = not dedup_on
+                view    = get_view()
+                offset  = max(0, min(offset, max(0, len(view) - 1)))
+                matches = find_matches(view, term, is_regex) if term else []
 
         elif ch == ord('#'):
-            show_ln = not show_ln
+            if not large_file:
+                show_ln = not show_ln
 
         elif ch == ord('x'):
             _draw_stats(stdscr, view, vendors)
 
         elif ch == ord('e'):
-            export = 'logview_filtered_export.txt'
-            try:
-                Path(export).write_text('\n'.join(t for t, _ in view))
-                msg = f"Exported {len(view)} lines to {export}  (press any key)"
-            except OSError as e:
-                msg = f"Export failed: {e}  (press any key)"
-            h, w = stdscr.getmaxyx()
-            stdscr.addstr(h - 2, 0, msg[:w-1], curses.color_pair(_P_STAT))
-            stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
+            if large_file:
+                h, w = stdscr.getmaxyx()
+                stdscr.addstr(h - 2, 0, "Export not available in large file mode  (press any key)"[:w-1],
+                              curses.color_pair(_P_STAT))
+                stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
+            else:
+                export = 'logview_filtered_export.txt'
+                try:
+                    Path(export).write_text('\n'.join(t for t, _ in view))
+                    msg = f"Exported {len(view)} lines to {export}  (press any key)"
+                except OSError as e:
+                    msg = f"Export failed: {e}  (press any key)"
+                h, w = stdscr.getmaxyx()
+                stdscr.addstr(h - 2, 0, msg[:w-1], curses.color_pair(_P_STAT))
+                stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
+
+        elif ch == ord('h'):
+            hidden_cols += 1
+
+        elif ch == ord('u'):
+            hidden_cols = max(0, hidden_cols - 1)
 
         elif ch == ord('c'):
-            filtered = lines[:]
-            filt = term = None
-            is_regex = dedup_on = False
-            matches = []; offset = 0
-            view = get_view()
+            if large_file:
+                term = filt = None
+                is_regex = False
+                matches  = []
+                offset   = 0
+            else:
+                filtered = lines[:]
+                filt = term = None
+                is_regex = dedup_on = False
+                matches = []; offset = 0
+                view = get_view()
 
         elif ch == ord('q'):
             break
 
         offset = max(0, min(offset, max(0, len(view) - page)))
 
-    save_color_map(COLOR_FILE, mac_map, ctr[0])
+    if col_hidden is not None and file_base:
+        col_hidden[file_base] = hidden_cols
+    save_color_map(COLOR_FILE, mac_map, ctr[0], col_hidden)
 
 # ── Run modes ─────────────────────────────────────────────────────────────────
 
@@ -791,6 +1028,14 @@ def piped_mode(vendors, mac_map, ctr):
 
 
 def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None):
+    if log_file.name.endswith('.gz'):
+        with gzip.open(log_file, 'rt', errors='replace') as gz:
+            all_lines = gz.read().splitlines()
+        for line in all_lines[-tail_lines_count:]:
+            print(highlight_ansi(line, vendors, mac_map, ctr))
+        save_color_map(COLOR_FILE, mac_map, ctr[0])
+        return   # can't follow a compressed file
+
     all_lines = log_file.read_text(errors='replace').splitlines()
     for line in all_lines[-tail_lines_count:]:
         print(highlight_ansi(line, vendors, mac_map, ctr))
@@ -806,7 +1051,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None)
         try:
             while True:
                 if time.time() - last_reload >= 5:
-                    new_map, _ = load_color_map(COLOR_FILE)
+                    new_map, _, _2 = load_color_map(COLOR_FILE)
                     mac_map.update(new_map)
                     last_reload = time.time()
                 cur_size = log_file.stat().st_size
@@ -879,13 +1124,57 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None)
         save_color_map(COLOR_FILE, mac_map, ctr[0])
 
 
-def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None):
-    all_lines = []
+def _decompress_gz(src):
+    """Decompress a .gz file to a NamedTemporaryFile; caller must delete it."""
+    print(f"Decompressing {src.name}...", file=sys.stderr)
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix='.log')
+    try:
+        with gzip.open(src, 'rb') as gz:
+            while True:
+                chunk = gz.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                tf.write(chunk)
+    finally:
+        tf.close()
+    return Path(tf.name)
+
+
+def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, file_base=None):
+    # Decompress any .gz files to temp files first
+    temps   = []   # temp paths to delete on exit
+    actual  = []   # (real_path, display_path) pairs
     for f in files:
-        if len(files) > 1:
-            all_lines.append(f'{"─"*4} {f} {"─"*4}')
-        all_lines.extend(f.read_text(errors='replace').splitlines())
-    curses.wrapper(_tui, all_lines, vendors, mac_map, ctr, alert_pat)
+        if f.name.endswith('.gz'):
+            tmp = _decompress_gz(f)
+            temps.append(tmp)
+            actual.append((tmp, f))
+        else:
+            actual.append((f, f))
+
+    try:
+        real_files = [r for r, _ in actual]
+        total_size = sum(r.stat().st_size for r in real_files)
+
+        if len(real_files) == 1 and total_size > LARGE_FILE_THRESHOLD:
+            lf = LargeFile(real_files[0])
+            try:
+                curses.wrapper(_tui, lf, vendors, mac_map, ctr, alert_pat, col_hidden, file_base)
+            finally:
+                lf.close()
+        else:
+            all_lines = []
+            for real, disp in actual:
+                if len(actual) > 1:
+                    all_lines.append(f'{"─"*4} {disp} {"─"*4}')
+                all_lines.extend(real.read_text(errors='replace').splitlines())
+            curses.wrapper(_tui, all_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base)
+    finally:
+        for tmp in temps:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -916,7 +1205,7 @@ def main():
     global _GEO_READER
     follow, tail_lines, log_files, alert_pat = parse_args()
     vendors = load_oui(OUI_FILE)
-    mac_map, idx = load_color_map(COLOR_FILE)
+    mac_map, idx, col_hidden = load_color_map(COLOR_FILE)
     ctr = [idx]
 
     cfg = load_config()
@@ -938,7 +1227,8 @@ def main():
         missing = [f for f in log_files if not f.exists()]
         if missing:
             sys.exit(f"File not found: {missing[0]}")
-        interactive_mode(log_files, vendors, mac_map, ctr, alert_pat)
+        file_base = _file_base(log_files[0])
+        interactive_mode(log_files, vendors, mac_map, ctr, alert_pat, col_hidden, file_base)
     else:
         print("Usage: netlog.py [-f] [-n N] [--alert PATTERN] <file> [file2 ...]",
               file=sys.stderr)
