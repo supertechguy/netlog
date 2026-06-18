@@ -553,7 +553,7 @@ def _draw_status(win, height, width, term, is_regex, filt, offset, total,
     line1 = "  ".join(parts) + f"  {offset+1}-{end}/{total}"
     line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  "
              "/=text  r=regex  n/p=match  f=filter  "
-             "d=dedup  #=linenum  S=stats  e=export  c=clear  q=quit")
+             "d=dedup  #=linenum  x=stats  e=export  c=clear  q=quit")
     try:
         win.addstr(height - 2, 0, line1[:width - 1], curses.color_pair(_P_STAT))
         win.clrtoeol()
@@ -752,7 +752,7 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None):
         elif ch == ord('#'):
             show_ln = not show_ln
 
-        elif ch == ord('S'):
+        elif ch == ord('x'):
             _draw_stats(stdscr, view, vendors)
 
         elif ch == ord('e'):
