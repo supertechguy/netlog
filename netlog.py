@@ -7,8 +7,11 @@ import json
 import curses
 import time
 import glob
+import tarfile
+import hashlib
 import ipaddress
 import urllib.request
+import urllib.parse
 from collections import Counter
 from pathlib import Path
 
@@ -24,9 +27,11 @@ try:
 except ImportError:
     HAS_GEOIP = False
 
-SCRIPT_DIR = Path(__file__).parent
-OUI_FILE   = SCRIPT_DIR / 'oui.txt'
-COLOR_FILE = SCRIPT_DIR / 'mac_colors.json'
+SCRIPT_DIR   = Path(__file__).parent
+OUI_FILE     = SCRIPT_DIR / 'oui.txt'
+COLOR_FILE   = SCRIPT_DIR / 'mac_colors.json'
+CONFIG_FILE  = SCRIPT_DIR / 'netlog_config.json'
+GEOIP_DEST   = SCRIPT_DIR / 'GeoLite2-City.mmdb'
 
 # ── Patterns ──────────────────────────────────────────────────────────────────
 
@@ -122,7 +127,11 @@ def load_oui(path):
     if not path.exists():
         print("OUI file not found. Downloading from IEEE...", file=sys.stderr)
         try:
-            with urllib.request.urlopen("http://standards-oui.ieee.org/oui/oui.txt", timeout=30) as r:
+            req = urllib.request.Request(
+                "https://standards-oui.ieee.org/oui/oui.txt",
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
                 path.write_text(r.read().decode('utf-8', errors='replace'))
         except Exception as e:
             print(f"Failed to download OUI file: {e}", file=sys.stderr)
@@ -156,10 +165,26 @@ def mac_color(norm, mac_map, ctr):
         ctr[0] += 1
     return mac_map[norm]
 
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def load_config():
+    if CONFIG_FILE.exists():
+        try:
+            return json.loads(CONFIG_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_config(cfg):
+    try:
+        CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
+    except Exception as e:
+        print(f"Warning: could not save config: {e}", file=sys.stderr)
+
 # ── GeoIP ─────────────────────────────────────────────────────────────────────
 
 GEOIP_PATHS = [
-    SCRIPT_DIR / 'GeoLite2-City.mmdb',
+    GEOIP_DEST,
     SCRIPT_DIR / 'GeoLite2-Country.mmdb',
     Path('/usr/share/GeoIP/GeoLite2-City.mmdb'),
     Path('/usr/share/GeoIP/GeoLite2-Country.mmdb'),
@@ -173,9 +198,77 @@ _GEO_READER = None
 _GEO_CACHE  = {}
 
 
-def load_geoip():
+def _geoip_fetch(account_id, license_key):
+    import io
+    base_url = "https://download.maxmind.com/geoip/databases/GeoLite2-City/download?suffix=tar.gz"
+    sha_url  = base_url + ".sha256"
+    mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+    mgr.add_password(None, "https://download.maxmind.com/", account_id, license_key)
+    opener = urllib.request.build_opener(urllib.request.HTTPBasicAuthHandler(mgr))
+    print("Downloading GeoLite2-City.mmdb...", file=sys.stderr)
+    with opener.open(base_url, timeout=60) as r:
+        data = r.read()
+    with opener.open(sha_url, timeout=15) as r:
+        expected_sha = r.read().decode().split()[0].strip()
+    actual_sha = hashlib.sha256(data).hexdigest()
+    if actual_sha != expected_sha:
+        raise ValueError(f"SHA256 mismatch (got {actual_sha}, expected {expected_sha})")
+    print("SHA256 verified.", file=sys.stderr)
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        for member in tar.getmembers():
+            if member.name.endswith("GeoLite2-City.mmdb"):
+                GEOIP_DEST.write_bytes(tar.extractfile(member).read())
+                print(f"Saved to {GEOIP_DEST}", file=sys.stderr)
+                return True
+    raise FileNotFoundError("GeoLite2-City.mmdb not found inside the downloaded archive.")
+
+
+def update_geoip(cfg, prompt_if_missing=False):
+    """Download or update GeoLite2-City.mmdb using stored or prompted credentials.
+    Returns True if the file is ready, False otherwise."""
+    import datetime
+    today = datetime.date.today().isoformat()
+
+    account_id  = cfg.get("maxmind_account_id", "")
+    license_key = cfg.get("maxmind_license_key", "")
+
+    if not account_id or not license_key:
+        if not prompt_if_missing:
+            return GEOIP_DEST.exists()
+        print("GeoLite2-City.mmdb not found.", file=sys.stderr)
+        print("For help obtaining credentials, see:", file=sys.stderr)
+        print("  https://dev.maxmind.com/geoip/updating-databases/#directly-downloading-databases",
+              file=sys.stderr)
+        try:
+            account_id  = input("MaxMind Account ID: ").strip()
+            license_key = input("MaxMind License Key: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nSkipping GeoIP download.", file=sys.stderr)
+            return False
+        if not account_id or not license_key:
+            print("No credentials provided, skipping GeoIP download.", file=sys.stderr)
+            return False
+        cfg["maxmind_account_id"]  = account_id
+        cfg["maxmind_license_key"] = license_key
+
+    if cfg.get("last_geoip_check") == today and GEOIP_DEST.exists():
+        return True
+
+    try:
+        if _geoip_fetch(account_id, license_key):
+            cfg["last_geoip_check"] = today
+            save_config(cfg)
+            return True
+    except Exception as e:
+        print(f"Failed to download GeoLite2-City.mmdb: {e}", file=sys.stderr)
+    return GEOIP_DEST.exists()
+
+
+def load_geoip(cfg):
     if not HAS_GEOIP:
         return None
+    needs_download = not any(p.exists() for p in GEOIP_PATHS)
+    update_geoip(cfg, prompt_if_missing=needs_download)
     for path in GEOIP_PATHS:
         if path.exists():
             try:
@@ -820,14 +913,11 @@ def main():
     mac_map, idx = load_color_map(COLOR_FILE)
     ctr = [idx]
 
-    _GEO_READER = load_geoip()
-    if _GEO_READER is None:
-        if not HAS_GEOIP:
-            print("GeoIP: install 'maxminddb' for IP location lookup  (pip install maxminddb)",
-                  file=sys.stderr)
-        else:
-            print("GeoIP: place GeoLite2-City.mmdb next to this script or in /usr/share/GeoIP/",
-                  file=sys.stderr)
+    cfg = load_config()
+    _GEO_READER = load_geoip(cfg)
+    if _GEO_READER is None and not HAS_GEOIP:
+        print("GeoIP: install 'maxminddb' for IP location lookup  (pip install maxminddb)",
+              file=sys.stderr)
 
     if not sys.stdin.isatty():
         piped_mode(vendors, mac_map, ctr)
