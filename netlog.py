@@ -1038,6 +1038,24 @@ def piped_mode(vendors, mac_map, ctr):
         save_color_map(COLOR_FILE, mac_map, ctr[0])
 
 
+def _tail_lines(path, n, block=65536):
+    """Read the last n lines of a file without loading it all into memory."""
+    lines = []
+    with open(path, 'rb') as f:
+        f.seek(0, 2)
+        remaining = f.tell()
+        buf = b''
+        while remaining > 0 and len(lines) <= n:
+            read_size = min(block, remaining)
+            remaining -= read_size
+            f.seek(remaining)
+            buf = f.read(read_size) + buf
+            lines = buf.split(b'\n')
+        if lines and lines[-1] == b'':
+            lines.pop()
+    return [l.decode('utf-8', errors='replace') for l in lines[-n:]]
+
+
 def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None):
     if log_file.name.endswith('.gz'):
         with gzip.open(log_file, 'rt', errors='replace') as gz:
@@ -1047,13 +1065,13 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None)
         save_color_map(COLOR_FILE, mac_map, ctr[0])
         return   # can't follow a compressed file
 
-    all_lines = log_file.read_text(errors='replace').splitlines()
-    for line in all_lines[-tail_lines_count:]:
+    tail_lines = _tail_lines(log_file, tail_lines_count)
+    for line in tail_lines:
         print(highlight_ansi(line, vendors, mac_map, ctr))
 
     last_size   = log_file.stat().st_size
     last_reload = time.time()
-    buf         = list(all_lines)
+    buf         = list(tail_lines)
     paused      = False
     alert_re    = re.compile(alert_pat, re.I) if alert_pat else None
 
