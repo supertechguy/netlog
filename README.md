@@ -13,7 +13,7 @@ A terminal network log viewer written in Python. Designed for sysadmins and netw
 - **Interactive TUI** — full-screen curses viewer with search, filter, dedup, stats, column hiding, and export
 - **Large file support** — files over 50 MB are accessed via `mmap` + a byte-offset index so only the visible screen is ever in RAM
 - **Automatic `.gz` decompression** — open compressed logs directly; follow mode handles them gracefully too
-- **Follow mode** — `tail -f`-style real-time monitoring with optional audio/visual alerts
+- **Follow mode** — `tail -f`-style real-time monitoring with optional egrep filter and audio/visual alerts
 - **Piped input** — `cat file.log | netlog.py` works; all highlighting applies
 
 ---
@@ -40,11 +40,12 @@ The OUI vendor database (`oui.txt`) is downloaded automatically from Wireshark o
 ## Usage
 
 ```
-netlog.py <file> [file2 ...]          Interactive TUI viewer
-netlog.py -f <file>                   Follow mode (like tail -f)
-netlog.py -f -n 50 <file>             Follow, showing last 50 lines first
-netlog.py --alert PATTERN <file>      Follow with alert bell on pattern match
-cat file.log | netlog.py              Piped/ANSI mode
+netlog.py <file> [file2 ...]                   Interactive TUI viewer
+netlog.py -f <file>                            Follow mode (like tail -f)
+netlog.py -f -n 50 <file>                      Follow, showing last 50 lines first
+netlog.py -f "pattern" <file>                  Follow, only showing lines matching pattern
+netlog.py -f --alert PATTERN <file>            Follow with alert bell on pattern match
+cat file.log | netlog.py                       Piped/ANSI mode
 ```
 
 Multiple files and shell globs are supported:
@@ -164,10 +165,13 @@ The database is also found automatically if already installed system-wide (commo
 
 ```bash
 netlog.py -f /var/log/firewall.log
+netlog.py -f "deny|drop" /var/log/firewall.log
+netlog.py -f -n 50 "WARN|ERR" /var/log/syslog
 netlog.py -f --alert "DENY" /var/log/firewall.log
 ```
 
 - Displays the last 10 lines (configurable with `-n N`) then streams new lines as they arrive
+- An optional egrep-style filter pattern (extended regex, in quotes) placed **before the filename** limits output to matching lines only — both the initial tail and the live stream are filtered; a `[filter: ...]` header is printed at startup
 - `Space` pauses/resumes the stream
 - `q` quits
 - `--alert PATTERN` triggers a terminal bell and highlights matching lines with `▶` when the pattern matches a new line

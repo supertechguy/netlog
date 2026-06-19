@@ -1057,12 +1057,22 @@ def _tail_lines(path, n, block=65536):
 
 
 def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
-              col_hidden=None, file_base=None):
+              col_hidden=None, file_base=None, egrep_pat=None):
     hidden_cols = (col_hidden or {}).get(file_base or '', 0)
+
+    egrep_re = None
+    if egrep_pat:
+        try:
+            egrep_re = re.compile(egrep_pat)
+        except re.error as e:
+            sys.exit(f"Invalid egrep pattern: {e}")
+        print(_a(f'[filter: {egrep_pat}]', '0;36'), flush=True)
 
     if log_file.name.endswith('.gz'):
         with gzip.open(log_file, 'rt', errors='replace') as gz:
             all_lines = gz.read().splitlines()
+        if egrep_re:
+            all_lines = [l for l in all_lines if egrep_re.search(l)]
         for line in all_lines[-tail_lines_count:]:
             out = _strip_cols(line, hidden_cols) if hidden_cols else line
             print(highlight_ansi(out, vendors, mac_map, ctr))
@@ -1070,6 +1080,8 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
         return   # can't follow a compressed file
 
     tail_lines = _tail_lines(log_file, tail_lines_count)
+    if egrep_re:
+        tail_lines = [l for l in tail_lines if egrep_re.search(l)]
     for line in tail_lines:
         out = _strip_cols(line, hidden_cols) if hidden_cols else line
         print(highlight_ansi(out, vendors, mac_map, ctr))
@@ -1094,6 +1106,8 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                         f.seek(last_size)
                         for raw in f:
                             line = raw.rstrip('\n')
+                            if egrep_re and not egrep_re.search(line):
+                                continue
                             buf.append(line)
                             if len(buf) > 10000: buf.pop(0)
                             out = _strip_cols(line, hidden_cols) if hidden_cols else line
@@ -1152,6 +1166,8 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                     f.seek(last_size)
                     for raw in f:
                         line = raw.rstrip('\n')
+                        if egrep_re and not egrep_re.search(line):
+                            continue
                         buf.append(line)
                         if len(buf) > 10000: buf.pop(0)
                         out = _strip_cols(line, hidden_cols) if hidden_cols else line
@@ -1226,11 +1242,13 @@ def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=No
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    follow     = False
-    tail_lines = 10
-    log_files  = []
-    alert_pat  = None
-    args       = sys.argv[1:]
+    follow      = False
+    tail_lines  = 10
+    log_files   = []
+    alert_pat   = None
+    egrep_pat   = None
+    args        = sys.argv[1:]
+    positionals = []
     i = 0
     while i < len(args):
         a = args[i]
@@ -1241,16 +1259,27 @@ def parse_args():
         elif a == '--alert' and i + 1 < len(args):
             alert_pat = args[i+1]; i += 1
         elif not a.startswith('-'):
-            matches = sorted(glob.glob(a))
-            for p in (matches or [a]):
-                log_files.append(Path(p))
+            positionals.append(a)
         i += 1
-    return follow, tail_lines, log_files, alert_pat
+
+    # In follow mode: if two or more positional args, first is egrep filter, rest are files
+    if follow and len(positionals) >= 2:
+        egrep_pat   = positionals[0]
+        file_args   = positionals[1:]
+    else:
+        file_args   = positionals
+
+    for a in file_args:
+        matches = sorted(glob.glob(a))
+        for p in (matches or [a]):
+            log_files.append(Path(p))
+
+    return follow, tail_lines, log_files, alert_pat, egrep_pat
 
 
 def main():
     global _GEO_READER
-    follow, tail_lines, log_files, alert_pat = parse_args()
+    follow, tail_lines, log_files, alert_pat, egrep_pat = parse_args()
     vendors = load_oui(OUI_FILE)
     mac_map, idx, col_hidden = load_color_map(COLOR_FILE)
     ctr = [idx]
@@ -1265,12 +1294,12 @@ def main():
         piped_mode(vendors, mac_map, ctr)
     elif follow:
         if not log_files:
-            sys.exit("Usage: netlog.py -f [-n N] [--alert PATTERN] <file>")
+            sys.exit('Usage: netlog.py -f [-n N] [--alert PATTERN] ["egrep_pattern"] <file>')
         lf = log_files[0]
         if not lf.exists():
             sys.exit(f"File not found: {lf}")
         file_base = _file_base(lf)
-        tail_mode(lf, tail_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base)
+        tail_mode(lf, tail_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base, egrep_pat)
     elif log_files:
         missing = [f for f in log_files if not f.exists()]
         if missing:
@@ -1278,7 +1307,7 @@ def main():
         file_base = _file_base(log_files[0])
         interactive_mode(log_files, vendors, mac_map, ctr, alert_pat, col_hidden, file_base)
     else:
-        print("Usage: netlog.py [-f] [-n N] [--alert PATTERN] <file> [file2 ...]",
+        print('Usage: netlog.py [-f] [-n N] [--alert PATTERN] ["egrep_pattern"] <file> [file2 ...]',
               file=sys.stderr)
         print("Or:    cat file.log | netlog.py", file=sys.stderr)
         sys.exit(1)
