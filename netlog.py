@@ -128,6 +128,7 @@ ANSI_EV_ERROR = '1;33'   # bold yellow
 ANSI_EV_ALLOW = '1;32'   # bold green
 ANSI_EV_START = '0;36'   # cyan
 ANSI_EV_END   = '2;37'   # dim white
+ANSI_GEO      = '0;32'   # green for geo annotations
 
 _P_MAC      = 1    # pairs 1-8
 _P_IP4      = 9
@@ -144,6 +145,7 @@ _P_EV_ERROR = 26
 _P_EV_ALLOW = 27
 _P_EV_START = 28
 _P_EV_END   = 29
+_P_GEO      = 30
 
 _MAC_CURSES = [
     curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_MAGENTA,
@@ -377,9 +379,9 @@ def _collect_segments(line, vendors, mac_map, ctr, search_term=None, search_is_r
     def overlaps(s, e):
         return any(cs < e and s < ce for cs, ce in covered)
 
-    def add(s, e, disp, ansi, pair, bold=True):
+    def add(s, e, disp, ansi, pair, bold=True, geo=''):
         if not overlaps(s, e):
-            segs.append((s, e, disp, ansi, pair, bold))
+            segs.append((s, e, disp, ansi, pair, bold, geo))
             covered.append((s, e))
 
     # MACs
@@ -392,15 +394,13 @@ def _collect_segments(line, vendors, mac_map, ctr, search_term=None, search_is_r
 
     # IPv4
     for m in IP4_RE.finditer(line):
-        geo  = geo_lookup(m.group())
-        disp = f'{m.group()} ({geo})' if geo else m.group()
-        add(m.start(), m.end(), disp, ANSI_IP4, _P_IP4)
+        geo = geo_lookup(m.group())
+        add(m.start(), m.end(), m.group(), ANSI_IP4, _P_IP4, geo=geo or '')
 
     # IPv6
     for m in IP6_RE.finditer(line):
-        geo  = geo_lookup(m.group())
-        disp = f'{m.group()} ({geo})' if geo else m.group()
-        add(m.start(), m.end(), disp, ANSI_IP6, _P_IP6)
+        geo = geo_lookup(m.group())
+        add(m.start(), m.end(), m.group(), ANSI_IP6, _P_IP6, geo=geo or '')
 
     # Severity
     for m in SEV_RE.finditer(line):
@@ -448,9 +448,11 @@ def highlight_ansi(line, vendors, mac_map, ctr, search_term=None, search_is_rege
     segs = _collect_segments(line, vendors, mac_map, ctr, search_term, search_is_regex)
     out  = [_a(ev[0], ev[1]) if ev else '  ']
     prev = 0
-    for s, e, disp, ansi, _pair, _bold in segs:
+    for s, e, disp, ansi, _pair, _bold, geo in segs:
         out.append(line[prev:s])
         out.append(_a(disp, ansi))
+        if geo:
+            out.append(_a(f' ({geo})', ANSI_GEO))
         prev = e
     out.append(line[prev:])
     return ''.join(out)
@@ -640,6 +642,7 @@ def _init_colors():
     curses.init_pair(_P_EV_ALLOW, curses.COLOR_GREEN,   -1)
     curses.init_pair(_P_EV_START, curses.COLOR_CYAN,    -1)
     curses.init_pair(_P_EV_END,   curses.COLOR_WHITE,   -1)
+    curses.init_pair(_P_GEO,      curses.COLOR_GREEN,   -1)
 
 # ── Curses line drawing ───────────────────────────────────────────────────────
 
@@ -670,7 +673,7 @@ def _draw_line(win, y, text, count, vendors, mac_map, ctr,
 
     segs = _collect_segments(text, vendors, mac_map, ctr, search_term, search_is_regex)
     prev = 0
-    for src_s, src_e, disp, _ansi, pair, bold in segs:
+    for src_s, src_e, disp, _ansi, pair, bold, geo in segs:
         cattr = curses.color_pair(pair) | (curses.A_BOLD if bold else 0)
         chunk = text[prev:src_s]
         if chunk and x < width - 1:
@@ -684,6 +687,14 @@ def _draw_line(win, y, text, count, vendors, mac_map, ctr,
             try:
                 cut = disp[:width - 1 - x]
                 win.addstr(y, x, cut, cattr)
+                x += len(cut)
+            except curses.error:
+                return
+        if geo and x < width - 1:
+            try:
+                geo_text = f' ({geo})'
+                cut = geo_text[:width - 1 - x]
+                win.addstr(y, x, cut, curses.color_pair(_P_GEO))
                 x += len(cut)
             except curses.error:
                 return
