@@ -1056,18 +1056,23 @@ def _tail_lines(path, n, block=65536):
     return [l.decode('utf-8', errors='replace') for l in lines[-n:]]
 
 
-def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None):
+def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
+              col_hidden=None, file_base=None):
+    hidden_cols = (col_hidden or {}).get(file_base or '', 0)
+
     if log_file.name.endswith('.gz'):
         with gzip.open(log_file, 'rt', errors='replace') as gz:
             all_lines = gz.read().splitlines()
         for line in all_lines[-tail_lines_count:]:
-            print(highlight_ansi(line, vendors, mac_map, ctr))
+            out = _strip_cols(line, hidden_cols) if hidden_cols else line
+            print(highlight_ansi(out, vendors, mac_map, ctr))
         save_color_map(COLOR_FILE, mac_map, ctr[0])
         return   # can't follow a compressed file
 
     tail_lines = _tail_lines(log_file, tail_lines_count)
     for line in tail_lines:
-        print(highlight_ansi(line, vendors, mac_map, ctr))
+        out = _strip_cols(line, hidden_cols) if hidden_cols else line
+        print(highlight_ansi(out, vendors, mac_map, ctr))
 
     last_size   = log_file.stat().st_size
     last_reload = time.time()
@@ -1091,7 +1096,8 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None)
                             line = raw.rstrip('\n')
                             buf.append(line)
                             if len(buf) > 10000: buf.pop(0)
-                            colored = highlight_ansi(line, vendors, mac_map, ctr)
+                            out = _strip_cols(line, hidden_cols) if hidden_cols else line
+                            colored = highlight_ansi(out, vendors, mac_map, ctr)
                             if alert_re and alert_re.search(line):
                                 sys.stdout.write('\a')
                                 colored = _a('▶ ', '1;31') + colored
@@ -1104,7 +1110,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None)
             save_color_map(COLOR_FILE, mac_map, ctr[0])
         return
 
-    # Raw-input mode: Space=pause, q=quit
+    # Raw-input mode: Space=pause, h=hide col, u=unhide col, q=quit
     old = termios.tcgetattr(sys.stdin)
     new = termios.tcgetattr(sys.stdin)
     new[3] &= ~(termios.ICANON | termios.ECHO)
@@ -1120,6 +1126,15 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None)
                     label  = "PAUSED (Space to resume)" if paused else "Resumed"
                     sys.stdout.write(f'\r\033[0;33m[{label}]\033[0m\r\n')
                     sys.stdout.flush()
+                elif ch in ('h', 'H'):
+                    hidden_cols += 1
+                    sys.stdout.write(f'\r\033[0;33m[COLS HIDDEN: {hidden_cols}]\033[0m\r\n')
+                    sys.stdout.flush()
+                elif ch in ('u', 'U'):
+                    hidden_cols = max(0, hidden_cols - 1)
+                    label = f'COLS HIDDEN: {hidden_cols}' if hidden_cols else 'All cols shown'
+                    sys.stdout.write(f'\r\033[0;33m[{label}]\033[0m\r\n')
+                    sys.stdout.flush()
                 elif ch in ('q', 'Q', '\x03', '\x04'):
                     break
 
@@ -1127,7 +1142,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None)
                 continue
 
             if time.time() - last_reload >= 5:
-                new_map, _ = load_color_map(COLOR_FILE)
+                new_map, _, _2 = load_color_map(COLOR_FILE)
                 mac_map.update(new_map)
                 last_reload = time.time()
 
@@ -1139,7 +1154,8 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None)
                         line = raw.rstrip('\n')
                         buf.append(line)
                         if len(buf) > 10000: buf.pop(0)
-                        colored = highlight_ansi(line, vendors, mac_map, ctr)
+                        out = _strip_cols(line, hidden_cols) if hidden_cols else line
+                        colored = highlight_ansi(out, vendors, mac_map, ctr)
                         if alert_re and alert_re.search(line):
                             sys.stdout.write('\a')
                             colored = _a('▶ ', '1;31') + colored
@@ -1150,7 +1166,9 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None)
         pass
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old)
-        save_color_map(COLOR_FILE, mac_map, ctr[0])
+        if col_hidden is not None and file_base:
+            col_hidden[file_base] = hidden_cols
+        save_color_map(COLOR_FILE, mac_map, ctr[0], col_hidden)
 
 
 def _decompress_gz(src):
@@ -1251,7 +1269,8 @@ def main():
         lf = log_files[0]
         if not lf.exists():
             sys.exit(f"File not found: {lf}")
-        tail_mode(lf, tail_lines, vendors, mac_map, ctr, alert_pat)
+        file_base = _file_base(lf)
+        tail_mode(lf, tail_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base)
     elif log_files:
         missing = [f for f in log_files if not f.exists()]
         if missing:
