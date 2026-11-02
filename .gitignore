@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Data auto-downloaded / generated at runtime (see README: Persistent State)
+oui.txt
+mac_colors.json
+netlog_config.json
+GeoLite2-City.mmdb
+GeoLite2-Country.mmdb
+logview_filtered_export.txt

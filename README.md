@@ -14,7 +14,7 @@ A terminal network log viewer written in Python. Designed for sysadmins and netw
 - **Large file support** — files over 50 MB are accessed via `mmap` + a byte-offset index so only the visible screen is ever in RAM
 - **Automatic `.gz` decompression** — open compressed logs directly; follow mode handles them gracefully too
 - **Follow mode** — `tail -f`-style real-time monitoring with optional egrep filter and audio/visual alerts
-- **Piped input** — `cat file.log | netlog.py` works; all highlighting applies
+- **Piped input** — `cat file.log | netlog` works; all highlighting applies
 
 ---
 
@@ -27,33 +27,59 @@ A terminal network log viewer written in Python. Designed for sysadmins and netw
 
 ## Installation
 
+### Run in place
+
 ```bash
 git clone <repo>
 cd netlog
-chmod +x netlog.py
+chmod +x netlog
+./netlog <file>
 ```
 
-The OUI vendor database (`oui.txt`) is downloaded automatically from Wireshark on first run.
+### Install so it runs from anywhere
+
+```bash
+git clone <repo>
+cd netlog
+./install.sh              # installs to ~/.local/bin/netlog (no sudo needed)
+./install.sh --system     # installs to /usr/local/bin/netlog instead (may need sudo)
+./install.sh --prefix DIR # installs to DIR/bin/netlog
+```
+
+After installing, make sure the target `bin` directory is on your `PATH` (the
+script tells you if it isn't), then run it as `netlog` from anywhere:
+
+```bash
+netlog /var/log/syslog
+```
+
+The OUI vendor database (`oui.txt`) is downloaded automatically from Wireshark on first run
+(`install.sh` pre-seeds it from this checkout if it's already been downloaded once).
 
 ---
 
 ## Usage
 
 ```
-netlog.py <file> [file2 ...]                   Interactive TUI viewer
-netlog.py -f <file>                            Follow mode (like tail -f)
-netlog.py -f -n 50 <file>                      Follow, showing last 50 lines first
-netlog.py -f "pattern" <file>                  Follow, only showing lines matching pattern
-netlog.py -f --alert PATTERN <file>            Follow with alert bell on pattern match
-cat file.log | netlog.py                       Piped/ANSI mode
+netlog <file> [file2 ...]                   Interactive TUI viewer
+netlog -f <file>                            Follow mode (like tail -f)
+netlog -f -n 50 <file>                      Follow, showing last 50 lines first
+netlog -f "pattern" <file>                  Follow, only showing lines matching pattern
+netlog -f --alert PATTERN <file>            Follow with alert bell on pattern match
+cat file.log | netlog                       Piped/ANSI mode
+netlog --setup-geoip                        Configure (or reconfigure) MaxMind GeoIP
+netlog --version                            Print version and exit
+netlog --help                               Full option reference
 ```
+
+(From a git clone, run it as `./netlog`; once installed via `install.sh`, just `netlog` from any directory.)
 
 Multiple files and shell globs are supported:
 
 ```bash
-netlog.py /var/log/syslog /var/log/kern.log
-netlog.py /var/log/firewall.log*
-netlog.py /var/log/firewall.log.10.gz
+netlog /var/log/syslog /var/log/kern.log
+netlog /var/log/firewall.log*
+netlog /var/log/firewall.log.10.gz
 ```
 
 ---
@@ -142,7 +168,17 @@ GeoIP annotation requires a free MaxMind account and the `maxminddb` package.
 pip install maxminddb
 ```
 
-On first run with a MaxMind account ID and license key, `netlog.py` will offer to download `GeoLite2-City.mmdb` automatically. Credentials are saved to `netlog_config.json` for future updates.
+The first time `netlog` runs interactively (a real terminal, not piped input) with no GeoIP database found anywhere, it asks:
+
+```
+Set up MaxMind GeoIP now? [y/N]
+```
+
+Answer `y` and it prints links to sign up and generate a license key, then prompts for your Account ID and license key and downloads `GeoLite2-City.mmdb`. Credentials are saved to `netlog_config.json` (mode `600`, since it holds a secret) for future updates.
+
+Answer `n` (or just hit enter) and netlog remembers the decline — it won't ask again. Run `netlog --setup-geoip` any time afterward to configure it (or update stored credentials).
+
+netlog never prompts when stdin isn't an interactive terminal (piped input, cron, CI, etc.) — it just runs without GeoIP in that case.
 
 The database is also found automatically if already installed system-wide (common paths under `/usr/share/GeoIP/` and `/var/lib/GeoIP/` are checked).
 
@@ -150,24 +186,33 @@ The database is also found automatically if already installed system-wide (commo
 
 ## Persistent State
 
-`mac_colors.json` (stored next to `netlog.py`) persists:
+netlog's data files — `oui.txt`, `mac_colors.json`, `netlog_config.json`, and `GeoLite2-City.mmdb` — live in a per-user **data directory**, resolved in this order:
+
+1. `$NETLOG_DATA_DIR`, if set
+2. The script's own directory, if it's a dev checkout (i.e. has a `.git` next to it)
+3. `$XDG_DATA_HOME/netlog`, or `~/.local/share/netlog` if `XDG_DATA_HOME` isn't set
+
+Running `netlog` straight from a git clone (as in "Run in place" above) keeps everything next to the script, same as before. An `install.sh`-installed copy has no `.git` next to it, so it automatically uses `~/.local/share/netlog` instead — which also means the install location itself (`/usr/local/bin`, etc.) never needs to be writable after install.
+
+`mac_colors.json` persists:
 
 - MAC address → color assignments (so the same device always gets the same color)
 - Hidden column counts per file base name
 
-`netlog_config.json` persists:
+`netlog_config.json` (permissions `600`) persists:
 
 - MaxMind GeoIP credentials (account ID + license key)
+- Whether GeoIP setup was declined, so netlog doesn't ask again
 
 ---
 
 ## Follow Mode
 
 ```bash
-netlog.py -f /var/log/firewall.log
-netlog.py -f "deny|drop" /var/log/firewall.log
-netlog.py -f -n 50 "WARN|ERR" /var/log/syslog
-netlog.py -f --alert "DENY" /var/log/firewall.log
+netlog -f /var/log/firewall.log
+netlog -f "deny|drop" /var/log/firewall.log
+netlog -f -n 50 "WARN|ERR" /var/log/syslog
+netlog -f --alert "DENY" /var/log/firewall.log
 ```
 
 - Displays the last 10 lines (configurable with `-n N`) then streams new lines as they arrive
@@ -176,18 +221,29 @@ netlog.py -f --alert "DENY" /var/log/firewall.log
 - `q` quits
 - `--alert PATTERN` triggers a terminal bell and highlights matching lines with `▶` when the pattern matches a new line
 - `.gz` files are decompressed and displayed, then exit (compressed files cannot be followed)
+- Log rotation is handled automatically: if the file is truncated or replaced (the usual `logrotate` pattern), netlog detects it and resumes streaming from the start of the new file, printing a `[Log rotated — resuming from new file]` notice
 
 ---
 
 ## Piped Mode
 
 ```bash
-cat /var/log/syslog | netlog.py
-journalctl -f | netlog.py
-ssh host 'tail -f /var/log/auth.log' | netlog.py
+cat /var/log/syslog | netlog
+journalctl -f | netlog
+ssh host 'tail -f /var/log/auth.log' | netlog
 ```
 
 All ANSI highlighting — including event glyphs — is applied to stdout. Color map is updated and saved on exit.
+
+---
+
+## Testing
+
+A small `unittest` suite (stdlib only, no test framework dependency) covers the pure logic — highlighting/segment priority, dedup, column stripping, search, and CLI argument parsing:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
 
 ---
 
@@ -195,12 +251,16 @@ All ANSI highlighting — including event glyphs — is applied to stdout. Color
 
 | File | Purpose |
 |------|---------|
-| `netlog.py` | Main script |
-| `oui.txt` | IEEE OUI vendor database (auto-downloaded) |
-| `mac_colors.json` | Persistent MAC colors and column settings |
-| `netlog_config.json` | GeoIP credentials and other config |
-| `GeoLite2-City.mmdb` | MaxMind GeoIP database (optional, auto-downloaded) |
+| `netlog` | Main script |
+| `install.sh` | Installs `netlog` on PATH |
+| `tests/` | Unit tests (`python3 -m unittest discover -s tests`) |
+| `oui.txt` | IEEE OUI vendor database (auto-downloaded, in the data dir) |
+| `mac_colors.json` | Persistent MAC colors and column settings (in the data dir) |
+| `netlog_config.json` | GeoIP credentials and other config, mode `600` (in the data dir) |
+| `GeoLite2-City.mmdb` | MaxMind GeoIP database (optional, auto-downloaded, in the data dir) |
+
+See [Persistent State](#persistent-state) above for where "the data dir" resolves to.
 
 ---
 
-Copyright 2025 supertechguy.com — GPL
+Copyright 2025 supertechguy.com — [GPLv3](LICENSE)

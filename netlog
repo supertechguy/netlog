@@ -17,6 +17,7 @@ import mmap
 import gzip
 import os
 import tempfile
+import argparse
 from collections import Counter
 from pathlib import Path
 
@@ -32,13 +33,39 @@ try:
 except ImportError:
     HAS_GEOIP = False
 
+VERSION = '1.1.0'
+
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # bytes — above this, use mmap index
 
-SCRIPT_DIR   = Path(__file__).parent
-OUI_FILE     = SCRIPT_DIR / 'oui.txt'
-COLOR_FILE   = SCRIPT_DIR / 'mac_colors.json'
-CONFIG_FILE  = SCRIPT_DIR / 'netlog_config.json'
-GEOIP_DEST   = SCRIPT_DIR / 'GeoLite2-City.mmdb'
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _data_dir():
+    """Where persistent state (OUI db, color map, config, GeoIP db) lives.
+
+    A dev checkout (has .git next to the script) keeps state alongside the
+    script, matching prior behavior. An installed copy (no .git — e.g. one
+    placed in ~/.local/bin or /usr/local/bin by install.sh) uses the XDG
+    data dir instead, since the install location may not be writable and
+    is shared by anyone who installs the script.
+    """
+    override = os.environ.get('NETLOG_DATA_DIR')
+    if override:
+        return Path(override).expanduser()
+    if (SCRIPT_DIR / '.git').exists():
+        return SCRIPT_DIR
+    xdg = os.environ.get('XDG_DATA_HOME')
+    base = Path(xdg).expanduser() if xdg else Path.home() / '.local' / 'share'
+    return base / 'netlog'
+
+
+DATA_DIR = _data_dir()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+OUI_FILE     = DATA_DIR / 'oui.txt'
+COLOR_FILE   = DATA_DIR / 'mac_colors.json'
+CONFIG_FILE  = DATA_DIR / 'netlog_config.json'
+GEOIP_DEST   = DATA_DIR / 'GeoLite2-City.mmdb'
 
 # ── Patterns ──────────────────────────────────────────────────────────────────
 
@@ -236,14 +263,15 @@ def load_config():
 def save_config(cfg):
     try:
         CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
-    except Exception as e:
+        os.chmod(CONFIG_FILE, 0o600)   # holds MaxMind credentials
+    except OSError as e:
         print(f"Warning: could not save config: {e}", file=sys.stderr)
 
 # ── GeoIP ─────────────────────────────────────────────────────────────────────
 
 GEOIP_PATHS = [
     GEOIP_DEST,
-    SCRIPT_DIR / 'GeoLite2-Country.mmdb',
+    DATA_DIR / 'GeoLite2-Country.mmdb',
     Path('/usr/share/GeoIP/GeoLite2-City.mmdb'),
     Path('/usr/share/GeoIP/GeoLite2-Country.mmdb'),
     Path('/var/lib/GeoIP/GeoLite2-City.mmdb'),
@@ -291,12 +319,30 @@ def update_geoip(cfg, prompt_if_missing=False):
     license_key = cfg.get("maxmind_license_key", "")
 
     if not account_id or not license_key:
-        if not prompt_if_missing:
+        if not prompt_if_missing or cfg.get("geoip_setup_declined"):
             return GEOIP_DEST.exists()
-        print("GeoLite2-City.mmdb not found.", file=sys.stderr)
-        print("For help obtaining credentials, see:", file=sys.stderr)
-        print("  https://dev.maxmind.com/geoip/updating-databases/#directly-downloading-databases",
+
+        print("GeoIP lookup can annotate IP addresses with city/country using a free",
               file=sys.stderr)
+        print("MaxMind GeoLite2 account (requires an Account ID + license key).",
+              file=sys.stderr)
+        try:
+            reply = input("Set up MaxMind GeoIP now? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print(file=sys.stderr)
+            reply = 'n'
+
+        if reply not in ('y', 'yes'):
+            cfg["geoip_setup_declined"] = True
+            save_config(cfg)
+            print("Skipping GeoIP setup. Run 'netlog --setup-geoip' to configure it later.",
+                  file=sys.stderr)
+            return False
+
+        print("Sign up for a free account at:", file=sys.stderr)
+        print("  https://www.maxmind.com/en/geolite2/signup", file=sys.stderr)
+        print("Then get your Account ID and generate a license key at:", file=sys.stderr)
+        print("  https://www.maxmind.com/en/accounts/current/license-key", file=sys.stderr)
         try:
             account_id  = input("MaxMind Account ID: ").strip()
             license_key = input("MaxMind License Key: ").strip()
@@ -308,6 +354,7 @@ def update_geoip(cfg, prompt_if_missing=False):
             return False
         cfg["maxmind_account_id"]  = account_id
         cfg["maxmind_license_key"] = license_key
+        cfg.pop("geoip_setup_declined", None)
 
     if cfg.get("last_geoip_check") == today and GEOIP_DEST.exists():
         return True
@@ -322,11 +369,25 @@ def update_geoip(cfg, prompt_if_missing=False):
     return GEOIP_DEST.exists()
 
 
-def load_geoip(cfg):
+def setup_geoip_cmd(cfg):
+    """Handler for `netlog --setup-geoip`: force the interactive credential
+    prompt even if setup was previously declined or already configured."""
+    if not HAS_GEOIP:
+        sys.exit("GeoIP: install the 'maxminddb' package first (pip install maxminddb)")
+    cfg.pop("maxmind_account_id", None)
+    cfg.pop("maxmind_license_key", None)
+    cfg.pop("geoip_setup_declined", None)
+    ok = update_geoip(cfg, prompt_if_missing=True)
+    if ok:
+        print(f"GeoIP ready: {GEOIP_DEST}", file=sys.stderr)
+    sys.exit(0 if ok else 1)
+
+
+def load_geoip(cfg, allow_prompt=True):
     if not HAS_GEOIP:
         return None
     needs_download = not any(p.exists() for p in GEOIP_PATHS)
-    update_geoip(cfg, prompt_if_missing=needs_download)
+    update_geoip(cfg, prompt_if_missing=needs_download and allow_prompt)
     for path in GEOIP_PATHS:
         if path.exists():
             try:
@@ -1056,6 +1117,37 @@ def _tail_lines(path, n, block=65536):
     return [l.decode('utf-8', errors='replace') for l in lines[-n:]]
 
 
+def _read_new_lines(log_file, state):
+    """Read lines appended to log_file since the last call, updating state
+    in place. Detects log rotation (truncation, or the path replaced by a
+    new inode — the common logrotate pattern) and transparently restarts
+    from the beginning of the new file in that case.
+
+    state is a dict with 'size' and 'ino' keys. Returns (new_lines, rotated).
+    """
+    try:
+        st = log_file.stat()
+    except FileNotFoundError:
+        return [], False   # mid-rotation gap; file will reappear shortly
+
+    rotated = st.st_ino != state['ino'] or st.st_size < state['size']
+    if rotated:
+        state['size'] = 0
+        state['ino']  = st.st_ino
+
+    if st.st_size <= state['size']:
+        state['size'] = st.st_size
+        return [], rotated
+
+    lines = []
+    with open(log_file, errors='replace') as f:
+        f.seek(state['size'])
+        for raw in f:
+            lines.append(raw.rstrip('\n'))
+    state['size'] = st.st_size
+    return lines, rotated
+
+
 def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
               col_hidden=None, file_base=None, egrep_pat=None):
     hidden_cols = (col_hidden or {}).get(file_base or '', 0)
@@ -1086,7 +1178,8 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
         out = _strip_cols(line, hidden_cols) if hidden_cols else line
         print(highlight_ansi(out, vendors, mac_map, ctr))
 
-    last_size   = log_file.stat().st_size
+    st          = log_file.stat()
+    state       = {'size': st.st_size, 'ino': st.st_ino}
     last_reload = time.time()
     buf         = list(tail_lines)
     paused      = False
@@ -1100,23 +1193,20 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                     new_map, _, _2 = load_color_map(COLOR_FILE)
                     mac_map.update(new_map)
                     last_reload = time.time()
-                cur_size = log_file.stat().st_size
-                if cur_size > last_size:
-                    with open(log_file, errors='replace') as f:
-                        f.seek(last_size)
-                        for raw in f:
-                            line = raw.rstrip('\n')
-                            if egrep_re and not egrep_re.search(line):
-                                continue
-                            buf.append(line)
-                            if len(buf) > 10000: buf.pop(0)
-                            out = _strip_cols(line, hidden_cols) if hidden_cols else line
-                            colored = highlight_ansi(out, vendors, mac_map, ctr)
-                            if alert_re and alert_re.search(line):
-                                sys.stdout.write('\a')
-                                colored = _a('▶ ', '1;31') + colored
-                            print(colored, flush=True)
-                    last_size = cur_size
+                new_lines, rotated = _read_new_lines(log_file, state)
+                if rotated:
+                    sys.stdout.write('\r\033[0;33m[Log rotated — resuming from new file]\033[0m\r\n')
+                for line in new_lines:
+                    if egrep_re and not egrep_re.search(line):
+                        continue
+                    buf.append(line)
+                    if len(buf) > 10000: buf.pop(0)
+                    out = _strip_cols(line, hidden_cols) if hidden_cols else line
+                    colored = highlight_ansi(out, vendors, mac_map, ctr)
+                    if alert_re and alert_re.search(line):
+                        sys.stdout.write('\a')
+                        colored = _a('▶ ', '1;31') + colored
+                    print(colored, flush=True)
                 time.sleep(0.2)
         except KeyboardInterrupt:
             pass
@@ -1160,23 +1250,20 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                 mac_map.update(new_map)
                 last_reload = time.time()
 
-            cur_size = log_file.stat().st_size
-            if cur_size > last_size:
-                with open(log_file, errors='replace') as f:
-                    f.seek(last_size)
-                    for raw in f:
-                        line = raw.rstrip('\n')
-                        if egrep_re and not egrep_re.search(line):
-                            continue
-                        buf.append(line)
-                        if len(buf) > 10000: buf.pop(0)
-                        out = _strip_cols(line, hidden_cols) if hidden_cols else line
-                        colored = highlight_ansi(out, vendors, mac_map, ctr)
-                        if alert_re and alert_re.search(line):
-                            sys.stdout.write('\a')
-                            colored = _a('▶ ', '1;31') + colored
-                        print(colored, flush=True)
-                last_size = cur_size
+            new_lines, rotated = _read_new_lines(log_file, state)
+            if rotated:
+                sys.stdout.write('\r\033[0;33m[Log rotated — resuming from new file]\033[0m\r\n')
+            for line in new_lines:
+                if egrep_re and not egrep_re.search(line):
+                    continue
+                buf.append(line)
+                if len(buf) > 10000: buf.pop(0)
+                out = _strip_cols(line, hidden_cols) if hidden_cols else line
+                colored = highlight_ansi(out, vendors, mac_map, ctr)
+                if alert_re and alert_re.search(line):
+                    sys.stdout.write('\a')
+                    colored = _a('▶ ', '1;31') + colored
+                print(colored, flush=True)
 
     except KeyboardInterrupt:
         pass
@@ -1241,51 +1328,71 @@ def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=No
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
-def parse_args():
-    follow      = False
-    tail_lines  = 10
-    log_files   = []
-    alert_pat   = None
-    egrep_pat   = None
-    args        = sys.argv[1:]
-    positionals = []
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == '-f':
-            follow = True
-        elif a == '-n' and i + 1 < len(args) and args[i+1].isdigit():
-            tail_lines = int(args[i+1]); i += 1
-        elif a == '--alert' and i + 1 < len(args):
-            alert_pat = args[i+1]; i += 1
-        elif not a.startswith('-'):
-            positionals.append(a)
-        i += 1
+def build_arg_parser():
+    p = argparse.ArgumentParser(
+        prog='netlog',
+        description='Terminal network log viewer with MAC/IP/syslog highlighting.',
+        epilog=(
+            'Examples:\n'
+            '  netlog /var/log/syslog                 Interactive TUI viewer\n'
+            '  netlog -f /var/log/syslog               Follow mode (like tail -f)\n'
+            '  netlog -f -n 50 /var/log/syslog          Follow, last 50 lines first\n'
+            '  netlog -f "deny|drop" /var/log/fw.log    Follow, egrep-filtered\n'
+            '  netlog -f --alert DENY /var/log/fw.log   Follow with alert bell\n'
+            '  cat file.log | netlog                    Piped/ANSI mode\n'
+            '  netlog --setup-geoip                     Configure MaxMind GeoIP'
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument('-f', dest='follow', action='store_true',
+                    help='Follow mode (tail -f style)')
+    p.add_argument('-n', dest='tail_lines', type=int, default=10, metavar='N',
+                    help='Lines to show initially in follow mode (default: 10)')
+    p.add_argument('--alert', dest='alert_pat', metavar='PATTERN',
+                    help='Bell + highlight new lines matching this regex in follow mode')
+    p.add_argument('--setup-geoip', dest='setup_geoip', action='store_true',
+                    help='Configure (or reconfigure) MaxMind GeoIP credentials, then exit')
+    p.add_argument('--version', action='version', version=f'netlog {VERSION}')
+    p.add_argument('args', nargs='*', metavar='FILE',
+                    help='Log file(s) to view; shell globs are supported. In follow mode, '
+                         'if two or more FILE arguments are given, the first is treated as '
+                         'an egrep-style filter pattern instead of a filename.')
+    return p
 
-    # In follow mode: if two or more positional args, first is egrep filter, rest are files
-    if follow and len(positionals) >= 2:
-        egrep_pat   = positionals[0]
-        file_args   = positionals[1:]
+
+def parse_args(argv=None):
+    ns = build_arg_parser().parse_args(argv)
+
+    positionals = ns.args
+    if ns.follow and len(positionals) >= 2:
+        egrep_pat, *file_args = positionals
     else:
-        file_args   = positionals
+        egrep_pat, file_args = None, positionals
 
+    log_files = []
     for a in file_args:
         matches = sorted(glob.glob(a))
         for p in (matches or [a]):
             log_files.append(Path(p))
 
-    return follow, tail_lines, log_files, alert_pat, egrep_pat
+    return ns.follow, ns.tail_lines, log_files, ns.alert_pat, egrep_pat, ns.setup_geoip
 
 
 def main():
     global _GEO_READER
-    follow, tail_lines, log_files, alert_pat, egrep_pat = parse_args()
+    follow, tail_lines, log_files, alert_pat, egrep_pat, setup_geoip = parse_args()
     vendors = load_oui(OUI_FILE)
     mac_map, idx, col_hidden = load_color_map(COLOR_FILE)
     ctr = [idx]
 
     cfg = load_config()
-    _GEO_READER = load_geoip(cfg)
+
+    if setup_geoip:
+        setup_geoip_cmd(cfg)   # exits the process
+
+    # Never prompt interactively when stdin isn't a real terminal — e.g. piped
+    # log input, cron, or CI would otherwise have input() read from the pipe.
+    _GEO_READER = load_geoip(cfg, allow_prompt=sys.stdin.isatty())
     if _GEO_READER is None and not HAS_GEOIP:
         print("GeoIP: install 'maxminddb' for IP location lookup  (pip install maxminddb)",
               file=sys.stderr)
@@ -1294,7 +1401,7 @@ def main():
         piped_mode(vendors, mac_map, ctr)
     elif follow:
         if not log_files:
-            sys.exit('Usage: netlog.py -f [-n N] [--alert PATTERN] ["egrep_pattern"] <file>')
+            sys.exit('Usage: netlog -f [-n N] [--alert PATTERN] ["egrep_pattern"] <file>')
         lf = log_files[0]
         if not lf.exists():
             sys.exit(f"File not found: {lf}")
@@ -1307,9 +1414,9 @@ def main():
         file_base = _file_base(log_files[0])
         interactive_mode(log_files, vendors, mac_map, ctr, alert_pat, col_hidden, file_base)
     else:
-        print('Usage: netlog.py [-f] [-n N] [--alert PATTERN] ["egrep_pattern"] <file> [file2 ...]',
+        print('Usage: netlog [-f] [-n N] [--alert PATTERN] ["egrep_pattern"] <file> [file2 ...]',
               file=sys.stderr)
-        print("Or:    cat file.log | netlog.py", file=sys.stderr)
+        print("Or:    cat file.log | netlog", file=sys.stderr)
         sys.exit(1)
 
 
