@@ -8,6 +8,7 @@ import curses
 import time
 import glob
 import tarfile
+import textwrap
 import hashlib
 import ipaddress
 import urllib.request
@@ -19,6 +20,7 @@ import os
 import tempfile
 import argparse
 import collections
+import csv
 import datetime
 import functools
 from collections import Counter, namedtuple
@@ -36,7 +38,7 @@ try:
 except ImportError:
     HAS_GEOIP = False
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # bytes — above this, use mmap index
 
@@ -1382,6 +1384,9 @@ _FAIL_WORD = re.compile(
 # Event-name → lifecycle kind, first match wins. Idle/session timeouts are a
 # normal disconnect, not a failure, so they're checked before the failure rule.
 _KIND_RULES = [
+    ('reboot',     re.compile(r'^ap[A-Z]\w*[Rr]eboot')),
+    ('ap_down',    re.compile(r'^ap[A-Z]\w*(?:[Ll]ost|[Dd]isconnect|[Dd]own|[Oo]ffline|[Hh]eartbeat)')),
+    ('ap_up',      re.compile(r'^ap[A-Z]\w*(?:[Jj]oin|[Cc]onnected|[Oo]nline|[Dd]iscovery)')),
     ('disconnect', re.compile(r'idle|sessiontimeout|session_timeout', re.I)),
     ('failure',    _FAIL_WORD),
     ('disconnect', re.compile(r'disconnect|deauth|disassoc|leave|left\b|logout|logoff|expir', re.I)),
@@ -1456,8 +1461,8 @@ def parse_timestamp(line, fields=None):
         t = None
     if t is None and fields:
         v = fields.get('epoch', '')
-        if v.isdigit() and len(v) in (10, 13):
-            t = int(v) / (1000 if len(v) == 13 else 1)
+        if v.isdigit() and len(v) in (10, 13, 16, 19):
+            t = int(v) / 10 ** (len(v) - 10)      # s, ms, µs or ns
     return t
 
 
@@ -1500,11 +1505,11 @@ def _bsd_epoch(text):
 
 
 _HAS_ALPHA  = re.compile(r'[A-Za-z]')
-ParsedEvent = namedtuple('ParsedEvent', 'name fields kind ts')
+ParsedEvent = namedtuple('ParsedEvent', 'name fields kind ts fmt vsev', defaults=('kv', None))
 
 
-def _parse_event(line):
-    """Parse a key=value log line into a ParsedEvent, or None if it isn't one.
+def _parse_generic(line):
+    """Parse a generic key=value log line into a ParsedEvent, or None.
 
     A line counts as a structured event when it has at least one key=value
     pair AND either an event name or a client/AP/user field. The returned
@@ -1548,7 +1553,1901 @@ def _parse_event(line):
     status = fields.get('status', '')
     if status and _FAIL_WORD.search(status):
         kind = 'failure'                  # e.g. clientAuthorization result="failure"
+    _, host = syslog_header(line)
+    if host:
+        fields['host'] = intern(host)
     return ParsedEvent(name, fields, kind, parse_timestamp(line, fields))
+
+
+# ── Vendor log formats ────────────────────────────────────────────────────────
+#
+# Each LogFormat recognises one vendor's syslog layout and turns a line into
+# canonical fields + an event kind. Detection is per line (a file can mix
+# sources), cheapest checks first, and the format that matched the previous
+# line is tried first since logs usually come in runs from one source.
+#
+# Canonical fields (all optional):
+#   host, client_mac, client_ip, user, ap_name, ap_mac, ap_loc, ssid, rssi,
+#   src_ip, dst_ip, src_port, dst_port, proto, action, rule, iface, vlan,
+#   neighbor, peer, reason, status, signature, threat_sev, msg
+#
+# Event kinds and what they mean:
+#   wireless/NAC : failure join auth roam disconnect ap_down ap_up
+#   firewall     : deny allow session threat
+#   admin        : login_fail login logout config
+#   switching    : link_down link_up err_disable loop stp violation port_error poe
+#   routing      : neighbor_down neighbor_up failover
+#   other        : vpn_down vpn_up service_down service_up hw reboot
+
+KIND_SEVERITY = {
+    'failure': 'error', 'join': 'success', 'auth': 'success', 'roam': 'info',
+    'disconnect': 'info', 'ap_down': 'error', 'ap_up': 'success',
+    'deny': 'warning', 'allow': 'info', 'session': 'info', 'threat': 'error',
+    'login_fail': 'warning', 'login': 'success', 'logout': 'info', 'config': 'info',
+    'link_down': 'warning', 'link_up': 'success', 'err_disable': 'error',
+    'loop': 'error', 'stp': 'warning', 'violation': 'warning', 'port_error': 'warning',
+    'poe': 'warning', 'neighbor_down': 'error', 'neighbor_up': 'success',
+    'failover': 'warning', 'vpn_down': 'error', 'vpn_up': 'success',
+    'service_down': 'error', 'service_up': 'success', 'hw': 'warning', 'reboot': 'warning',
+}
+# Kinds whose severity follows the device's own syslog level when it gives one
+# (environment messages range from informational to critical).
+_VENDOR_SEV_KINDS = {'hw', 'stp', 'poe', 'reboot', 'failover', 'port_error', 'threat'}
+
+SEV_NAMES = {
+    'emerg': 0, 'emergency': 0, 'emer': 0, 'emrg': 0, 'panic': 0,
+    'alert': 1, 'alrt': 1,
+    'crit': 2, 'critical': 2, 'very-high': 2,
+    'err': 3, 'error': 3, 'errs': 3, 'erro': 3, 'high': 3,
+    'warn': 4, 'warning': 4, 'medium': 4,
+    'notice': 5, 'noti': 5, 'low': 5,
+    'info': 6, 'informational': 6, 'information': 6, 'summ': 6,
+    'debug': 7, 'dbug': 7, 'verb': 7,
+}
+
+
+def vendor_sev_tier(n):
+    """Syslog severity 0-7 → 'error' | 'warning' | 'info'."""
+    if n is None:
+        return None
+    return 'error' if n <= 3 else ('warning' if n == 4 else 'info')
+
+
+_PROTO_NUM = {'1': 'icmp', '6': 'tcp', '17': 'udp', '47': 'gre', '50': 'esp', '58': 'ipv6-icmp'}
+
+# ── Shared text classification ────────────────────────────────────────────────
+# Used by the formats that give a message tag (Cisco mnemonics, Junos tags,
+# Comware/Huawei modules, EXOS conditions) plus free text. Ordered; first hit
+# wins. Each rule: (kind or callable(msg)->kind, tag regex, message regex).
+
+_DOWN_UP = re.compile(r'\b(down|up|off-?line|on-?line|disabled|enabled)\b', re.I)
+
+
+def _updown(msg, down, up):
+    """Kind from the LAST up/down word in msg ('changed state to down')."""
+    hits = _DOWN_UP.findall(msg)
+    if not hits:
+        return None
+    w = hits[-1].lower()
+    return down if w in ('down', 'offline', 'off-line', 'disabled') else up
+
+
+_NBR_DOWN_RE = re.compile(
+    r'\b(?:down|idle|active|connect|init|exstart|dead|reset|closed?|lost|expired|'
+    r'notification|hold ?timer|backwardtransition)\b', re.I)
+_NBR_UP_RE = re.compile(r'(?:to|state)\s+(?:full|established|up)\b|\bis up\b|\bUp\b', re.I)
+
+
+def _neighbor_kind(msg):
+    m = re.search(r'\bto\s+(\w+)', msg, re.I)       # "from FULL to DOWN", "to Established"
+    if m:
+        tgt = m.group(1).lower()
+        if tgt in ('full', 'established', 'up', 'twoway', '2way'):
+            return 'neighbor_up'
+        return 'neighbor_down'
+    if _NBR_UP_RE.search(msg):
+        return 'neighbor_up'
+    if _NBR_DOWN_RE.search(msg):
+        return 'neighbor_down'
+    return None
+
+
+_TEXT_RULES = [
+    # L2 problems first: they often also say "down"/"disabled".
+    ('err_disable', r'ERR_?DISABLE|ERRDISABLE', r'err-?disable'),
+    ('loop',        r'BPDU_?GUARD|BPDUGUARD|LOOP|MACFLAP|MAC_?FLAP|MAC_?MOVE|STORM',
+                    r'loop[- ]?(?:detect|protect)|flapping between port|mac[- ]?(?:move|flap)|'
+                    r'bpdu ?guard|broadcast storm|storm[- ]control'),
+    ('violation',   r'PSECURE|PORT_?SECURITY|DHCP_SNOOPING|SW_DAI|DUPADDR|IP_?CONFLICT|'
+                    r'ARP_?INSPECT|DUPLICATE_IP|ROGUE',
+                    r'security violation|duplicate (?:ip|address)|address conflict|'
+                    r'snooping.*(?:drop|deny)|rogue'),
+    ('port_error',  r'DUPLEX_MISMATCH|NATIVE_VLAN_MISMATCH|CRC|FCS|BADFRAME|FFI',
+                    r'duplex mismatch|native vlan mismatch|crc error|excessive|'
+                    r'high collision|drop rate'),
+    (_neighbor_kind, r'ADJCHG|ADJCHANGE|NBRCHANGE|NBR_?CHG|NBRDOWN|NBRUP|ADJDOWN|ADJUP|'
+                     r'NEIGHBOR|BGP_|BGP-|OSPF|EIGRP|DUAL-|ISIS|LDP|BFD|PEER_?STATE',
+                     r'\b(?:bgp|ospf|eigrp|is-is|isis|ldp|bfd) (?:neighbor|peer|adjacency)|'
+                     r'\bneighbor \S+ (?:up|down)'),
+    ('poe',         r'ILPOWER|POE|PSE_|POWER_DENY', r'\bpoe\b|power over ethernet|inline power'),
+    ('hw',          r'ENVMON|PLATFORM_ENV|ENVIRONMENT|PSU|POWER_?SUPPLY|\bFAN|_FAN|TEMP|'
+                    r'THERMAL|FRU|CHASSISD|ENV_|TRANSCEIVER|SFP',
+                    r'\bfan\b|power supply|temperature|overheat|thermal|transceiver'),
+    ('failover',    r'STANDBY|HSRP|VRRP|FAILOVER|REDUNDANCY|HA_|_HA\b',
+                    r'failover|became (?:active|master)|state change.*(?:active|standby|master)'),
+    ('service_down', r'RADIUS_?DEAD|SERVER_?DEAD|AAA.*DOWN|NOT_?RESPOND',
+                     r'radius server .*(?:dead|down|not respond)|server .* is (?:dead|down)|'
+                     r'aaa server down'),
+    ('service_up',  r'RADIUS_?ALIVE|SERVER_?ALIVE', r'radius server .*(?:alive|up)'),
+    ('login_fail',  r'LOGIN_?FAIL|LOGINFAIL|AUTH_?FAIL.*(?:USER|LOGIN)|USERAUTH_?FAIL|'
+                    r'INVALID_?USER|SSHD_LOGIN_FAILED|SSH_USER_LOGIN_FAIL',
+                    r'login (?:failed|failure|incorrect)|failed password|invalid (?:user|password)|'
+                    r'authentication failed for (?:user|admin)|user .* failed to log ?in|'
+                    r'access denied for user|bad password'),
+    ('login',       r'LOGIN_?SUCCESS|UI_AUTH_EVENT|USER_LOGIN\b|SHELL_LOGIN\b|SSH_USER_LOGIN\b',
+                    r'logged in|login success|accepted (?:password|publickey)|'
+                    r'session - manager mode|session opened for user'),
+    ('logout',      r'LOGOUT|LOGOFF', r'logged out|logout|session closed for user'),
+    ('config',      r'CONFIG_I|CFGLOG|UI_COMMIT|CMDRECORD|CONFIG_?CHANGE|CFG_?CHANGE|'
+                    r'_CONFIG\b|CONFIG$',
+                    r'configured from|commit (?:complete|operation)|configuration (?:changed|saved)|'
+                    r'running[- ]config|startup[- ]config'),
+    ('reboot',      r'RESTART|RELOAD|REBOOT|COLDSTART|WARMSTART|SYS_?START',
+                    r'\b(?:reboot|reload|restart)(?:ed|ing)?\b|cold ?start|system (?:is )?starting'),
+    ('stp',         r'SPANTREE|\bSTP|_STP|MSTP|RSTP|TOPO', r'spanning[- ]tree|\bstp\b|topology change'),
+    (lambda m: 'vpn_down' if re.search(r'down|fail|delet|terminat|expire|abort|lost', m, re.I)
+     else ('vpn_up' if re.search(r'\bup\b|establish|complet|creat', m, re.I) else None),
+                    r'VPN|IKE|IPSEC|ISAKMP|CRYPTO|TUNNEL|KMD',
+                    r'\b(?:ipsec|ike|vpn|tunnel)\b'),
+    # Wireless / NAC lifecycle
+    ('ap_down',     None, r'\bap\b.*(?:disjoin|disconnect|lost|went down|is down|offline|'
+                          r'heartbeat)|access point .* (?:down|offline|disconnected)'),
+    ('ap_up',       None, r'\bap\b.*(?:\bjoined|connected|is up|online)|access point .* '
+                          r'(?:up|online|connected)'),
+    ('failure',     r'DOT1X|MAB|AUTHMGR|SESSION_MGR|EAP|RADIUS|WEBAUTH|CLIENT_EXCLUSION|'
+                    r'APF|DOT11',
+                    r'fail|reject|timeout|timed out|excluded|unable|invalid|denied|mismatch'),
+    ('auth',        r'DOT1X|MAB|AUTHMGR|SESSION_MGR|EAP|RADIUS|WEBAUTH|CLIENT_ORCH',
+                    r'success|authoriz|authenticated|run state|joined'),
+    ('disconnect',  None, r'deauth|disassoc|disconnect'),
+    ('roam',        None, r'\broam'),
+    ('join',        None, r'\bassociat|joined'),
+    # Physical links last: "down"/"up" alone is weak evidence.
+    (lambda m: _updown(m, 'link_down', 'link_up'),
+                    r'UPDOWN|LINK|IF_DOWN|IF_UP|PHY|PORT_?STATE|OSTATE|LINEPROTO|PORTLINK|'
+                    r'IFNET|ETHPORT|IF_STATE',
+                    r'\b(?:interface|port|link|line protocol)\b.*\b(?:up|down|on-?line|off-?line)\b'),
+]
+# Kinds that need BOTH a matching tag and matching text when the source has
+# tags: "failed" alone in some %SYS-3-... message is not a client auth failure.
+_TAG_AND_TEXT = {'failure', 'auth'}
+_TEXT_RULES = [(k, re.compile(t) if t else None, re.compile(m, re.I) if m else None)
+               for k, t, m in _TEXT_RULES]
+
+
+def classify_text(tag, msg):
+    """Event kind from a vendor tag (e.g. 'LINK-UPDOWN', 'RPD_OSPF_NBRDOWN')
+    and/or message text, or None."""
+    tag = (tag or '').upper()
+    for kind, tag_re, msg_re in _TEXT_RULES:
+        if kind in _TAG_AND_TEXT and tag:
+            hit = (tag_re is not None and tag_re.search(tag)) and \
+                  (msg_re is not None and msg and msg_re.search(msg))
+        else:
+            hit = (tag_re is not None and tag and tag_re.search(tag)) or \
+                  (msg_re is not None and msg and msg_re.search(msg))
+        if not hit:
+            continue
+        k = kind(msg or '') if callable(kind) else kind
+        if k:
+            return k
+    return None
+
+
+# ── Field extraction helpers ──────────────────────────────────────────────────
+
+_MAC_ANY_RE  = re.compile(
+    r'(?<![0-9A-Fa-f:.\-])(?:[0-9A-Fa-f]{2}[:\-]){5}[0-9A-Fa-f]{2}(?![0-9A-Fa-f\-]|:[0-9A-Fa-f])'
+    r'|\b[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\b')
+_IFACE_ANY_RE = re.compile(
+    r'\b((?:GigabitEthernet|TenGigabitEthernet|TwentyFiveGigE|FortyGigabitEthernet|'
+    r'HundredGigE|FastEthernet|Ethernet|Port-channel|Vlan|Loopback|Tunnel|Serial|'
+    r'Gi|Te|Fa|Fo|Hu|Twe|Tw|Eth|Et|Po|Vl|Lo|Tu|Se|Mg|mgmt|XGE|GE|'
+    r'ge-|xe-|et-|fe-|ae|irb|reth|ethernet|lag|ve)\s?\d+(?:/\d+)*(?:[.:]\d+)?'
+    r'|\d+/\d+/\d+|\b(?:port|Port) \d+(?:[/:]\d+)*)\b')
+_IP_PORT_PAIR_RE = re.compile(
+    r'(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]*:[0-9a-fA-F:]+)[/:(](\d{1,5})\)?\s*'
+    r'(?:->|to|-->|→|,? dst[:=]?|\s)\s*'
+    r'(?:\w+[:/])?(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]*:[0-9a-fA-F:]+)[/:(](\d{1,5})')
+_USER_RE = re.compile(
+    r"""(?:\buser(?:name)?\s*(?:[=:]\s*|\s)['"\[(]?|\[user:\s*|Username entry \(|"""
+    r"""for (?:user |admin )['"]?)([^\s'"\])(),;]+)""", re.I)
+_SRC_IP_RE = re.compile(
+    r"(?:\bfrom (?:host |src IP |source )?|\[Source:\s*|\bsrc(?:-ip)?[=:\s]\s*|IP\s*=\s*|"
+    r"\((?=\d))['\"]?(\d{1,3}(?:\.\d{1,3}){3})")
+
+
+_NOT_USERS = {'name', 'password', 'authentication', 'entry', 'account', 'is', 'from', 'on',
+              'for', 'unknown', 'ip', 'login', 'logged', 'session', 'mode', 'id', 'the', 'a',
+              'has', 'was', 'with', 'via', 'executed', 'requested', 'admin-role'}
+
+
+def _ip_ports(text):
+    m = _IP_PORT_PAIR_RE.search(text)
+    if not m:
+        return {}
+    return {'src_ip': m.group(1), 'src_port': m.group(2),
+            'dst_ip': m.group(3), 'dst_port': m.group(4)}
+
+
+def _first(regex, text, group=1):
+    m = regex.search(text)
+    return m.group(group) if m else None
+
+
+def _first_mac(text, skip=()):
+    for m in _MAC_ANY_RE.finditer(text):
+        mac = norm_mac(m.group())
+        if mac and mac not in skip and mac != '00:00:00:00:00:00':
+            return mac
+    return None
+
+
+def _common_fields(msg, kind):
+    """Fields worth pulling out of free text for a given kind."""
+    f = {}
+    iface = _first(_IFACE_ANY_RE, msg)
+    if iface:
+        f['iface'] = iface
+    if kind in ('login_fail', 'login', 'logout', 'config', 'failure', 'auth', 'join',
+                'disconnect', 'roam'):
+        u = _first(_USER_RE, msg)
+        if u and not norm_mac(u) and '/' not in u and u.lower() not in _NOT_USERS:
+            f['user'] = u
+        ip = _first(_SRC_IP_RE, msg)
+        if ip:
+            f['src_ip'] = ip
+    if kind in ('failure', 'auth', 'join', 'disconnect', 'roam', 'loop', 'violation'):
+        mac = _first_mac(msg)
+        if mac:
+            f['client_mac'] = mac
+    if kind in ('neighbor_down', 'neighbor_up'):
+        n = _first(re.compile(r'(?:neighbou?r|nbr|peer)\s+(\S+?)[\s,(]', re.I), msg + ' ')
+        if n:
+            f['neighbor'] = n.strip("'\"")
+    if kind in ('deny', 'allow', 'session', 'threat'):
+        f.update(_ip_ports(msg))
+    return f
+
+
+# ── Syslog header ─────────────────────────────────────────────────────────────
+
+_HDR_RE = re.compile(
+    r'^\s*(?:<(\d{1,3})>)?(?:1 )?\s*(?:\d+:\s*)?[*%]?'
+    r'(?:[A-Z][a-z]{2}\s+\d{1,2}(?:\s+\d{4})?\s+\d{2}:\d{2}:\d{2}(?:[.:]\d+)?(?:\s+\d{4})?'
+    r'|\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?'
+    r'|\d{10}(?:\.\d+)?)'
+    r'(?:\s+[A-Z]{3,4}:)?\s+(\S+)\s')
+
+
+def syslog_header(line):
+    """(syslog severity 0-7 or None, sending host or None)."""
+    m = _HDR_RE.match(line)
+    if not m:
+        m2 = re.match(r'\s*<(\d{1,3})>', line)
+        return (int(m2.group(1)) % 8 if m2 else None), None
+    sev  = int(m.group(1)) % 8 if m.group(1) else None
+    host = m.group(2)
+    if host.endswith(':') or host.startswith(('%', '[', '<')) or host in ('-', 'last'):
+        host = None
+    return sev, host
+
+
+# ── Format parsers ────────────────────────────────────────────────────────────
+# Each returns a dict with 'name', 'kind', 'vsev' (0-7 or None) and canonical
+# fields, or None when the line isn't really that format.
+
+def _kv_pairs(text, pair_re=None):
+    pair_re = pair_re or KV_RE
+    out = {}
+    for k, v in pair_re.findall(text):
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in '"\'':
+            v = v[1:-1]
+        out.setdefault(k, v)
+    return out
+
+
+def _map_fields(raw, mapping):
+    """Copy raw vendor keys to canonical names (first non-empty wins)."""
+    f = {}
+    for key, canon in mapping.items():
+        v = raw.get(key)
+        if v not in (None, '', 'N/A', 'n/a', '-', '0.0.0.0') and canon not in f:
+            f[canon] = v
+    return f
+
+
+# Ruckus SmartZone / vSZ:  ... Core: @@203,clientJoinFailure,"apMac"="..","clientMac"="..",...
+_SZ_RE    = re.compile(r'@@(\d+),(\w+),(.*)$')
+_SZ_KV_RE = re.compile(r'"([^"]+)"="([^"]*)"')
+_SZ_MAP   = {'clientMac': 'client_mac', 'apMac': 'ap_mac', 'apName': 'ap_name',
+             'apLocation': 'ap_loc', 'ssid': 'ssid', 'userName': 'user', 'username': 'user',
+             'clientIP': 'client_ip', 'receivedSignalStrength': 'rssi', 'rssi': 'rssi',
+             'disconnectReason': 'reason', 'reason': 'reason', 'reasonCode': 'reason',
+             'apIpAddress': 'ap_ip', 'zoneName': 'zone', 'fromApName': 'from_ap',
+             'fromApMac': 'from_ap_mac', 'vlanId': 'vlan', 'hostname': 'client_host'}
+
+
+def _p_ruckus_sz(line):
+    m = _SZ_RE.search(line)
+    if not m:
+        return None
+    raw = dict(_SZ_KV_RE.findall(m.group(3)))
+    f   = _map_fields(raw, _SZ_MAP)
+    name = m.group(2)
+    f.update(name=name, code=m.group(1), kind=_kind_of(name))
+    return f
+
+
+# Ruckus ZoneDirector / Unleashed: "User[alice@aa:bb..] joins WLAN[Corp] from AP[AP-1@aa:..]"
+_ZD_RE = re.compile(r'\b(User|AP|Client)\[([^\]]*)\]\s+(\w+(?: \w+)?)')
+
+
+def _p_ruckus_zd(line):
+    m = _ZD_RE.search(line)
+    if not m:
+        return None
+    f   = {}
+    msg = line[m.start():]
+    who, verb = m.group(2), m.group(3).lower()
+    if m.group(1) in ('User', 'Client'):
+        f['client_mac'] = _first_mac(who)
+        u = who.split('@')[0] if '@' in who else None
+        if u and not norm_mac(u):
+            f['user'] = u
+        ap = re.search(r'AP\[([^\]@]*)(?:@([^\]]*))?\]', msg[len(m.group(0)):])
+        if ap:
+            f['ap_name'] = ap.group(1)
+            if ap.group(2) and norm_mac(ap.group(2)):
+                f['ap_mac'] = norm_mac(ap.group(2))
+        wlan = re.search(r'WLAN\[([^\]]*)\]', msg)
+        if wlan:
+            f['ssid'] = wlan.group(1)
+        if re.search(r'fail|reject|denied|timeout', msg, re.I):
+            kind = 'failure'
+        elif 'roam' in verb:
+            kind = 'roam'
+        elif re.search(r'disconnect|leave|left|deauth|idle', msg, re.I):
+            kind = 'disconnect'
+        elif re.search(r'authoriz|authenticat', msg, re.I):
+            kind = 'auth'
+        elif 'join' in verb:
+            kind = 'join'
+        else:
+            kind = None
+    else:
+        f['ap_name'] = who.split('@')[0]
+        mac = _first_mac(who)
+        if mac:
+            f['ap_mac'] = mac
+        kind = ('ap_down' if re.search(r'lost|disconnect|heartbeat|down|offline', msg, re.I)
+                else 'reboot' if 'reboot' in msg.lower()
+                else 'ap_up' if re.search(r'join|connect|up\b', msg, re.I) else None)
+    phrase = re.match(r'\s*([^\[]+?)\s*(?:WLAN|AP|User)?\[', line[m.end(2) + 1:])
+    phrase = phrase.group(1) if phrase else verb
+    f.update(name=f'{m.group(1)} {phrase}'.strip()[:50], kind=kind, msg=msg)
+    return f
+
+
+# ArubaOS controllers / Instant APs:
+#   authmgr[1234]: <522008> <NOTI> <host 10.0.0.1> User Authentication Successful: username=..
+#   :501094: <NOTI> |AP ap1@10.0.0.2 stm|  Auth failure: aa:bb:..: AP 10.0.0.2-bssid-ap1 Reason ...
+_ARUBA_RE = re.compile(
+    r'[<:](\d{6})[>:]\s*<(EMRG|ALRT|CRIT|ERRS|WARN|NOTI|INFO|DBUG)>\s*'
+    r'(?:<([^>]*)>\s*)?(?:\|([^|]*)\|\s*)?(.*)$')
+_ARUBA_MAP = {'username': 'user', 'MAC': 'client_mac', 'mac': 'client_mac', 'IP': 'client_ip',
+              'AP': 'ap_name', 'ap': 'ap_name', 'SSID': 'ssid', 'ssid': 'ssid', 'VLAN': 'vlan',
+              'role': 'role', 'bssid': 'bssid', 'reason': 'reason'}
+
+
+def _p_aruba(line):
+    m = _ARUBA_RE.search(line)
+    if not m:
+        return None
+    msgid, lvl, ctx, proc, msg = m.groups()
+    f = _map_fields(_kv_pairs(msg), _ARUBA_MAP)
+    if 'client_mac' in f:
+        f['client_mac'] = norm_mac(f['client_mac']) or f.pop('client_mac')
+    ap = re.search(r'\bAP ([^@\s|]+)@', proc or '') or \
+         re.search(r'\bAP \d{1,3}(?:\.\d{1,3}){3}-[0-9a-f:]{17}-(\S+)', msg)
+    if ap and 'ap_name' not in f:
+        f['ap_name'] = ap.group(1)
+    title = msg.split(':', 1)[0].strip()[:48] or msgid
+    kind  = classify_text('', title)
+    if msgid.startswith('522') and re.search(r'fail', msg, re.I):
+        kind = 'failure'
+    if kind in ('failure', 'auth', 'join', 'disconnect', 'roam') and 'client_mac' not in f:
+        mac = _first_mac(msg)
+        if mac:
+            f['client_mac'] = mac
+    r = re.search(r'\bReason:?\s+(.+?)\s*$', msg)
+    if r and 'reason' not in f:
+        f['reason'] = r.group(1)[:80]
+    f.update(name=f'{msgid} {title}', kind=kind, vsev=SEV_NAMES[lvl.lower()], msg=msg)
+    if kind not in ('failure', 'auth', 'join', 'disconnect', 'roam'):
+        f.update({k: v for k, v in _common_fields(msg, kind).items() if k not in f})
+    return f
+
+
+# Aruba AOS-CX switches:  hpe-restd[1234]: Event|4605|LOG_INFO|AMM|1/1|User admin logged in ...
+_AOSCX_RE = re.compile(r'Event\|(\d+)\|LOG_(\w+)\|([^|]*)\|([^|]*)\|(.*)$')
+
+
+def _p_aos_cx(line):
+    m = _AOSCX_RE.search(line)
+    if not m:
+        return None
+    msg  = m.group(5)
+    kind = classify_text('', msg)
+    f    = _common_fields(msg, kind)
+    f.update(name=f'Event {m.group(1)}', kind=kind,
+             vsev=SEV_NAMES.get(m.group(2).lower()), msg=msg)
+    return f
+
+
+# Aruba AOS-S / HP ProCurve:  00076 ports: port 1 is now off-line
+_PROCURVE_SUBSYS = (r'ports|mgr|auth|FFI|stp|mstp|loop-protect|lldp|dot1x|mac-auth|macauth|'
+                    r'web-auth|poe|chassis|system|vlan|ip|SNTP|snmp|lacp|dhcp-snoop|'
+                    r'dhcp-snooping|arp-protect|dca|port-security|trunk|ssl|sshd|telnet|'
+                    r'update|tftp|igmp|rate-limit|udld|ntp|radius|tacacs|cdp|ports-security')
+_PROCURVE_RE = re.compile(
+    r'(?:^|\s)(?:([IWMED]) \d\d/\d\d/\d\d \d\d:\d\d:\d\d )?(\d{5}) (' + _PROCURVE_SUBSYS +
+    r'):\s+(.*)$')
+
+
+def _p_procurve(line):
+    m = _PROCURVE_RE.search(line)
+    if not m:
+        return None
+    letter, code, sub, msg = m.groups()
+    kind = classify_text(sub.upper(), msg)
+    if sub == 'auth' and re.search(r'invalid|fail', msg, re.I):
+        kind = 'login_fail'
+    f = _common_fields(msg, kind)
+    vsev = {'I': 6, 'W': 4, 'M': 2, 'E': 3, 'D': 7}.get(letter) if letter else None
+    f.update(name=f'{sub} {code}', kind=kind, vsev=vsev, msg=msg)
+    return f
+
+
+# Cisco ASA / FTD / PIX:  %ASA-4-106023: Deny tcp src outside:1.2.3.4/1234 dst inside:..
+_ASA_RE = re.compile(r'%(ASA|FTD|PIX|FWSM)-(?:\w+-)?([0-7])-(\d{6}):?\s*(.*)$')
+_ASA_KIND = {
+    'deny':   {'106001', '106006', '106007', '106014', '106015', '106016', '106017', '106021',
+               '106022', '106023', '106027', '313001', '313004', '313008', '710003', '710005',
+               '419001', '419002', '500004', '108003', '402117', '410001'},
+    'allow':  {'106100'},
+    'session': {'302013', '302014', '302015', '302016', '302020', '302021', '305011',
+                '305012', '609001', '609002'},
+    'login_fail': {'113005', '113006', '605004', '611102', '716039', '113015', '772003'},
+    'login':  {'113004', '113008', '605005', '611101', '113012', '502103'},
+    'logout': {'611103', '716002'},
+    'config': {'111008', '111009', '111010', '111001', '111005'},
+    'threat': {'733100', '733101', '733102', '733104', '733105', '400000', '338001',
+               '338002', '338003', '338004', '338005', '338006', '338007', '338008',
+               '430001', '430005'},
+    'vpn_up': {'713119', '713120', '602303', '722022', '722051', '113039', '734001'},
+    'vpn_down': {'713050', '602304', '722023', '113019', '716001', '750003', '713903',
+                 '713904', '713902', '751022'},
+    'failover': {'104001', '104002', '104500', '104502'},
+    'hw':     {'105005', '105008', '105009', '105011', '105043', '199010', '735005',
+               '735011', '735012'},
+    'link_up': {'411001', '411003'},
+    'link_down': {'411002', '411004'},
+}
+_ASA_ID = {i: k for k, ids in _ASA_KIND.items() for i in ids}
+_ASA_DESC = {
+    '106001': 'inbound TCP denied', '106006': 'inbound UDP denied', '106007': 'inbound DNS denied',
+    '106014': 'inbound ICMP denied', '106015': 'TCP denied (no connection)',
+    '106021': 'reverse-path check denied', '106023': 'denied by ACL', '106100': 'ACL hit',
+    '302013': 'built TCP', '302014': 'teardown TCP', '302015': 'built UDP', '302016': 'teardown UDP',
+    '113004': 'AAA auth successful', '113005': 'AAA auth rejected', '605004': 'login denied',
+    '605005': 'login permitted', '611101': 'user auth succeeded', '611102': 'user auth failed',
+    '611103': 'user logged out', '111008': 'command executed', '111010': 'config change',
+    '713050': 'VPN connection terminated', '713119': 'IKE phase 1 completed',
+    '602303': 'IPsec SA created', '602304': 'IPsec SA deleted', '722051': 'AnyConnect connected',
+    '113019': 'VPN session disconnected', '750003': 'IKEv2 negotiation aborted',
+    '716039': 'WebVPN auth rejected', '733100': 'drop rate exceeded', '105005': 'failover link lost',
+    '104001': 'failover: now active', '104002': 'failover: now standby',
+    '710003': 'access to device denied', '313001': 'ICMP denied', '411001': 'interface up',
+    '411002': 'interface down', '419002': 'duplicate TCP SYN', '338001': 'botnet traffic'}
+
+
+def _p_asa(line):
+    m = _ASA_RE.search(line)
+    if not m:
+        return None
+    prod, sev, mid, msg = m.groups()
+    kind = _ASA_ID.get(mid)
+    if mid == '106100':
+        kind = 'deny' if 'denied' in msg else 'allow'
+    if mid.startswith('4000') and kind is None:
+        kind = 'threat'                      # IPS signature messages 400000-400050
+    if kind is None:
+        kind = classify_text('', msg)
+    f = {}
+    # "src outside:1.2.3.4/1234 dst inside:10.0.0.1/80"
+    s = re.search(r'src (\S+?):([\d.a-fA-F:]+)/(\d+)\b.*?dst (\S+?):([\d.a-fA-F:]+)/(\d+)', msg)
+    if s:
+        f.update(src_zone=s.group(1), src_ip=s.group(2), src_port=s.group(3),
+                 dst_zone=s.group(4), dst_ip=s.group(5), dst_port=s.group(6))
+    else:
+        # "denied tcp inside/10.0.0.1(1234) -> outside/8.8.8.8(80)"
+        s = re.search(r'(\w+)/([\d.a-fA-F:]+)\((\d+)\)\s*->\s*(\w+)/([\d.a-fA-F:]+)\((\d+)\)', msg)
+        if s:
+            f.update(src_zone=s.group(1), src_ip=s.group(2), src_port=s.group(3),
+                     dst_zone=s.group(4), dst_ip=s.group(5), dst_port=s.group(6))
+        else:
+            # "from 1.2.3.4/1234 to 10.0.0.1/80" / "for outside:1.2.3.4/123 (..) to inside:.."
+            s = re.search(r'(?:from|for) (?:\w+:)?([\d.a-fA-F:]+)/(\d+)\b.*?\bto (?:\w+:)?'
+                          r'([\d.a-fA-F:]+)/(\d+)', msg)
+            if s:
+                f.update(src_ip=s.group(1), src_port=s.group(2), dst_ip=s.group(3),
+                         dst_port=s.group(4))
+    p = re.search(r'\b(tcp|udp|icmp|gre|esp|ip)\b', msg, re.I)
+    if p:
+        f['proto'] = p.group(1).lower()
+    rule = re.search(r'access-(?:group|list) "?([\w.\-]+)"?', msg)
+    if rule:
+        f['rule'] = rule.group(1)
+    for k, v in _common_fields(msg, kind).items():
+        f.setdefault(k, v)
+    if kind in ('login_fail', 'login', 'logout'):
+        u = re.search(r"\b[Uu]ser(?:name)?\s*=\s*'?<?([^\s,'>]+)", msg) or \
+            re.search(r"\b[Uu]ser(?:name)?\s*:?\s*'?<?([^\s,'>]+)", msg)
+        if u and u.group(1).lower() not in _NOT_USERS:
+            f['user'] = u.group(1)
+        elif f.get('user', '').lower() in _NOT_USERS:
+            f.pop('user')
+    if kind in ('vpn_up', 'vpn_down'):
+        peer = re.search(r'\b(?:IP|peer|Peer|Remote)\s*=?\s*(\d{1,3}(?:\.\d{1,3}){3})', msg)
+        if peer:
+            f['peer'] = peer.group(1)
+    desc = _ASA_DESC.get(mid)
+    f.update(name=f'{prod}-{mid}' + (f' {desc}' if desc else ''), kind=kind, vsev=int(sev),
+             msg=msg)
+    return f
+
+
+# Cisco IOS / IOS-XE / NX-OS / Catalyst 9800 / AireOS WLC, Arista EOS, Dell (FTOS):
+#   %LINK-3-UPDOWN: Interface GigabitEthernet1/0/1, changed state to down
+_CISCO_RE = re.compile(
+    r'%([A-Z][A-Z0-9_]*(?:-[A-Z][A-Z0-9_]*)*?)-([0-7])-([A-Z][A-Z0-9_]*)\s*:\s*(.*)$')
+
+
+def _p_cisco(line):
+    m = _CISCO_RE.search(line)
+    if not m or m.group(1) in ('ASA', 'FTD', 'PIX', 'FWSM'):
+        return None
+    fac, sev, mnem, msg = m.groups()
+    msg  = re.sub(r'^(?:Chassis \d+ R\d/\d: \w+: |\w+\.c:\d+ )', '', msg)  # 9800 / AireOS
+    tag  = f'{fac}-{mnem}'
+    kind = classify_text(tag, msg)
+    if tag == 'CLIENT_ORCH_LOG-CLIENT_ADDED_TO_RUN_STATE':
+        kind = 'auth'
+    f = _common_fields(msg, kind)
+    if fac in ('CLIENT_ORCH_LOG', 'CLIENT_EXCLUSION_SERVER', 'SESSION_MGR', 'DOT1X', 'MAB',
+               'AUTHMGR', 'APF', 'DOT11', 'WEBAUTH', 'EWLC_CLIENT', 'DOT1X_SWITCH'):
+        mac = _first_mac(msg)
+        if mac:
+            f['client_mac'] = mac
+        ssid = re.search(r'ssid \(([^)]+)\)', msg, re.I)
+        if ssid:
+            f['ssid'] = ssid.group(1)
+        u = re.search(r'Username entry \(([^)]+)\)', msg)
+        if u:
+            f['user'] = u.group(1)
+        r = re.search(r'(?:Authc failure|Failure) reason:\s*([^.]+)', msg)
+        if r:
+            f['reason'] = r.group(1)
+    ap = re.search(r'AP Name:\s*([^,]+)', msg)
+    if ap:
+        f['ap_name'] = ap.group(1).strip()
+        mac = _first_mac(msg)
+        if mac:
+            f['ap_mac'] = mac
+            f.pop('client_mac', None)
+    if kind == 'loop':
+        v = re.search(r'\bvlan (\d+)', msg, re.I)
+        if v:
+            f['vlan'] = v.group(1)
+    f.update(name=tag, kind=kind, vsev=int(sev), msg=msg)
+    return f
+
+
+# HPE Comware (H3C/FlexNetwork) and Huawei VRP:
+#   IFNET/3/PHY_UPDOWN: Physical state on the interface GigabitEthernet1/0/1 changed to down.
+#   %%01IFNET/4/LINK_STATE(l)[0]:The line protocol IP on the interface ... entered the DOWN state.
+_COMWARE_RE = re.compile(
+    r'(?:%%\d+)?\b([A-Z][A-Z0-9_]+)/([0-7])/([A-Za-z][A-Za-z0-9_]*)(?:\([a-z]+\))?'
+    r'(?:\[\d+\])?:\s*(.*)$')
+
+
+def _p_comware(line):
+    m = _COMWARE_RE.search(line)
+    if not m:
+        return None
+    mod, sev, mnem, msg = m.groups()
+    tag  = f'{mod}/{mnem}'
+    kind = classify_text(tag.replace('/', '-'), msg)
+    f    = _common_fields(msg, kind)
+    f.update(name=tag, kind=kind, vsev=int(sev), msg=msg)
+    return f
+
+
+# Juniper Junos (EX/QFX/MX/SRX):  rpd[1234]: RPD_OSPF_NBRDOWN: OSPF neighbor 10.0.0.2 ...
+#   or RFC 5424 structured-data: ... RT_FLOW - RT_FLOW_SESSION_DENY [junos@2636.1.1.1.2.40 k="v" ...]
+_JUNOS_TAGS = (r'RT_FLOW|RT_IDP|RT_SCREEN|RT_UTM|RT_AAMW|RT_SECINTEL|SNMP_TRAP|RPD_|BGP_|'
+               r'UI_|SSHD_|LOGIN_|ESWD_|L2ALD_|LACPD_|CHASSISD_|KMD_|DOT1XD_|BFDD_|VRRPD_|'
+               r'DCD_|MIB2D_|PFE_|JTASK_|COSD_|AUTHD_|LLDPD_|DHCPD_|JSRPD_|FLOW_|IDP_|'
+               r'L2CPD_|STP_|ERRMSG|RPD_|PAM_|JDHCPD_|LICENSE_')
+_JUNOS_RE = re.compile(r'(?:^|[\s:])((?:' + _JUNOS_TAGS + r')[A-Z0-9_]*)(?::\s+|\s+\[junos@[\d.]+\s+|\s*$)(.*)$')
+_JUNOS_SD_RE = re.compile(r'\b(' + _JUNOS_TAGS + r')[A-Z0-9_]*\s+\[junos@')
+_JUNOS_MAP = {'source-address': 'src_ip', 'destination-address': 'dst_ip',
+              'source-port': 'src_port', 'destination-port': 'dst_port',
+              'policy-name': 'rule', 'protocol-id': 'proto', 'username': 'user',
+              'source-zone-name': 'src_zone', 'destination-zone-name': 'dst_zone',
+              'attack-name': 'signature', 'threat-severity': 'threat_sev',
+              'interface-name': 'iface', 'packet-incoming-interface': 'iface',
+              'reason': 'reason', 'application': 'app'}
+
+
+def _p_junos(line):
+    m = _JUNOS_RE.search(line)
+    if not m:
+        return None
+    tag, msg = m.group(1), m.group(2)
+    inner = re.match(r'([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+):\s*(.*)$', msg)
+    if inner:                       # "RT_FLOW: RT_FLOW_SESSION_DENY: ..." → the inner tag
+        tag, msg = inner.groups()
+    f = {}
+    if '[junos@' in line:
+        sd = line[line.index('[junos@'):]
+        f  = _map_fields(_kv_pairs(sd), _JUNOS_MAP)
+        msg = sd.split(']', 1)[1].strip() if ']' in sd else ''
+    if tag.startswith('RT_FLOW_SESSION_DENY'):
+        kind = 'deny'
+    elif tag.startswith('RT_FLOW_SESSION_CREATE'):
+        kind = 'allow'
+    elif tag.startswith('RT_FLOW_SESSION_CLOSE'):
+        kind = 'session'
+    elif tag.startswith(('RT_IDP', 'RT_SCREEN', 'RT_AAMW', 'RT_SECINTEL', 'IDP_')):
+        kind = 'threat'
+    elif tag.startswith('RT_UTM') and re.search(r'block|deny|virus', tag + msg, re.I):
+        kind = 'threat'
+    elif tag.startswith('SNMP_TRAP_LINK_'):
+        kind = 'link_down' if tag.endswith('DOWN') else 'link_up'
+        n = re.search(r'ifName (\S+)', msg)
+        if n:
+            f['iface'] = n.group(1).rstrip(',')
+    elif 'BGP' in tag and 'STATE_CHANGED' in tag:
+        s = re.search(r'from (\w+) to (\w+)', msg)
+        kind = ('neighbor_up' if s and s.group(2) == 'Established'
+                else 'neighbor_down' if s and s.group(1) == 'Established'
+                else None)
+        n = re.search(r'peer ([\da-fA-F.:]+)', msg)
+        if n:
+            f['neighbor'] = n.group(1)
+    else:
+        kind = classify_text(tag, msg)
+    if tag.startswith('RT_FLOW') and 'src_ip' not in f:
+        s = re.search(r'([\da-fA-F.:]+)/(\d+)->([\da-fA-F.:]+)/(\d+)', msg)
+        if s:
+            f.update(src_ip=s.group(1), src_port=s.group(2), dst_ip=s.group(3),
+                     dst_port=s.group(4))
+        p = re.search(r'\s(\d+)\(\d+\)\s+(\S+)\s+(\S+)\s+(\S+)', msg)
+        if p:
+            f.update(proto=_PROTO_NUM.get(p.group(1), p.group(1)), rule=p.group(2),
+                     src_zone=p.group(3), dst_zone=p.group(4))
+    if tag.startswith('RT_SCREEN'):
+        a = re.search(r'attack-name: ([^!]+)!?.*?source: ([\d.a-fA-F:]+)(?::(\d+))?'
+                      r'.*?destination: ([\d.a-fA-F:]+)(?::(\d+))?', msg)
+        if a:
+            f.update(signature=a.group(1).strip(), src_ip=a.group(2), dst_ip=a.group(4))
+            if a.group(5):
+                f['dst_port'] = a.group(5)
+    if kind in ('login_fail', 'login', 'config', 'logout'):
+        u = re.search(r"user '([^']+)'", msg, re.I) or re.search(r"User '([^']+)'", msg)
+        if u:
+            f['user'] = u.group(1)
+        h = re.search(r"from host '([^']+)'", msg)
+        if h:
+            f['src_ip'] = h.group(1)
+    for k, v in _common_fields(msg, kind).items():
+        f.setdefault(k, v)
+    f.update(name=tag, kind=kind, msg=msg)
+    return f
+
+
+# Fortinet FortiGate (and FortiAP via FortiGate):
+#   date=2024-03-01 time=12:00:00 devname="FGT" devid="FG.." logid="0000000013" type="traffic" ...
+_FORTI_MAP = {'srcip': 'src_ip', 'dstip': 'dst_ip', 'srcport': 'src_port', 'dstport': 'dst_port',
+              'srcintf': 'iface',
+              'dstintf': 'out_iface', 'user': 'user', 'unauthuser': 'user', 'srcmac': 'client_mac',
+              'stamac': 'client_mac', 'ssid': 'ssid', 'ap': 'ap_name', 'apname': 'ap_name',
+              'signal': 'rssi', 'reason': 'reason', 'status': 'status', 'msg': 'msg',
+              'attack': 'signature', 'virus': 'signature', 'remip': 'peer', 'vpntunnel': 'tunnel',
+              'devname': 'host', 'service': 'service', 'action': 'action', 'crlevel': 'threat_sev',
+              'severity': 'threat_sev', 'ui': 'ui', 'logdesc': 'logdesc', 'eventtime': 'epoch',
+              'srcname': 'client_host'}
+
+
+def _p_fortinet(line):
+    if 'logid=' not in line or 'type=' not in line:
+        return None
+    raw = _kv_pairs(line)
+    if 'logid' not in raw:
+        return None
+    f    = _map_fields(raw, _FORTI_MAP)
+    typ  = raw.get('type', '')
+    sub  = raw.get('subtype', '')
+    act  = raw.get('action', '').lower()
+    desc = raw.get('logdesc', '') or raw.get('msg', '')
+    text = f"{desc} {raw.get('msg', '')} {act} {raw.get('status', '')}"
+    kind = None
+    if typ == 'traffic':
+        kind = 'deny' if act in ('deny', 'block', 'blocked', 'dropped', 'drop') else 'allow'
+    elif typ in ('utm', 'ips', 'virus', 'anomaly', 'webfilter', 'app-ctrl', 'dns', 'emailfilter',
+                 'dlp', 'waf', 'ssl', 'file-filter') or sub in ('ips', 'virus', 'anomaly', 'botnet'):
+        threatish = (sub in ('ips', 'virus', 'anomaly', 'botnet', 'malware') or
+                     typ in ('ips', 'virus', 'anomaly'))
+        if threatish:
+            kind = 'threat'
+        elif act in ('blocked', 'block', 'deny', 'dropped', 'reset'):
+            kind = 'deny'
+        else:
+            kind = 'allow'
+    elif typ == 'event':
+        if sub == 'wireless':
+            kind = (_kind_of(desc.replace(' ', '')) if desc else None) or classify_text('', text)
+            if re.search(r'rogue', text, re.I):
+                kind = 'violation'
+        elif sub == 'vpn':
+            kind = ('vpn_up' if act == 'tunnel-up' else
+                    'vpn_down' if act in ('tunnel-down', 'tunnel-stats') and 'down' in act else
+                    'vpn_down' if re.search(r'fail|error', raw.get('status', ''), re.I) else
+                    classify_text('VPN', text) if act != 'tunnel-stats' else 'session')
+        elif sub in ('user', 'endpoint', 'fortiextender') or act in ('login', 'logout', 'auth-logon'):
+            st = raw.get('status', '').lower()
+            if act == 'logout':
+                kind = 'logout'
+            elif st in ('failure', 'failed', 'fail', 'deny', 'denied') or 'fail' in text.lower():
+                kind = 'login_fail'
+            elif act in ('login', 'authentication', 'auth-logon') or st == 'success':
+                kind = 'login'
+        elif sub == 'ha':
+            kind = 'failover'
+        if kind is None:
+            kind = classify_text(raw.get('logid', ''), text)
+    if 'client_mac' in f:
+        f['client_mac'] = norm_mac(f['client_mac']) or f.pop('client_mac')
+    if raw.get('policyid'):
+        f['rule'] = raw.get('policyname') or (
+            'implicit deny (policy 0)' if raw['policyid'] == '0' else f'policy {raw["policyid"]}')
+    if 'proto' not in f and raw.get('proto'):
+        f['proto'] = _PROTO_NUM.get(raw['proto'], raw['proto'])
+    if kind in ('login_fail', 'login') and 'src_ip' not in f:
+        ip = re.search(r'\((\d{1,3}(?:\.\d{1,3}){3})\)', raw.get('ui', ''))
+        if ip:
+            f['src_ip'] = ip.group(1)
+    if 'date' in raw and 'time' in raw:
+        f['when'] = f"{raw['date']}T{raw['time']}"
+    name = desc or f'{typ}/{sub}'
+    f.update(name=name, kind=kind, vsev=SEV_NAMES.get(raw.get('level', '').lower()),
+             code=raw.get('logid'))
+    return f
+
+
+# Palo Alto PAN-OS (CSV syslog). Field positions from the PAN-OS syslog field
+# reference: 0 FUTURE_USE, 1 receive time, 2 serial, 3 type, 4 subtype, ...
+_PAN_RE = re.compile(
+    r'(?:^|[\s:])\d+,(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2}),([^,]*),(TRAFFIC|THREAT|SYSTEM|'
+    r'CONFIG|GLOBALPROTECT|USERID|AUTH|HIPMATCH|DECRYPTION|CORRELATION|URL|IPTAG|TUNNEL|SCTP),')
+_PAN_DENY   = {'deny', 'drop', 'drop icmp', 'drop-icmp', 'reset-both', 'reset-client',
+               'reset-server', 'reset both', 'reset client', 'reset server', 'block-url',
+               'block-ip', 'drop-all-packets', 'block', 'sinkhole', 'block-continue'}
+_PAN_THREAT = {'virus', 'spyware', 'vulnerability', 'wildfire', 'wildfire-virus', 'flood',
+               'scan', 'packet', 'ml-virus'}
+
+
+def _p_paloalto(line):
+    m = _PAN_RE.search(line)
+    if not m:
+        return None
+    try:
+        row = next(csv.reader([line[m.start() + (line[m.start()] in ' :'):]]))
+    except (csv.Error, StopIteration):
+        return None
+    g = lambda i: row[i] if len(row) > i and row[i] not in ('', 'N/A') else None
+    typ, sub = row[3], (g(4) or '')
+    f = {'when': row[1].replace('/', '-')}
+    kind = None
+    if typ in ('TRAFFIC', 'THREAT', 'DECRYPTION', 'URL'):
+        f.update({k: v for k, v in (
+            ('src_ip', g(7)), ('dst_ip', g(8)), ('rule', g(11)), ('user', g(12)),
+            ('app', g(14)), ('src_zone', g(16)), ('dst_zone', g(17)), ('iface', g(18)),
+            ('src_port', g(24)), ('dst_port', g(25)), ('proto', g(29)), ('action', g(30)))
+            if v and v != '0'})
+        act = (g(30) or '').lower()
+        if typ == 'TRAFFIC':
+            kind = 'deny' if act in _PAN_DENY or sub in ('deny', 'drop') else (
+                'allow' if sub == 'start' else 'session')
+        elif typ == 'THREAT':
+            f['signature'] = g(32)
+            f['threat_sev'] = g(34)
+            if sub in _PAN_THREAT:
+                kind = 'threat'
+            else:
+                kind = 'deny' if act in _PAN_DENY else 'allow'
+        else:
+            kind = 'deny' if act in _PAN_DENY else 'session'
+        name = f'{typ.lower()}/{sub}' + (f' {act}' if act else '')
+        if typ == 'THREAT' and f.get('signature'):
+            name = f.get('signature')
+    elif typ == 'SYSTEM':
+        # 7 vsys, 8 event id, 9 object, 12 module, 13 severity, 14 description
+        eid, desc = g(8) or sub, g(14) or ''
+        f['msg'] = desc
+        f['threat_sev'] = g(13)
+        if 'auth-fail' in eid or re.search(r'auth(?:entication)? fail', desc, re.I):
+            kind = 'login_fail'
+        elif 'auth-success' in eid or 'login' in eid:
+            kind = 'login'
+        elif eid.startswith('link-change') or 'link' in eid:
+            kind = _updown(desc, 'link_down', 'link_up')
+        elif eid.startswith(('ike-', 'ipsec-', 'tunnel-')) or 'vpn' in eid or sub == 'vpn':
+            kind = 'vpn_down' if re.search(r'fail|down|delete|expire', eid + desc, re.I) \
+                else 'vpn_up' if re.search(r'success|up\b|established', eid + desc, re.I) else None
+        elif eid.startswith(('bgp', 'ospf', 'routed')) or sub == 'routing':
+            kind = _neighbor_kind(desc)
+        elif eid.startswith('ha') or sub == 'ha':
+            kind = 'failover'
+        else:
+            kind = classify_text(eid.upper(), desc)
+        for k, v in _common_fields(desc, kind).items():
+            f.setdefault(k, v)
+        u = re.search(r"[Uu]ser(?:name)?[: ]+'?([^\s',.]+)", desc)
+        if u and kind in ('login_fail', 'login'):
+            f['user'] = u.group(1)
+        name = eid
+    elif typ == 'CONFIG':
+        # 7 host, 8 vsys, 9 command, 10 admin, 11 client, 12 result, 13 path
+        kind = 'config'
+        f.update({k: v for k, v in (('src_ip', g(7)), ('user', g(10)), ('status', g(12)))
+                  if v})
+        name = f'config {g(9) or ""}'.strip()
+    elif typ == 'GLOBALPROTECT':
+        # 8 event id, 9 stage, 10 auth method, 12 source user, 15 public IP, ... status later
+        st   = next((c for c in row[24:] if c in ('success', 'failure')), '')
+        kind = 'login_fail' if st == 'failure' else ('login' if st == 'success' else None)
+        f.update({k: v for k, v in (('user', g(12)), ('src_ip', g(15)), ('status', st)) if v})
+        name = f'globalprotect {g(8) or sub}'
+    elif typ in ('USERID', 'AUTH'):
+        kind = 'login_fail' if re.search(r'fail', ','.join(row[4:]), re.I) else 'login'
+        name = f'{typ.lower()}/{sub}'
+    else:
+        name = f'{typ.lower()}/{sub}'
+    f.update(name=name, kind=kind)
+    return f
+
+
+# Cisco Meraki (MR/MS/MX):  <134>1 1709294400.123456789 MR42 events type=association ...
+_MERAKI_RE = re.compile(
+    r'^\s*(?:<\d+>)?1 (\d{10}\.\d+) (\S+) (events|flows|firewall|vpn_firewall|cellular_firewall|'
+    r'bridge_anyconnect_client_vpn_firewall|ip_flow_start|ip_flow_end|urls|ids-alerts|'
+    r'security_event|airmarshal_events)\s+(.*)$')
+_MERAKI_TYPE = {
+    'association': 'join', 'disassociation': 'disconnect', 'association_reject': 'failure',
+    '8021x_auth': 'auth', '8021x_eap_success': 'auth', '8021x_eap_failure': 'failure',
+    '8021x_radius_timeout': 'failure', '8021x_deauth': 'disconnect',
+    '8021x_client_deauth': 'disconnect', 'wpa_auth': 'auth', 'wpa_deauth': 'disconnect',
+    'splash_auth': 'auth', 'mac_auth': 'auth', 'mac_auth_failure': 'failure',
+    'wpa_auth_failure': 'failure', 'device_packet_flood': 'threat', 'dfs_event': 'hw',
+    'rogue_ssid_detected': 'violation', 'ssid_spoofing_detected': 'violation',
+    'vpn_connectivity_change': None, 'anyconnect_vpn_connect': 'vpn_up',
+    'anyconnect_vpn_disconnect': 'vpn_down', 'anyconnect_vpn_auth_failure': 'login_fail',
+    'client_vpn_connect': 'vpn_up', 'client_vpn_disconnect': 'vpn_down',
+}
+_MERAKI_MAP = {'client_mac': 'client_mac', 'mac': 'client_mac', 'src': 'src_ip', 'dst': 'dst_ip',
+               'sport': 'src_port', 'dport': 'dst_port', 'protocol': 'proto', 'rssi': 'rssi',
+               'identity': 'user', 'user': 'user', 'reason': 'reason', 'vap': 'vap',
+               'signature': 'signature', 'priority': 'threat_sev', 'ssid': 'ssid',
+               'peer_contact': 'peer', 'client_ip': 'client_ip', 'aid': 'aid'}
+
+
+def _p_meraki(line):
+    m = _MERAKI_RE.search(line)
+    if not m:
+        return None
+    epoch, host, cat, rest = m.groups()
+    raw = _kv_pairs(rest)
+    f   = _map_fields(raw, _MERAKI_MAP)
+    f.update(host=host, epoch=epoch.split('.')[0])
+    for k in ('src_ip', 'dst_ip'):     # "1.2.3.4:5678"
+        v = f.get(k, '')
+        if v.count(':') == 1 and '.' in v:
+            ip, port = v.split(':')
+            f[k] = ip
+            f.setdefault('src_port' if k == 'src_ip' else 'dst_port', port)
+    if 'client_mac' in f:
+        f['client_mac'] = norm_mac(f['client_mac']) or f.pop('client_mac')
+    typ = raw.get('type', '')
+    if cat == 'events':
+        if typ:
+            kind = _MERAKI_TYPE.get(typ)
+            if typ == 'vpn_connectivity_change':
+                kind = 'vpn_up' if raw.get('connectivity') == 'true' else 'vpn_down'
+            if kind is None:
+                kind = classify_text('', typ.replace('_', ' '))
+            name = typ
+        else:
+            kind = classify_text('', rest)
+            name = ' '.join(rest.split()[:3])
+            f.update({k: v for k, v in _common_fields(rest, kind).items() if k not in f})
+    elif cat in ('flows', 'firewall', 'vpn_firewall', 'cellular_firewall',
+                 'bridge_anyconnect_client_vpn_firewall'):
+        pat  = rest.split('pattern:', 1)[1].strip() if 'pattern:' in rest else ''
+        kind = 'deny' if re.search(r'\bdeny\b|\bblock', pat, re.I) else 'allow'
+        name = f'{cat} {"deny" if kind == "deny" else "allow"}'
+        f['rule'] = pat[:60] or None
+    elif cat in ('ids-alerts', 'security_event'):
+        kind = 'threat'
+        msg  = rest.split('message:', 1)[1].strip() if 'message:' in rest else ''
+        name = msg or raw.get('signature') or typ or cat
+        if 'malicious' in rest or 'block' in raw.get('action', ''):
+            kind = 'threat'
+    elif cat == 'airmarshal_events':
+        kind = 'violation'
+        name = typ or cat
+    else:
+        kind = 'session'
+        name = cat
+    f.update(name=name, kind=kind)
+    return {k: v for k, v in f.items() if v is not None}
+
+
+# CEF (ArcSight Common Event Format): UniFi Network, Fortinet, Check Point,
+# Sophos, Trend, Zscaler and others can all send it.
+_CEF_RE    = re.compile(r'CEF:\s?(\d+)\|((?:[^|\\]|\\.)*)\|((?:[^|\\]|\\.)*)\|((?:[^|\\]|\\.)*)\|'
+                        r'((?:[^|\\]|\\.)*)\|((?:[^|\\]|\\.)*)\|((?:[^|\\]|\\.)*)\|(.*)$')
+_CEF_EXT_RE = re.compile(r'([\w.\[\]-]+)=((?:[^=\\]|\\.)*?)(?=\s+[\w.\[\]-]+=|\s*$)')
+_CEF_MAP = {'src': 'src_ip', 'dst': 'dst_ip', 'spt': 'src_port', 'dpt': 'dst_port',
+            'proto': 'proto', 'act': 'action', 'suser': 'user', 'duser': 'user',
+            'smac': 'client_mac', 'msg': 'msg', 'reason': 'reason', 'outcome': 'status',
+            'deviceInboundInterface': 'iface', 'cs1': 'rule', 'dvchost': 'host',
+            'UNIFIclientMac': 'client_mac', 'UNIFIclientIp': 'client_ip',
+            'UNIFIwifiName': 'ssid', 'UNIFIaccessPointName': 'ap_name',
+            'UNIFIconnectedToDeviceName': 'ap_name', 'UNIFIlastConnectedToDeviceName': 'ap_name',
+            'UNIFIaccessPointMac': 'ap_mac', 'UNIFIconnectedToDeviceMac': 'ap_mac',
+            'UNIFIlastConnectedToDeviceMac': 'ap_mac', 'UNIFIwifiRssi': 'rssi',
+            'UNIFIrssi': 'rssi', 'UNIFIadmin': 'user', 'UNIFIhost': 'host',
+            'UNIFIclientAlias': 'client_host', 'UNIFIclientHostname': 'client_host',
+            'UNIFIdeviceName': 'ap_name', 'UNIFIdeviceMac': 'ap_mac',
+            'UNIFIipsSignature': 'signature', 'UNIFIipsSessionId': 'session'}
+
+
+def _cef_sev(s):
+    s = s.strip().lower()
+    if s.isdigit():
+        n = int(s)
+        return 1 if n >= 9 else 3 if n >= 7 else 4 if n >= 4 else 6
+    return SEV_NAMES.get(s)
+
+
+def _p_cef(line):
+    m = _CEF_RE.search(line)
+    if not m:
+        return None
+    _v, vendor, product, _ver, sig, name, sev, ext = m.groups()
+    raw = {k: v.replace('\\=', '=').replace('\\\\', '\\') for k, v in _CEF_EXT_RE.findall(ext)}
+    f   = _map_fields(raw, _CEF_MAP)
+    for k in ('client_mac', 'ap_mac'):
+        if k in f:
+            f[k] = norm_mac(f[k]) or f.pop(k)
+    act  = (raw.get('act') or '').lower()
+    text = f'{name} {raw.get("msg", "")}'
+    if re.search(r'deny|denied|drop|block|reject|prevent', act):
+        kind = 'deny'
+    elif re.search(r'ips|ids|intrusion|threat|malware|virus|attack|exploit|botnet', text, re.I) \
+            and not act.startswith(('allow', 'accept', 'permit')):
+        kind = 'threat'
+    elif act.startswith(('allow', 'accept', 'permit', 'pass')):
+        kind = 'allow'
+    else:
+        low = name.lower()
+        kind = ('join' if re.search(r'client (?:connected|joined|associated)', low) else
+                'disconnect' if re.search(r'client disconnected', low) else
+                'roam' if 'roam' in low else
+                'login' if re.search(r'admin (?:accessed|logged in)|login success', low) else
+                'login_fail' if re.search(r'login fail|authentication fail', low) else
+                'ap_down' if re.search(r'(?:device|ap|access point).*(?:offline|disconnected|lost)',
+                                       low) else
+                'ap_up' if re.search(r'(?:device|ap|access point).*(?:online|connected|adopted)',
+                                     low) else
+                classify_text(sig.upper(), text))
+    if kind == 'threat' and 'signature' not in f:
+        f['signature'] = name
+    f.update(name=name, kind=kind, vsev=_cef_sev(sev), vendor=f'{vendor} {product}'.strip(),
+             code=sig)
+    if raw.get('rt', '').isdigit():
+        f['epoch'] = raw['rt']
+    return f
+
+
+# LEEF (IBM Log Event Extended Format) 1.0/2.0
+_LEEF_RE = re.compile(r'LEEF:\s?([12]\.0)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|(.*)$')
+_LEEF_MAP = {'src': 'src_ip', 'dst': 'dst_ip', 'srcPort': 'src_port', 'dstPort': 'dst_port',
+             'proto': 'proto', 'usrName': 'user', 'action': 'action', 'srcMAC': 'client_mac',
+             'policy': 'rule', 'reason': 'reason', 'msg': 'msg', 'identSrc': 'src_ip'}
+
+
+def _p_leef(line):
+    m = _LEEF_RE.search(line)
+    if not m:
+        return None
+    ver, vendor, product, _pv, eid, ext = m.groups()
+    delim = '\t'
+    if ver == '2.0' and '|' in ext:
+        d, ext = ext.split('|', 1)
+        delim = (bytes.fromhex(d[2:]).decode() if d.lower().startswith('x') and len(d) > 1
+                 else d or '\t')
+    raw = {}
+    for part in ext.split(delim):
+        if '=' in part:
+            k, v = part.split('=', 1)
+            raw[k.strip()] = v.strip()
+    f   = _map_fields(raw, _LEEF_MAP)
+    act = (raw.get('action') or '').lower()
+    kind = ('deny' if re.search(r'deny|drop|block|reject', act) else
+            'allow' if re.search(r'allow|accept|permit', act) else
+            classify_text(eid.upper(), raw.get('msg', eid)))
+    sev = raw.get('sev')
+    f.update(name=eid, kind=kind, vendor=f'{vendor} {product}'.strip(),
+             vsev=_cef_sev(sev) if sev else None)
+    return f
+
+
+# hostapd (UniFi APs, OpenWrt, many embedded APs):
+#   hostapd: ath0: STA aa:bb:cc:dd:ee:ff IEEE 802.11: associated
+_HOSTAPD_RE = re.compile(
+    r'hostapd(?:\[\d+\])?:\s+(\S+):\s+STA ([0-9a-fA-F:]{17})\s+([^:]+):\s*(.*)$')
+
+
+def _p_hostapd(line):
+    m = _HOSTAPD_RE.search(line)
+    if not m:
+        return None
+    vap, mac, mod, msg = m.groups()
+    low = msg.lower()
+    if re.search(r'fail|timeout|reject|invalid mic|mismatch|eap-failure|denied', low):
+        kind = 'failure'
+    elif re.search(r'disassociated|deauthenticated|sta left|inactivity', low):
+        kind = 'disconnect'
+    elif re.search(r'pairwise key handshake completed|authenticated|eap-success|authorized', low):
+        kind = 'auth'
+    elif re.search(r'\bassociated|reassociated', low):
+        kind = 'join'
+    else:
+        kind = None
+    name = f'{mod.strip()}: {msg.split("(")[0].strip()}'[:60]
+    return {'name': name, 'kind': kind, 'client_mac': norm_mac(mac), 'iface': vap, 'msg': msg}
+
+
+# UniFi AP station tracker:  stahtd[123]: [STA-TRACKER].stahtd_dump_event(): {"mac":..}
+def _p_unifi_stahtd(line):
+    i = line.find('[STA-TRACKER]')
+    if i < 0:
+        return None
+    j = line.find('{', i)
+    try:
+        d = json.loads(line[j:]) if j >= 0 else {}
+    except ValueError:
+        return None
+    et   = str(d.get('event_type', ''))
+    kind = ('failure' if 'fail' in et else 'disconnect' if 'disassoc' in et or 'leave' in et
+            else 'join' if et in ('success', 'fixup', 'associated', 'connected') else None)
+    f = {'name': f"{d.get('message_type', 'STA_TRACKER')} {et}".strip(), 'kind': kind,
+         'iface': d.get('vap'), 'ssid': d.get('essid') or d.get('ssid')}
+    mac = norm_mac(str(d.get('mac', '')))
+    if mac:
+        f['client_mac'] = mac
+    for k in ('assoc_status', 'auth_failures', 'wpa_auth_failures'):
+        if str(d.get(k, '0')) not in ('0', ''):
+            f['reason'] = f'{k}={d[k]}'
+            break
+    return {k: v for k, v in f.items() if v}
+
+
+# Linux netfilter / iptables / nftables / UFW / UniFi & EdgeOS gateways:
+#   kernel: [UFW BLOCK] IN=eth0 OUT= MAC=.. SRC=1.2.3.4 DST=.. PROTO=TCP SPT=.. DPT=22
+#   kernel: [WAN_IN-4000-D]IN=eth0 ...
+_NF_RE = re.compile(r'\bIN=(\S*) OUT=(\S*) .*?\bSRC=([\da-fA-F.:]+) DST=([\da-fA-F.:]+)')
+
+
+def _p_netfilter(line):
+    m = _NF_RE.search(line)
+    if not m:
+        return None
+    prefix = line[:m.start()]
+    f = {'iface': m.group(1) or m.group(2), 'src_ip': m.group(3), 'dst_ip': m.group(4)}
+    for key, canon in (('PROTO', 'proto'), ('SPT', 'src_port'), ('DPT', 'dst_port')):
+        v = re.search(r'\b' + key + r'=(\S+)', line)
+        if v:
+            f[canon] = v.group(1).lower() if canon == 'proto' else v.group(1)
+    rule = re.search(r'\[([\w-]+?)-(?:\d+|default|RET)-?([ADR])?\]', prefix)
+    tag  = re.search(r'\[(?:UFW )?([A-Z][A-Z ]*)\]|\b(ACCEPT|DROP|REJECT|DENY|BLOCK|ALLOW)\b',
+                     prefix)
+    word = ''
+    if rule and rule.group(2):
+        word = {'A': 'accept', 'D': 'drop', 'R': 'reject'}[rule.group(2)]
+        f['rule'] = rule.group(0).strip('[]')
+    elif tag:
+        word = (tag.group(1) or tag.group(2) or '').lower()
+        f['rule'] = word
+    if re.search(r'drop|reject|deny|block', word, re.I):
+        kind = 'deny'
+    elif re.search(r'accept|allow|pass', word, re.I):
+        kind = 'allow'
+    else:
+        kind = None
+    f.update(name=f'netfilter {word}'.strip(), kind=kind)
+    return f
+
+
+# pfSense / OPNsense:  filterlog[123]: 5,,,1000000103,igb0,match,block,in,4,0x0,,64,...
+def _p_filterlog(line):
+    i = line.find('filterlog')
+    if i < 0:
+        return None
+    j = line.find(': ', i)
+    if j < 0:
+        return None
+    c = line[j + 2:].split(',')
+    if len(c) < 10:
+        return None
+    f = {'rule': c[3] or c[0], 'iface': c[4], 'action': c[6]}
+    try:
+        if c[8] == '4':
+            f.update(proto=c[16].lower(), src_ip=c[18], dst_ip=c[19])
+            if f['proto'] in ('tcp', 'udp') and len(c) > 21:
+                f.update(src_port=c[20], dst_port=c[21])
+        elif c[8] == '6':
+            f.update(proto=c[12].lower(), src_ip=c[15], dst_ip=c[16])
+            if f['proto'] in ('tcp', 'udp') and len(c) > 18:
+                f.update(src_port=c[17], dst_port=c[18])
+    except IndexError:
+        pass
+    kind = 'deny' if c[6] in ('block', 'reject') else ('allow' if c[6] == 'pass' else None)
+    f.update(name=f'filterlog {c[6]}', kind=kind)
+    return {k: v for k, v in f.items() if v}
+
+
+# MikroTik RouterOS:  firewall,info input: in:ether1 out:(unknown 0), src-mac .., proto TCP (SYN),
+#                     1.2.3.4:51234->10.0.0.1:22, len 60
+_MT_TOPICS = (r'system|firewall|wireless|interface|dhcp|account|caps|ipsec|ppp|pppoe|l2tp|ovpn|'
+              r'hotspot|script|bridge|ospf|bgp|route|dns|ntp|ssh|web-proxy|e-mail|certificate|'
+              r'health|lte|wireguard|stp|rstp|mstp|radius|dot1x|poe-out|ups|manager|async|gps|'
+              r'sstp|pptp|vrrp|ike2|watchdog|isdn|wifi')
+_MT_RE = re.compile(
+    r'(?:^|\s)((?:' + _MT_TOPICS + r')(?:,(?:info|warning|error|critical|debug|account|raw|'
+    r'packet|' + _MT_TOPICS + r'))+)\s+(.*)$')
+
+
+def _p_mikrotik(line):
+    m = _MT_RE.search(line)
+    if not m:
+        return None
+    topics, msg = m.group(1).split(','), m.group(2)
+    lvl  = next((t for t in topics if t in ('critical', 'error', 'warning', 'info', 'debug')), None)
+    vsev = {'critical': 2, 'error': 3, 'warning': 4, 'info': 6, 'debug': 7}.get(lvl)
+    f, kind = {}, None
+    if 'firewall' in topics:
+        s = re.search(r'([\da-fA-F.:]+?):(\d+)->([\da-fA-F.:]+?):(\d+)', msg) or \
+            re.search(r'(\d{1,3}(?:\.\d{1,3}){3})->(\d{1,3}(?:\.\d{1,3}){3})', msg)
+        if s and s.lastindex == 4:
+            f.update(src_ip=s.group(1), src_port=s.group(2), dst_ip=s.group(3),
+                     dst_port=s.group(4))
+        elif s:
+            f.update(src_ip=s.group(1), dst_ip=s.group(2))
+        p = re.search(r'proto (\w+)', msg)
+        if p:
+            f['proto'] = p.group(1).lower()
+        i = re.search(r'\bin:(\S+?)[ ,]', msg)
+        if i:
+            f['iface'] = i.group(1)
+        pre = msg.split(':', 1)[0]
+        kind = ('deny' if re.search(r'drop|reject|deny|block', pre, re.I) else
+                'allow' if re.search(r'accept|allow', pre, re.I) else None)
+        name = f'firewall {pre}'[:40]
+    elif {'wireless', 'caps', 'wifi'} & set(topics):
+        w = re.match(r'([0-9A-Fa-f:]{17})@(\S+):\s*(\w[\w ]*?)(?:,|$)', msg)
+        if w:
+            f.update(client_mac=norm_mac(w.group(1)), iface=w.group(2))
+            word = w.group(3).lower()
+            kind = ('failure' if re.search(r'reject|fail|not in local acl|timeout', msg, re.I) else
+                    'disconnect' if 'disconnect' in word else
+                    'join' if 'connect' in word else None)
+            r = re.search(r'signal strength (-?\d+)', msg)
+            if r:
+                f['rssi'] = r.group(1)
+            r = re.search(r'disconnected, (.+?)(?:, signal|$)', msg)
+            if r:
+                f['reason'] = r.group(1)
+            name = f'wireless {word}'
+        else:
+            kind = classify_text('', msg)
+            name = 'wireless'
+    else:
+        if re.search(r'login failure', msg):
+            kind = 'login_fail'
+        elif re.search(r'logged in', msg):
+            kind = 'login'
+        elif re.search(r'logged out', msg):
+            kind = 'logout'
+        elif re.search(r'(?:changed|added|removed) by', msg):
+            kind = 'config'
+        elif 'interface' in topics:
+            kind = _updown(msg, 'link_down', 'link_up')
+        else:
+            kind = classify_text(topics[0].upper(), msg)
+        u = re.search(r'user (\S+)', msg)
+        if u and kind in ('login_fail', 'login', 'logout', 'config'):
+            f['user'] = u.group(1)
+        ip = re.search(r'from (\d{1,3}(?:\.\d{1,3}){3})', msg)
+        if ip:
+            f['src_ip'] = ip.group(1)
+        if 'interface' in topics:
+            f['iface'] = msg.split()[0]
+        name = f'{topics[0]} ' + ' '.join(msg.split()[:3])
+    f.update(name=name[:60], kind=kind, vsev=vsev, msg=msg)
+    return f
+
+
+# SonicWall:  id=firewall sn=C0EAE4.. time="2024-03-01 12:00:00" fw=1.2.3.4 pri=6 c=262144 m=98
+#             msg="Connection Opened" src=10.0.0.1:1234:X0 dst=8.8.8.8:53:X1 proto=udp/dns
+def _p_sonicwall(line):
+    if 'id=' not in line or ' m=' not in line or ('sn=' not in line and 'fw=' not in line):
+        return None
+    raw = _kv_pairs(line)
+    if 'm' not in raw:
+        return None
+    f   = {}
+    for k, ip_k, port_k in (('src', 'src_ip', 'src_port'), ('dst', 'dst_ip', 'dst_port')):
+        parts = raw.get(k, '').split(':')
+        if parts and parts[0]:
+            f[ip_k] = parts[0]
+            if len(parts) > 1 and parts[1]:
+                f[port_k] = parts[1]
+            if len(parts) > 2 and k == 'src':
+                f['iface'] = parts[2]
+    if raw.get('proto'):
+        f['proto'] = raw['proto'].split('/')[0]
+    user = raw.get('usr') or raw.get('user')
+    if user:
+        f['user'] = user
+    msg = raw.get('msg', '')
+    act = raw.get('fw_action', '').lower()
+    low = msg.lower()
+    if re.search(r'ips (?:detection|prevention)|anti-virus|anti-spyware|botnet|malware|attack|'
+                 r'port scan|scan detected|flood', low):
+        kind = 'threat'
+    elif act in ('drop', 'deny', 'block') or re.search(r'dropped|denied|blocked', low):
+        kind = 'deny'
+    elif re.search(r'login (?:denied|failed)|authentication failed|incorrect', low):
+        kind = 'login_fail'
+    elif re.search(r'logged in|login allowed|login succeeded', low):
+        kind = 'login'
+    elif act == 'forward' or 'connection opened' in low:
+        kind = 'allow'
+    elif 'connection closed' in low:
+        kind = 'session'
+    else:
+        kind = classify_text('', msg)
+    pri = raw.get('pri', '')
+    f.update(name=msg or f'm={raw["m"]}', kind=kind, code=raw['m'], msg=msg,
+             vsev=int(pri) if pri.isdigit() and int(pri) < 8 else None)
+    if raw.get('time'):
+        f['when'] = raw['time'].replace(' ', 'T')
+    return f
+
+
+# Sophos Firewall (XG/SFOS):  device="SFW" date=2024-03-01 time=12:00:00 ... log_type="Firewall"
+_SOPHOS_MAP = {'src_ip': 'src_ip', 'dst_ip': 'dst_ip', 'src_port': 'src_port',
+               'dst_port': 'dst_port', 'protocol': 'proto', 'fw_rule_id': 'rule',
+               'user_name': 'user', 'src_mac': 'client_mac', 'in_interface': 'iface',
+               'message': 'msg', 'status': 'status', 'signature_msg': 'signature',
+               'device_name': 'host', 'reason': 'reason'}
+
+
+def _p_sophos(line):
+    if 'log_type=' not in line or 'log_component=' not in line:
+        return None
+    raw = _kv_pairs(line)
+    f   = _map_fields(raw, _SOPHOS_MAP)
+    lt, sub = raw.get('log_type', ''), raw.get('log_subtype', '')
+    text = f"{raw.get('message', '')} {sub} {raw.get('status', '')}"
+    if lt in ('IDP', 'Anti-Virus', 'ATP', 'Anti-Spam', 'Sandstorm') or sub == 'Alert':
+        kind = 'threat'
+    elif lt in ('Firewall', 'Content Filtering', 'Application Filter', 'Web Filter'):
+        kind = 'deny' if sub in ('Denied', 'Drop', 'Blocked') or \
+            raw.get('status', '').lower() in ('deny', 'drop', 'blocked') else 'allow'
+    elif re.search(r'authentication', lt + raw.get('log_component', ''), re.I) or \
+            sub == 'Authentication':
+        kind = 'login_fail' if re.search(r'fail', text, re.I) else 'login'
+    else:
+        kind = classify_text(raw.get('log_component', '').upper(), text)
+    if 'client_mac' in f:
+        f['client_mac'] = norm_mac(f['client_mac']) or f.pop('client_mac')
+    if 'date' in raw and 'time' in raw:
+        f['when'] = f"{raw['date']}T{raw['time']}"
+    f.update(name=f"{lt}/{sub}".strip('/') or raw.get('log_component', 'sophos'), kind=kind,
+             vsev=SEV_NAMES.get(raw.get('priority', '').lower()))
+    return f
+
+
+# Check Point (syslog exporter):  ... [action:"Drop"; src:"1.2.3.4"; dst:".."; ...]
+_CP_KV_RE = re.compile(r'(\w+):"((?:[^"\\]|\\.)*)"')
+
+
+def _p_checkpoint(line):
+    if 'product:"' not in line and 'origin:"' not in line:
+        return None
+    raw = dict(_CP_KV_RE.findall(line))
+    if 'action' not in raw and 'product' not in raw:
+        return None
+    f = _map_fields(raw, {'src': 'src_ip', 'dst': 'dst_ip', 's_port': 'src_port',
+                          'service': 'dst_port', 'proto': 'proto', 'rule_name': 'rule',
+                          'rule': 'rule', 'src_user_name': 'user', 'user': 'user',
+                          'ifname': 'iface', 'protection_name': 'signature',
+                          'attack': 'signature', 'severity': 'threat_sev', 'reason': 'reason',
+                          'origin': 'host', 'src_machine_name': 'client_host'})
+    if f.get('proto') in _PROTO_NUM:
+        f['proto'] = _PROTO_NUM[f['proto']]
+    act = raw.get('action', '').lower()
+    if act in ('prevent', 'detect') or raw.get('protection_name') or raw.get('attack'):
+        kind = 'threat'
+    elif act in ('drop', 'reject', 'block'):
+        kind = 'deny'
+    elif act in ('accept', 'allow'):
+        kind = 'allow'
+    elif act in ('failed log in', 'log in failed') or 'fail' in raw.get('auth_status', '').lower():
+        kind = 'login_fail'
+    elif act in ('log in', 'logged in') or raw.get('auth_status', '').lower() == 'successful login':
+        kind = 'login'
+    elif act in ('key install',):
+        kind = 'vpn_up'
+    else:
+        kind = classify_text(raw.get('product', '').upper(), act)
+    f.update(name=f"{raw.get('product', 'Check Point')} {act}".strip(), kind=kind)
+    return f
+
+
+# FreeRADIUS:  Auth: (123) Login incorrect (mschap: ...): [alice] (from client wlc port 0 cli aa-bb-..)
+_FR_RE = re.compile(r'\bAuth: (?:\(\d+\) )?(Login OK|Login incorrect|Invalid user)'
+                    r'(?: \(([^)]*)\))?: \[([^\]]*)\](?: \(from client (\S+) port (\S+)'
+                    r'(?: cli ([0-9A-Fa-f:.\-]+))?)?')
+
+
+def _p_freeradius(line):
+    m = _FR_RE.search(line)
+    if not m:
+        return None
+    res, reason, user, nas, port, cli = m.groups()
+    f = {'name': f'radius {res}', 'kind': 'auth' if res == 'Login OK' else 'failure',
+         'user': user.split('/')[0] or None, 'reason': reason, 'nas': nas}
+    if cli and norm_mac(cli):
+        f['client_mac'] = norm_mac(cli)
+    return {k: v for k, v in f.items() if v}
+
+
+# Cisco ISE:  CISE_Failed_Attempts 0000123 1 0 2024-03-01 12:00:00.000 +00:00 0000001 5400 NOTICE
+#             Failed-Attempt: Authentication failed, ConfigVersionId=1, UserName=alice, ...
+_ISE_RE = re.compile(r'\b(CISE_\w+) \d+ \d+ \d+ (\d{4}-\d{2}-\d{2} [\d:.]+ [+-]\d{2}:?\d{2}) '
+                     r'\d+ (\d{4,5}) (\w+) ([^:,]+):\s*([^,]*),?(.*)$')
+
+
+def _p_ise(line):
+    m = _ISE_RE.search(line)
+    if not m:
+        return None
+    cat, when, code, sevw, klass, text, rest = m.groups()
+    raw = {}
+    for part in re.split(r',\s*(?=[\w\-. ]+=)', rest):
+        if '=' in part:
+            k, v = part.split('=', 1)
+            raw[k.strip()] = v.strip()
+    f = _map_fields(raw, {'UserName': 'user', 'User-Name': 'user', 'Calling-Station-ID': 'client_mac',
+                          'NetworkDeviceName': 'nas', 'NAS-Port-Id': 'iface',
+                          'FailureReason': 'reason', 'Location': 'ap_loc',
+                          'NAS-IP-Address': 'nas_ip', 'Framed-IP-Address': 'client_ip',
+                          'SSID': 'ssid'})
+    if 'client_mac' in f:
+        f['client_mac'] = norm_mac(f['client_mac']) or f.pop('client_mac')
+    called = raw.get('Called-Station-ID', '')
+    if ':' in called and 'ssid' not in f:
+        f['ssid'] = called.rsplit(':', 1)[1]
+    kind = ('failure' if 'Failed' in cat or code in ('5400', '5405', '5411', '5417', '5440')
+            else 'auth' if 'Passed' in cat or code in ('5200', '5236') else
+            'login_fail' if 'Administrator' in cat and 'fail' in text.lower() else
+            'config' if 'Administrative' in cat else None)
+    f.update(name=f'ISE {code} {text.strip()}'[:60], kind=kind,
+             vsev=SEV_NAMES.get(sevw.lower()), when=when.replace(' ', 'T', 1).replace(' ', ''))
+    return f
+
+
+# Extreme Networks EXOS:  <Info:vlan.msgs.portLinkStateDown> Port 1:1 link down
+_EXOS_RE = re.compile(r'<(Emer|Alrt|Crit|Erro|Warn|Noti|Info|Dbug|Summ|Verb)\w*:([\w.]+)>\s*(.*)$')
+
+
+def _p_exos(line):
+    m = _EXOS_RE.search(line)
+    if not m:
+        return None
+    lvl, tag, msg = m.groups()
+    kind = classify_text(tag.upper().replace('.', '_'), msg)
+    if 'LinkStateDown' in tag:
+        kind = 'link_down'
+    elif 'LinkStateUp' in tag:
+        kind = 'link_up'
+    f = _common_fields(msg, kind)
+    p = re.search(r'\bPort (\d+(?::\d+)?)', msg)
+    if p:
+        f['iface'] = p.group(1)
+    f.update(name=tag, kind=kind, vsev=SEV_NAMES.get(lvl.lower()), msg=msg)
+    return f
+
+
+# Ruckus ICX / Brocade FastIron switches (no message tags):
+#   Interface ethernet1/1/1, state down / Security: SSH login by admin from src IP ...
+_ICX_RE = re.compile(
+    r'\b(Interface (?:ethernet|ve|lag|management)\s?\S+, state (?:up|down)|'
+    r'Security: |STP: |MSTP: |DOT1X: |MAC Authentication |Loop Detection: |'
+    r'System: (?:Module|Fan|PoE|Power|Temperature)|PoE: |Port \S+ is (?:shut down|disabled))(.*)$')
+
+
+def _p_icx(line):
+    m = _ICX_RE.search(line)
+    if not m:
+        return None
+    msg  = m.group(0)
+    head = m.group(1).split(':')[0].split(',')[0].strip()
+    kind = classify_text(head.upper().replace(' ', '_'), msg)
+    if head.startswith('Interface'):
+        kind = 'link_down' if msg.rstrip().endswith('down') or 'state down' in msg else 'link_up'
+    elif head == 'Security' and re.search(r'fail|reject|denied|invalid', msg, re.I):
+        kind = 'login_fail'
+    elif head == 'Security' and 'login' in msg.lower():
+        kind = 'login'
+    f = _common_fields(msg, kind)
+    if head.startswith('Interface'):
+        f['iface'] = head.split()[1]
+    f.update(name=head if not head.startswith('Interface') else 'Interface state', kind=kind,
+             msg=msg)
+    return f
+
+
+# Dell EMC OS10:  %Node.1-Unit.1:PRI:OS10 %Dell EMC (OS10) %IFM_OSTATE_DN: Interface ...
+_OS10_RE = re.compile(r'%Dell EMC \(OS10\) %([A-Z][A-Z0-9_]+):\s*(.*)$')
+
+
+def _p_os10(line):
+    m = _OS10_RE.search(line)
+    if not m:
+        return None
+    tag, msg = m.groups()
+    kind = 'link_down' if tag.endswith(('_DN', '_DOWN')) and 'OSTATE' in tag else \
+        'link_up' if tag.endswith('_UP') and 'OSTATE' in tag else classify_text(tag, msg)
+    f = _common_fields(msg, kind)
+    f.update(name=tag, kind=kind, msg=msg)
+    return f
+
+
+_SHORT_NAMES = {
+    'ruckus_sz': 'Ruckus SmartZone', 'ruckus_zd': 'Ruckus ZD/Unleashed', 'aruba_os': 'ArubaOS',
+    'aruba_cx': 'AOS-CX', 'aruba_aoss': 'AOS-S', 'cisco_asa': 'Cisco ASA/FTD',
+    'cisco': 'Cisco IOS-style', 'comware': 'Comware/Huawei', 'junos': 'Junos',
+    'fortinet': 'FortiGate', 'paloalto': 'PAN-OS', 'meraki': 'Meraki', 'cef': 'CEF',
+    'leef': 'LEEF', 'unifi_sta': 'UniFi stahtd', 'hostapd': 'hostapd', 'filterlog': 'pfSense',
+    'netfilter': 'netfilter', 'mikrotik': 'MikroTik', 'sonicwall': 'SonicWall',
+    'sophos': 'Sophos', 'checkpoint': 'Check Point', 'freeradius': 'FreeRADIUS',
+    'ise': 'Cisco ISE', 'exos': 'Extreme EXOS', 'icx': 'Ruckus ICX', 'os10': 'Dell OS10',
+    'kv': 'key=value'}
+
+
+class LogFormat:
+    """One recognised log format.
+
+    hint     : substrings, any of which must appear in the line before the
+               (slower) parser is tried; None = always try.
+    examples : (line, expected kind, {field: value}) — documentation, the
+               --formats listing, and unit tests all use these.
+    """
+    def __init__(self, id, vendor, product, classes, hint, parse, examples, note=''):
+        self.id, self.vendor, self.product = id, vendor, product
+        self.short = _SHORT_NAMES.get(id, vendor)
+        self.classes, self.hint, self.parse = classes, hint, parse
+        self.examples, self.note = examples, note
+
+    @property
+    def label(self):
+        return f'{self.vendor} {self.product}'.strip()
+
+
+FORMATS = [
+    LogFormat('ruckus_sz', 'Ruckus', 'SmartZone / vSZ', 'wifi', ('@@',), _p_ruckus_sz, [
+        ('May  1 08:01:00 sz1 Core: @@203,clientJoinFailure,"apMac"="aa:bb:cc:00:00:02",'
+         '"clientMac"="f4:f5:d8:de:73:50","ssid"="Staff-old","userName"="alice",'
+         '"apName"="AP-Gym-2","apLocation"="Gym"', 'failure',
+         {'client_mac': 'f4:f5:d8:de:73:50', 'ap_name': 'AP-Gym-2', 'ssid': 'Staff-old'}),
+        ('May  1 08:03:30 sz1 Core: @@202,clientJoin,"apMac"="aa:bb:cc:00:00:02",'
+         '"clientMac"="f4:f5:d8:de:73:50","ssid"="Staff","receivedSignalStrength"="-71"',
+         'join', {'rssi': '-71'}),
+        ('May  1 08:05:00 sz1 Core: @@209,clientRoaming,"apMac"="aa:bb:cc:00:00:03",'
+         '"clientMac"="f4:f5:d8:de:73:50"', 'roam', {}),
+    ], 'Event codes 201 clientAuthFailure, 202 clientJoin, 203 clientJoinFailure, '
+       '204 clientDisconnect, 205 clientInactivityTimeout, 206 clientAuthorization, '
+       '207 clientAuthorizationFailure, 208 clientSessionExpiration, 209 clientRoaming, '
+       '210 clientSessionLogout; AP events (apConnectionLost, apRebootByUser, ...).'),
+    LogFormat('ruckus_zd', 'Ruckus', 'ZoneDirector / Unleashed', 'wifi', ('User[', 'AP['),
+              _p_ruckus_zd, [
+        ('May  1 08:00:00 zd stamgr: User[aa:bb:cc:dd:ee:ff] joins WLAN[Corp] from '
+         'AP[AP-1@11:22:33:44:55:66]', 'join', {'ssid': 'Corp', 'ap_name': 'AP-1'}),
+        ('May  1 08:00:05 zd stamgr: User[aa:bb:cc:dd:ee:ff] fails to authenticate with '
+         'WLAN[Corp] from AP[AP-1@11:22:33:44:55:66]', 'failure', {}),
+    ], 'Text event format; less standardised than SmartZone.'),
+    LogFormat('aruba_os', 'Aruba (HPE)', 'ArubaOS controller / Instant AP', 'wifi',
+              ('<NOTI>', '<WARN>', '<ERRS>', '<INFO>', '<CRIT>', '<DBUG>', '<ALRT>', '<EMRG>'),
+              _p_aruba, [
+        ('Mar 20 10:48:41 ctrl authmgr[3456]: <522008> <NOTI> <ctrl 10.0.0.1>  User '
+         'Authentication Successful: username=alice MAC=00:00:5e:00:53:01 IP=10.124.163.132 '
+         'role=employee VLAN=10 AP=AP-1 SSID=Corp', 'auth',
+         {'user': 'alice', 'client_mac': '00:00:5e:00:53:01', 'ap_name': 'AP-1', 'ssid': 'Corp'}),
+        ('Mar 20 10:49:00 iap1 stm[1234]: <501094> <NOTI> |AP ap1@10.0.0.2 stm|  Auth failure: '
+         'aa:bb:cc:dd:ee:ff: AP 10.0.0.2-11:22:33:44:55:66-ap1 Reason AP is resource constrained',
+         'failure', {'client_mac': 'aa:bb:cc:dd:ee:ff', 'ap_name': 'ap1'}),
+    ], '<6-digit message ID> <LEVEL> then text; 522xxx = authmgr, 501xxx = station manager.'),
+    LogFormat('aruba_cx', 'Aruba (HPE)', 'AOS-CX switch', 'switch', ('Event|',), _p_aos_cx, [
+        ('Mar  1 12:00:00 cx1 hpe-restd[1234]: Event|4605|LOG_INFO|AMM|1/1|User admin '
+         'logged in from 10.0.0.9 through SSH session.', 'login',
+         {'user': 'admin', 'src_ip': '10.0.0.9'}),
+    ]),
+    LogFormat('aruba_aoss', 'Aruba / HP', 'AOS-S (ProCurve) switch', 'switch',
+              re.compile(r' \d{5} [a-zA-Z][\w-]*: '), _p_procurve, [
+        ('Mar  1 12:00:00 10.0.0.2 00076 ports: port 12 is now off-line', 'link_down',
+         {'iface': 'port 12'}),
+        ('Mar  1 12:00:01 10.0.0.2 00419 auth: Invalid user name/password on SSH session',
+         'login_fail', {}),
+    ], '5-digit event ID + subsystem.'),
+    LogFormat('cisco_asa', 'Cisco', 'ASA / Firepower (FTD)', 'firewall', ('%ASA-', '%FTD-', '%PIX-',
+                                                                     '%FWSM-'), _p_asa, [
+        ('Mar  1 12:00:00 asa1 %ASA-4-106023: Deny tcp src outside:203.0.113.5/51234 dst '
+         'inside:10.0.0.10/22 by access-group "outside_in" [0x0, 0x0]', 'deny',
+         {'src_ip': '203.0.113.5', 'dst_port': '22', 'rule': 'outside_in'}),
+        ('Mar  1 12:00:01 asa1 %ASA-6-113005: AAA user authentication Rejected : reason = '
+         'AAA failure : server = 10.0.0.5 : user = bob : user IP = 198.51.100.7', 'login_fail',
+         {'user': 'bob'}),
+    ], 'Message IDs mapped: 106xxx/313xxx/710xxx denies, 302xxx sessions, 113xxx/605xxx/611xxx '
+       'logins, 111xxx config, 713xxx/602xxx/722xxx VPN, 733xxx/4000xx/338xxx threats, '
+       '104xxx/105xxx failover.'),
+    LogFormat('cisco', 'Cisco / Arista / Dell', 'IOS, IOS-XE, NX-OS, Catalyst 9800 & AireOS WLC, EOS',
+              'switch router wifi', ('%',), _p_cisco, [
+        ('Mar  1 12:00:00 sw1 123: Mar  1 12:00:00.123: %LINK-3-UPDOWN: Interface '
+         'GigabitEthernet1/0/5, changed state to down', 'link_down',
+         {'iface': 'GigabitEthernet1/0/5'}),
+        ('Mar  1 12:00:00 sw1 %SW_MATM-4-MACFLAP_NOTIF: Host 0011.2233.4455 in vlan 10 is '
+         'flapping between port Gi1/0/1 and port Gi1/0/2', 'loop', {'vlan': '10'}),
+        ('Mar  1 12:00:00 r1 %OSPF-5-ADJCHG: Process 1, Nbr 10.0.0.2 on Gi0/0 from FULL to '
+         'DOWN, Neighbor Down: Dead timer expired', 'neighbor_down', {'neighbor': '10.0.0.2'}),
+        ('Mar  1 12:00:00 sw1 %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] '
+         '[Source: 10.0.0.9] [localport: 22] [Reason: Login Authentication Failed]',
+         'login_fail', {'user': 'admin', 'src_ip': '10.0.0.9'}),
+        ('Mar  1 12:00:00 wlc1 %SESSION_MGR-5-FAIL: Chassis 2 R0/0: wncd: Authorization '
+         'failed or unapplied for client (e839.dfba.997f) on Interface capwap_9000000a '
+         'AuditSessionID 0. Failure reason: Authc fail. Authc failure reason: Cred Fail.',
+         'failure', {'client_mac': 'e8:39:df:ba:99:7f'}),
+        ('Mar  1 12:00:00 wlc1 %CLIENT_ORCH_LOG-6-CLIENT_ADDED_TO_RUN_STATE: Chassis 2 R0/0: '
+         'wncd: Username entry (alice) joined with ssid (Corp) for device with MAC: '
+         '8272.3eb8.50ba', 'auth', {'user': 'alice', 'ssid': 'Corp',
+                                    'client_mac': '82:72:3e:b8:50:ba'}),
+    ], '%FACILITY-SEVERITY-MNEMONIC; severity digit is the syslog level.'),
+    LogFormat('comware', 'HPE Comware / Huawei', 'FlexNetwork (H3C), VRP', 'switch router',
+              ('/0/', '/1/', '/2/', '/3/', '/4/', '/5/', '/6/', '/7/'), _p_comware, [
+        ('%Mar  1 12:00:00:000 2024 SW1 IFNET/3/PHY_UPDOWN: Physical state on the interface '
+         'GigabitEthernet1/0/1 changed to down.', 'link_down',
+         {'iface': 'GigabitEthernet1/0/1'}),
+    ], 'MODULE/SEVERITY/MNEMONIC.'),
+    LogFormat('junos', 'Juniper', 'Junos (EX, QFX, MX, SRX)', 'switch router firewall',
+              re.compile(r'\b[A-Z][A-Z0-9]*_[A-Z0-9_]+(?::|\s+\[junos@)'), _p_junos, [
+        ('Mar  1 12:00:00 srx1 RT_FLOW: RT_FLOW_SESSION_DENY: session denied '
+         '203.0.113.5/51234->10.0.0.10/22 0x0 junos-ssh 6(0) deny-all untrust trust '
+         'UNKNOWN UNKNOWN N/A(N/A) ge-0/0/0.0 No policy reject 5 N/A N/A', 'deny',
+         {'src_ip': '203.0.113.5', 'dst_port': '22', 'rule': 'deny-all'}),
+        ('Mar  1 12:00:00 ex1 mib2d[1234]: SNMP_TRAP_LINK_DOWN: ifIndex 512, ifAdminStatus '
+         'up(1), ifOperStatus down(2), ifName ge-0/0/4', 'link_down', {'iface': 'ge-0/0/4'}),
+        ('Mar  1 12:00:00 mx1 rpd[1234]: RPD_BGP_NEIGHBOR_STATE_CHANGED: BGP peer 192.0.2.1 '
+         '(External AS 65001) changed state from Established to Idle (event RecvNotify)',
+         'neighbor_down', {'neighbor': '192.0.2.1'}),
+        ("Mar  1 12:00:00 ex1 sshd[99]: SSHD_LOGIN_FAILED: Login failed for user 'root' from "
+         "host '198.51.100.7'", 'login_fail', {'user': 'root', 'src_ip': '198.51.100.7'}),
+    ], 'Uppercase event tags (RT_FLOW_*, SNMP_TRAP_*, RPD_*, UI_*, ESWD_*, ...), plain or '
+       'RFC 5424 structured-data [junos@2636...].'),
+    LogFormat('fortinet', 'Fortinet', 'FortiGate (incl. FortiAP/FortiSwitch via FortiGate)',
+              'firewall wifi', ('logid=',), _p_fortinet, [
+        ('date=2024-03-01 time=12:00:00 devname="FGT60F" devid="FGT60FTK0000" logid='
+         '"0000000013" type="traffic" subtype="forward" level="notice" srcip=10.0.0.5 '
+         'srcport=51234 srcintf="internal" dstip=203.0.113.9 dstport=443 dstintf="wan1" '
+         'proto=6 action="deny" policyid=0', 'deny',
+         {'src_ip': '10.0.0.5', 'dst_port': '443', 'proto': 'tcp', 'host': 'FGT60F'}),
+        ('date=2024-03-01 time=12:00:00 devname="FGT60F" devid="FGT60FTK0000" logid='
+         '"0104043629" type="event" subtype="wireless" level="warning" logdesc="Wireless client '
+         'RADIUS authentication failure" stamac="aa:bb:cc:dd:ee:ff" ssid="Corp" ap="FAP-1"',
+         'failure', {'client_mac': 'aa:bb:cc:dd:ee:ff', 'ssid': 'Corp', 'ap_name': 'FAP-1'}),
+    ], 'key=value with type= traffic | utm | event and subtype=; level= is the syslog level.'),
+    LogFormat('paloalto', 'Palo Alto Networks', 'PAN-OS (CSV syslog)', 'firewall',
+              ('TRAFFIC,', 'THREAT,', 'SYSTEM,', 'CONFIG,', 'GLOBALPROTECT,', 'USERID,',
+               'AUTH,', 'DECRYPTION,', 'HIPMATCH,'), _p_paloalto, [
+        ('<14>Mar  1 12:00:00 PA-1 1,2024/03/01 12:00:00,013201000000,TRAFFIC,deny,2561,'
+         '2024/03/01 12:00:00,203.0.113.5,10.0.0.10,0.0.0.0,0.0.0.0,block-inbound,,,'
+         'ssh,vsys1,untrust,trust,ethernet1/1,,fwd,2024/03/01 12:00:00,12345,1,51234,22,0,0,'
+         '0x0,tcp,deny,60,60,0,1,2024/03/01 12:00:00,0,any,0,1,0x0,US,10.0.0.0-10.255.255.255,'
+         '0,1,0,policy-deny', 'deny',
+         {'src_ip': '203.0.113.5', 'dst_port': '22', 'rule': 'block-inbound'}),
+    ], 'Positional CSV per the PAN-OS syslog field reference (TRAFFIC, THREAT, SYSTEM, '
+       'CONFIG, GLOBALPROTECT, ...).'),
+    LogFormat('meraki', 'Cisco Meraki', 'MR / MS / MX', 'wifi switch firewall',
+              re.compile(r'^\s*(?:<\d+>)?1 \d{10}\.'),
+              _p_meraki, [
+        ("<134>1 1709294400.123456789 MR42 events type=8021x_eap_failure radio='1' vap='0' "
+         "client_mac='AA:BB:CC:DD:EE:FF' identity='alice'", 'failure',
+         {'client_mac': 'aa:bb:cc:dd:ee:ff', 'user': 'alice', 'host': 'MR42'}),
+        ("<134>1 1709294400.123456789 MX84 flows src=10.0.0.5 dst=203.0.113.9 mac=AA:BB:CC:DD:EE:FF "
+         "protocol=tcp sport=51234 dport=23 pattern: 1 (dst port 23) deny", 'deny',
+         {'dst_port': '23'}),
+    ], 'Categories: events (type=...), flows/firewall, urls, ids-alerts, security_event, '
+       'airmarshal_events.'),
+    LogFormat('cef', 'CEF', 'UniFi Network, and any CEF source', 'wifi firewall', ('CEF:',),
+              _p_cef, [
+        ('Mar  1 12:00:00 unifi CEF:0|Ubiquiti|UniFi Network|8.5.6|401|WiFi Client '
+         'Disconnected|2|UNIFIcategory=Monitoring UNIFIsubCategory=WiFi UNIFIclientMac='
+         '0a:be:db:c8:0d:81 UNIFIlastConnectedToDeviceName=Lobby AP UNIFIwifiName=Corp '
+         'msg=Client disconnected', 'disconnect',
+         {'client_mac': '0a:be:db:c8:0d:81', 'ap_name': 'Lobby AP', 'ssid': 'Corp'}),
+    ], 'CEF:Version|Vendor|Product|Version|ID|Name|Severity|key=value extensions.'),
+    LogFormat('leef', 'LEEF', 'IBM LEEF 1.0/2.0 sources', 'firewall', ('LEEF:',), _p_leef, [
+        ('LEEF:1.0|Palo Alto Networks|PAN-OS Syslog Integration|10.1|deny|src=203.0.113.5\t'
+         'dst=10.0.0.10\tsrcPort=51234\tdstPort=22\taction=deny', 'deny', {'dst_port': '22'}),
+    ]),
+    LogFormat('unifi_sta', 'Ubiquiti', 'UniFi AP station tracker (stahtd)', 'wifi',
+              ('STA-TRACKER',), _p_unifi_stahtd, [
+        ('Mar  1 12:00:00 U6-Lite stahtd[1234]: [STA-TRACKER].stahtd_dump_event(): '
+         '{"message_type":"STA_ASSOC_TRACKER","mac":"aa:bb:cc:dd:ee:ff","vap":"ath2",'
+         '"event_type":"failure","assoc_status":"0","wpa_auth_failures":"1"}', 'failure',
+         {'client_mac': 'aa:bb:cc:dd:ee:ff'}),
+    ]),
+    LogFormat('hostapd', 'hostapd', 'UniFi, OpenWrt and other Linux APs', 'wifi', ('hostapd',),
+              _p_hostapd, [
+        ('Mar  1 12:00:00 ap1 hostapd: ath0: STA aa:bb:cc:dd:ee:ff IEEE 802.11: associated',
+         'join', {'client_mac': 'aa:bb:cc:dd:ee:ff', 'iface': 'ath0'}),
+        ('Mar  1 12:00:02 ap1 hostapd: wlan0: STA aa:bb:cc:dd:ee:ff WPA: EAPOL-Key timeout',
+         'failure', {}),
+    ]),
+    LogFormat('filterlog', 'Netgate / Deciso', 'pfSense / OPNsense filterlog', 'firewall',
+              ('filterlog',), _p_filterlog, [
+        ('Mar  1 12:00:00 fw filterlog[123]: 5,,,1000000103,igb0,match,block,in,4,0x0,,64,'
+         '12345,0,DF,6,tcp,60,203.0.113.5,10.0.0.10,51234,22,0,S,1,,64240,,mss', 'deny',
+         {'src_ip': '203.0.113.5', 'dst_port': '22', 'iface': 'igb0'}),
+    ]),
+    LogFormat('netfilter', 'Linux', 'iptables / nftables / UFW, UniFi & EdgeOS gateways',
+              'firewall', ('SRC=',), _p_netfilter, [
+        ('Mar  1 12:00:00 gw kernel: [UFW BLOCK] IN=eth0 OUT= MAC=00:11:22:33:44:55 '
+         'SRC=203.0.113.5 DST=10.0.0.10 LEN=60 PROTO=TCP SPT=51234 DPT=22', 'deny',
+         {'src_ip': '203.0.113.5', 'dst_port': '22', 'proto': 'tcp'}),
+        ('Mar  1 12:00:00 udm kernel: [WAN_IN-4000-D]IN=eth8 OUT=br0 SRC=203.0.113.5 '
+         'DST=10.0.0.10 PROTO=UDP SPT=5353 DPT=161', 'deny', {'rule': 'WAN_IN-4000-D'}),
+    ]),
+    LogFormat('mikrotik', 'MikroTik', 'RouterOS', 'router firewall wifi', (',info', ',warning',
+              ',error', ',critical', ',debug', ',account'), _p_mikrotik, [
+        ('Mar  1 12:00:00 rtr firewall,info drop input: in:ether1 out:(unknown 0), proto TCP '
+         '(SYN), 203.0.113.5:51234->10.0.0.1:22, len 60', 'deny',
+         {'src_ip': '203.0.113.5', 'dst_port': '22'}),
+        ('Mar  1 12:00:00 rtr wireless,info aa:bb:cc:dd:ee:ff@wlan1: disconnected, received '
+         'deauth: sending station leaving (3), signal strength -77', 'disconnect',
+         {'client_mac': 'aa:bb:cc:dd:ee:ff', 'rssi': '-77'}),
+        ('Mar  1 12:00:00 rtr system,error,critical login failure for user admin from '
+         '198.51.100.7 via ssh', 'login_fail', {'user': 'admin', 'src_ip': '198.51.100.7'}),
+    ], 'Comma-separated topics with a level (info, warning, error, critical).'),
+    LogFormat('sonicwall', 'SonicWall', 'SonicOS', 'firewall', (' m=',), _p_sonicwall, [
+        ('Mar  1 12:00:00 sw id=firewall sn=C0EAE4000000 time="2024-03-01 12:00:00" '
+         'fw=203.0.113.1 pri=1 c=32 m=82 msg="Possible port scan detected" '
+         'src=198.51.100.7:51234:X1 dst=203.0.113.1:22:X1 proto=tcp/ssh', 'threat',
+         {'src_ip': '198.51.100.7', 'dst_port': '22'}),
+    ]),
+    LogFormat('sophos', 'Sophos', 'Firewall (XG / SFOS)', 'firewall', ('log_component=',),
+              _p_sophos, [
+        ('device="SFW" date=2024-03-01 time=12:00:00 timezone="UTC" device_name="XG" '
+         'log_id=010101600001 log_type="Firewall" log_component="Firewall Rule" '
+         'log_subtype="Denied" status="Deny" priority=Information fw_rule_id=5 '
+         'src_ip=203.0.113.5 dst_ip=10.0.0.10 protocol="TCP" src_port=51234 dst_port=22',
+         'deny', {'src_ip': '203.0.113.5', 'dst_port': '22'}),
+    ]),
+    LogFormat('checkpoint', 'Check Point', 'Quantum / Gaia (syslog export)', 'firewall',
+              ('product:"', 'origin:"'), _p_checkpoint, [
+        ('<134>1 2024-03-01T12:00:00Z gw1 CheckPoint 1234 - [action:"Drop"; ifdir:"inbound"; '
+         'ifname:"eth1"; origin:"10.0.0.1"; product:"VPN-1 & FireWall-1"; proto:"6"; '
+         'rule_name:"Cleanup"; s_port:"51234"; service:"22"; src:"203.0.113.5"; '
+         'dst:"10.0.0.10"]', 'deny', {'src_ip': '203.0.113.5', 'dst_port': '22', 'proto': 'tcp'}),
+    ]),
+    LogFormat('freeradius', 'FreeRADIUS', 'radiusd', 'nac', ('Auth:',), _p_freeradius, [
+        ('Mar  1 12:00:00 radius1 radiusd[99]: Auth: (123) Login incorrect (mschap: '
+         'MS-CHAP2-Response is incorrect): [alice] (from client wlc1 port 0 cli '
+         'AA-BB-CC-DD-EE-FF)', 'failure', {'user': 'alice', 'client_mac': 'aa:bb:cc:dd:ee:ff'}),
+    ]),
+    LogFormat('ise', 'Cisco', 'ISE', 'nac', ('CISE_',), _p_ise, [
+        ('Mar  1 12:00:00 ise1 CISE_Failed_Attempts 0000012345 1 0 2024-03-01 12:00:00.000 '
+         '+00:00 0000067890 5400 NOTICE Failed-Attempt: Authentication failed, '
+         'ConfigVersionId=12, UserName=alice, Calling-Station-ID=AA-BB-CC-DD-EE-FF, '
+         'NetworkDeviceName=WLC1, FailureReason=22056 Subject not found in the applicable '
+         'identity store(s)', 'failure', {'user': 'alice', 'client_mac': 'aa:bb:cc:dd:ee:ff'}),
+    ]),
+    LogFormat('exos', 'Extreme Networks', 'EXOS', 'switch', ('<Info:', '<Warn:', '<Erro:',
+              '<Crit:', '<Noti:', '<Emer:', '<Alrt:', '<Dbug:'), _p_exos, [
+        ('Mar  1 12:00:00 x440 <Info:vlan.msgs.portLinkStateDown> Port 1:12 link down',
+         'link_down', {'iface': '1:12'}),
+    ]),
+    LogFormat('icx', 'Ruckus / Brocade', 'ICX / FastIron switch', 'switch', ('Interface ',
+              'Security:', 'STP:', 'DOT1X:', 'MAC Authentication', 'Loop Detection',
+              'System:', 'PoE:', 'Port '), _p_icx, [
+        ('Mar  1 12:00:00 icx1 Interface ethernet1/1/5, state down', 'link_down',
+         {'iface': 'ethernet1/1/5'}),
+    ], 'Text messages without tags; matched by known prefixes.'),
+    LogFormat('os10', 'Dell', 'OS10', 'switch', ('(OS10)',), _p_os10, [
+        ('Mar  1 12:00:00 s5248 %Node.1-Unit.1:PRI:OS10 %Dell EMC (OS10) %IFM_OSTATE_DN: '
+         'Interface operational state is down :ethernet1/1/3', 'link_down', {}),
+    ]),
+]
+# Most specific signatures first; broad text matchers (ICX, ZoneDirector,
+# AOS-S) last.
+_ORDER = ['ruckus_sz', 'cef', 'leef', 'fortinet', 'paloalto', 'cisco_asa', 'os10', 'cisco',
+          'sophos', 'sonicwall', 'checkpoint', 'ise', 'freeradius', 'meraki', 'aruba_os',
+          'aruba_cx', 'junos', 'comware', 'filterlog', 'netfilter', 'unifi_sta', 'hostapd',
+          'mikrotik', 'exos', 'icx', 'ruckus_zd', 'aruba_aoss']
+FORMATS.sort(key=lambda f: _ORDER.index(f.id))
+FORMAT_BY_ID = {f.id: f for f in FORMATS}
+_GENERIC = LogFormat('kv', 'Generic', 'key=value', 'any', None, None, [])
+FORMAT_BY_ID['kv'] = _GENERIC
+_LAST_FMT = [None]
+
+
+# Fields that must be normalized after a vendor parser runs.
+_INT_FIELDS = ('src_port', 'dst_port')
+
+
+def _finish(fmt, d, line):
+    """Turn a vendor parser's dict into a ParsedEvent."""
+    hdr_sev, host = syslog_header(line)
+    name = d.pop('name', '') or ''
+    kind = d.pop('kind', None)
+    vsev = d.pop('vsev', None)
+    if vsev is None:
+        vsev = hdr_sev
+    when = d.pop('when', None)
+    fields = {}
+    intern = sys.intern
+    for k, v in d.items():
+        if v is None or v == '':
+            continue
+        v = str(v)
+        if k in _MAC_FIELDS:
+            v = norm_mac(v)
+            if not v:
+                continue
+        fields[k] = intern(v) if len(v) < 64 else v
+    if host and 'host' not in fields:
+        fields['host'] = intern(host)
+    ts = parse_timestamp(line, fields)
+    if ts is None and when:
+        ts = parse_timestamp(when)
+    return ParsedEvent(intern(name[:80]), fields, kind, ts, fmt, vsev)
+
+
+def _hint_ok(h, line):
+    if h is None:
+        return True
+    if isinstance(h, tuple):
+        for x in h:
+            if x in line:
+                return True
+        return False
+    return h.search(line) is not None      # compiled "gate" regex
+
+
+def _parse_vendor(line):
+    """Try the vendor formats whose cheap hint matches, in priority order
+    (the format that matched the previous line first). Returns a
+    ParsedEvent or None."""
+    last = _LAST_FMT[0]
+    if last is not None:
+        d = _try_format(last, line)
+        if d is not None:
+            return d
+    for i, subs, gate in _HINT_CHECKS:
+        if i == last:
+            continue
+        if subs is not None:
+            for x in subs:
+                if x in line:
+                    break
+            else:
+                continue
+        elif gate is not None and gate(line) is None:
+            continue
+        d = _try_format(i, line, checked=True)
+        if d is not None:
+            return d
+    return None
+
+
+def _try_format(i, line, checked=False):
+    fmt = FORMATS[i]
+    if not checked and not _hint_ok(fmt.hint, line):
+        return None
+    try:
+        d = fmt.parse(line)
+    except (ValueError, IndexError, KeyError, AttributeError):
+        d = None
+    if not d:
+        return None
+    _LAST_FMT[0] = i
+    return _finish(fmt.id, d, line)
+
+
+# (index, substrings or None, gate regex .search or None) per format,
+# precomputed so the per-line loop avoids isinstance checks and calls.
+_HINT_CHECKS = [(i, f.hint if isinstance(f.hint, tuple) else None,
+                 f.hint.search if f.hint is not None and not isinstance(f.hint, tuple)
+                 else None)
+                for i, f in enumerate(FORMATS)]
+
+
+def _parse_event(line):
+    """Vendor formats first, then the generic key=value parser."""
+    return _parse_vendor(line) or _parse_generic(line)
+
+
+def format_examples():
+    """(format, line, expected kind, expected fields) for every documented example."""
+    for fmt in FORMATS:
+        for line, kind, fields in fmt.examples:
+            yield fmt, line, kind, fields
+
+
+def format_list(color=False):
+    """Text for --formats."""
+    s   = _Style(color)
+    out = [s('Supported log formats', '1;36'), s('═' * 60, '2;37')]
+    for fmt in FORMATS:
+        out.append('')
+        out.append(s(f'{fmt.label}', '1;37') + s(f'  [{fmt.id}]  {fmt.classes}', '2;37'))
+        if fmt.note:
+            out.append(textwrap.fill(fmt.note, 100, initial_indent='  ', subsequent_indent='  '))
+        for line, kind, _ in fmt.examples[:2]:
+            line = line.replace('\t', '\\t')
+            out.append(s(f'  → {kind:<12}', ANSI_EV_START) + s(line[:110] +
+                                                                ('…' if len(line) > 110 else ''),
+                                                                '2;37'))
+    out.append('')
+    out.append('Anything else with key=value fields (clientMac=, userName=, apName=, ssid=, '
+               'srcip=, ...) is read by the generic parser.')
+    return '\n'.join(out)
 
 
 # Cached for the TUI, which re-classifies the same visible lines on every
@@ -1562,7 +3461,9 @@ class Rules:
     def __init__(self, loop_threshold=3, loop_window=300,
                  legacy_ssid=r'[-_](?:old|legacy)$', low_rssi=-75,
                  roam_threshold=3, roam_window=60,
-                 hotspot_min_failures=3, hotspot_factor=2.0, top=10):
+                 hotspot_min_failures=3, hotspot_factor=2.0, top=10,
+                 flap_threshold=3, flap_window=600, brute_threshold=5, brute_window=300,
+                 scan_ports=15, scan_hosts=15, scan_window=300):
         self.loop_threshold       = loop_threshold
         self.loop_window          = loop_window
         self.legacy_ssid          = legacy_ssid
@@ -1573,6 +3474,13 @@ class Rules:
         self.hotspot_min_failures = hotspot_min_failures
         self.hotspot_factor       = hotspot_factor
         self.top                  = top
+        self.flap_threshold       = flap_threshold     # link downs on one port...
+        self.flap_window          = flap_window        # ...within this many seconds
+        self.brute_threshold      = brute_threshold    # login failures from one source...
+        self.brute_window         = brute_window
+        self.scan_ports           = scan_ports         # distinct denied ports from one source...
+        self.scan_hosts           = scan_hosts         # ...or distinct denied hosts...
+        self.scan_window          = scan_window        # ...within one window
 
 
 RULES = Rules()
@@ -1605,15 +3513,41 @@ def event_findings(p, rules=None):
     return out
 
 
-def event_severity(p, rules=None, findings=None):
-    """'error' | 'warning' | 'success' | 'info' for a ParsedEvent."""
-    if p.kind == 'failure':
+def _threat_tier(v):
+    """Vendor threat severity (critical/high/medium/low, Meraki priority 1-3,
+    Junos MAJOR/MINOR) → tier, or None."""
+    v = (v or '').strip().lower()
+    if v in ('critical', 'high', 'major', 'very-high', '1', 'emergency', 'alert'):
         return 'error'
-    if findings if findings is not None else event_findings(p, rules):
+    if v in ('medium', 'minor', 'warning', '2'):
         return 'warning'
-    if p.kind in ('join', 'auth'):
-        return 'success'
-    return 'info'
+    if v in ('low', 'informational', 'info', 'information', '3', '4', 'notice'):
+        return 'info'
+    return None
+
+
+def event_severity(p, rules=None, findings=None):
+    """'error' | 'warning' | 'success' | 'info' for a ParsedEvent.
+
+    The event kind decides (a link-down is a warning however the device
+    rates it); for hardware, STP, PoE and similar kinds the device's own
+    syslog level decides; threats use the vendor's threat severity; events
+    of unknown kind fall back to the syslog level.
+    """
+    kind = p.kind
+    if kind == 'failure':
+        return 'error'
+    if kind == 'threat':
+        return _threat_tier(p.fields.get('threat_sev')) or vendor_sev_tier(p.vsev) or 'error'
+    if kind in _VENDOR_SEV_KINDS and p.vsev is not None:
+        return vendor_sev_tier(p.vsev)
+    base = KIND_SEVERITY.get(kind) if kind else None
+    if base in (None, 'info', 'success') and \
+            (findings if findings is not None else event_findings(p, rules)):
+        return 'warning'
+    if base:
+        return base
+    return vendor_sev_tier(p.vsev) or 'info'
 
 
 _STRUCT_GLYPH = {
@@ -1623,16 +3557,36 @@ _STRUCT_GLYPH = {
     'roam':       ('↔ ', ANSI_EV_START, _P_EV_START, False),
     'disconnect': ('↓ ', ANSI_EV_END,   _P_EV_END,   False),
 }
+# Kind-specific glyphs, used unless the event is an error.
+_KIND_GLYPH = {
+    'deny':       ('✗ ', ANSI_EV_DENY,  _P_EV_DENY,  True),
+    'allow':      ('✓ ', ANSI_EV_ALLOW, _P_EV_ALLOW, True),
+    'roam':       ('↔ ', ANSI_EV_START, _P_EV_START, False),
+    'disconnect': ('↓ ', ANSI_EV_END,   _P_EV_END,   False),
+    'logout':     ('↓ ', ANSI_EV_END,   _P_EV_END,   False),
+    'link_down':  ('↓ ', ANSI_EV_ERROR, _P_EV_ERROR, True),
+    'link_up':    ('↑ ', ANSI_EV_ALLOW, _P_EV_ALLOW, False),
+    'session':    ('↑ ', ANSI_EV_START, _P_EV_START, False),
+}
+_SESSION_END = re.compile(r'teardown|close|end|deny|drop', re.I)
+
+
+def _glyph_for(kind, severity, name=''):
+    if severity == 'error':
+        return _STRUCT_GLYPH['error']
+    if kind == 'session' and _SESSION_END.search(name or ''):
+        return _KIND_GLYPH['disconnect']
+    g = _KIND_GLYPH.get(kind)
+    if g:
+        return g
+    return _STRUCT_GLYPH.get(severity) if severity in ('warning', 'success') else None
 
 
 def _structured_glyph(text):
     p = parse_event(text)
     if p is None:
         return None
-    sev = event_severity(p)
-    if sev != 'info':
-        return _STRUCT_GLYPH[sev]
-    return _STRUCT_GLYPH.get(p.kind)
+    return _glyph_for(p.kind, event_severity(p), p.name)
 
 
 def failure_label(name, fields):
@@ -1648,12 +3602,18 @@ def failure_label(name, fields):
 class LogEvent:
     """One structured event (or, with kind None and no fields, a plain line
     kept for --client context)."""
-    __slots__ = ('seq', 'ts', 'eff', 'name', 'kind', 'severity', 'fields', 'findings', 'raw')
+    __slots__ = ('seq', 'ts', 'eff', 'name', 'kind', 'severity', 'fields', 'findings', 'raw',
+                 'fmt')
 
-    def __init__(self, seq, ts, name, kind, severity, fields, findings, raw=None):
+    def __init__(self, seq, ts, name, kind, severity, fields, findings, raw=None, fmt='kv'):
         self.seq, self.ts, self.eff = seq, ts, ts
         self.name, self.kind, self.severity = name, kind, severity
         self.fields, self.findings, self.raw = fields, findings, raw
+        self.fmt = fmt
+
+    @property
+    def host(self):
+        return self.fields.get('host')
 
     @property
     def client(self):
@@ -1669,8 +3629,90 @@ class LogEvent:
             else (self.name or '(event)')
 
 
+class DeviceStats:
+    """Per sending device (syslog host)."""
+    def __init__(self, host):
+        self.host     = host
+        self.formats  = Counter()
+        self.events   = 0
+        self.severity = Counter()
+        self.issues   = Counter()
+
+
+class _DenySource:
+    __slots__ = ('count', 'ports', 'dsts', 'bucket', 'b_ports', 'b_dsts', 'max_ports',
+                 'max_dsts', 'first', 'last', 'users')
+
+    def __init__(self):
+        self.count, self.ports, self.dsts = 0, set(), set()
+        self.bucket, self.b_ports, self.b_dsts = None, set(), set()
+        self.max_ports = self.max_dsts = 0
+        self.first = self.last = None
+        self.users = set()
+
+
+class FirewallStats:
+    """Running totals for firewall traffic: these lines can number millions,
+    so they're aggregated as they're read instead of being kept."""
+    _CAP = 512     # per-source distinct port / host sets stop growing here
+
+    def __init__(self, rules):
+        self.rules   = rules
+        self.deny    = 0
+        self.allow   = 0
+        self.session = 0
+        self.sources = {}
+        self.ports   = Counter()      # (port, proto) → denies
+        self.rule    = Counter()
+        self.dsts    = Counter()
+
+    def add(self, p):
+        kind = p.kind
+        if kind != 'deny':
+            if kind == 'allow':
+                self.allow += 1
+            else:
+                self.session += 1
+            return
+        self.deny += 1
+        f    = p.fields
+        src  = f.get('src_ip') or '?'
+        dpt  = f.get('dst_port')
+        dst  = f.get('dst_ip')
+        if dpt:
+            self.ports[(dpt, (f.get('proto') or '').lower())] += 1
+        if f.get('rule'):
+            self.rule[f['rule']] += 1
+        if dst:
+            self.dsts[dst] += 1
+        st = self.sources.get(src)
+        if st is None:
+            st = self.sources[src] = _DenySource()
+        st.count += 1
+        ts = p.ts
+        if ts is not None:
+            st.first = ts if st.first is None else min(st.first, ts)
+            st.last  = ts if st.last is None else max(st.last, ts)
+        if dpt and len(st.ports) < self._CAP:
+            st.ports.add(dpt)
+        if dst and len(st.dsts) < self._CAP:
+            st.dsts.add(dst)
+        # Scan detection in fixed time buckets (sliding windows would mean
+        # keeping every deny).
+        bucket = int(ts // self.rules.scan_window) if ts is not None else 0
+        if bucket != st.bucket:
+            st.bucket, st.b_ports, st.b_dsts = bucket, set(), set()
+        if dpt and len(st.b_ports) < self._CAP:
+            st.b_ports.add(dpt)
+        if dst and len(st.b_dsts) < self._CAP:
+            st.b_dsts.add(dst)
+        st.max_ports = max(st.max_ports, len(st.b_ports))
+        st.max_dsts  = max(st.max_dsts, len(st.b_dsts))
+
+
 class Analyzer:
-    """Feeds log lines in, keeps the structured events for analyze()."""
+    """Feeds log lines in; keeps structured events for Report and running
+    totals for the high-volume ones (firewall traffic)."""
     def __init__(self, rules=None, keep_raw=False, context_macs=None):
         self.rules        = rules or RULES
         self.keep_raw     = keep_raw
@@ -1678,11 +3720,19 @@ class Analyzer:
         self.events       = []
         self.context      = []
         self.lines        = 0
+        self.unparsed     = 0
+        self.formats      = Counter()
+        self.severity     = Counter()
+        self.issues       = Counter()      # (severity, label) for errors and warnings
+        self.devices      = {}
+        self.fw           = FirewallStats(self.rules)
 
     def feed(self, line):
         self.lines += 1
         p = _parse_event(line)
         if p is None:
+            if line.strip():
+                self.unparsed += 1
             if self.context_macs and MAC_RE.search(line):
                 for m in MAC_RE.finditer(line):
                     if norm_mac(m.group()) in self.context_macs:
@@ -1691,9 +3741,31 @@ class Analyzer:
                         break
             return None
         findings = event_findings(p, self.rules) or ()
-        ev = LogEvent(self.lines, p.ts, p.name, p.kind,
-                      event_severity(p, self.rules, findings), p.fields, findings,
-                      line if self.keep_raw else None)
+        sev      = event_severity(p, self.rules, findings)
+        f        = p.fields
+        label    = failure_label(p.name, f) if p.kind == 'failure' else (p.name or '(event)')
+        self.formats[p.fmt] += 1
+        self.severity[sev]  += 1
+        host = f.get('host') or '(no host)'
+        dev  = self.devices.get(host)
+        if dev is None:
+            dev = self.devices[host] = DeviceStats(host)
+        dev.events += 1
+        dev.severity[sev] += 1
+        dev.formats[p.fmt] += 1
+        if sev in ('error', 'warning'):
+            self.issues[(sev, label)] += 1
+            dev.issues[label] += 1
+
+        has_entity = any(k in f for k in _ENTITY_FIELDS)
+        if p.kind in ('deny', 'allow', 'session'):
+            self.fw.add(p)
+            if not ('client_mac' in f or 'user' in f):
+                return None
+        elif p.kind is None and not has_entity and p.fmt != 'kv':
+            return None                # unclassified vendor message: counted only
+        ev = LogEvent(self.lines, p.ts, p.name, p.kind, sev, f, findings,
+                      line if self.keep_raw else None, p.fmt)
         self.events.append(ev)
         return ev
 
@@ -1790,6 +3862,30 @@ class SiteStats:
         return self.failures / attempts if attempts else 0.0
 
 
+class LinkStats:
+    """Up/down history for one interface on one device. Repeated downs with
+    no up in between (LINK + LINEPROTO messages) count once."""
+    def __init__(self, host, iface):
+        self.host, self.iface = host, iface
+        self.downs       = []
+        self.ups         = 0
+        self.state       = None
+        self.last_ts     = None
+        self.err_disable = 0
+        self.flapping    = False
+
+    def add(self, ev):
+        if ev.kind == 'link_down':
+            if self.state != 'down':
+                self.downs.append(ev.eff)
+            self.state = 'down'
+        else:
+            if self.state != 'up':
+                self.ups += 1
+            self.state = 'up'
+        self.last_ts = ev.ts
+
+
 class ClientStats:
     def __init__(self, mac):
         self.mac       = mac
@@ -1827,7 +3923,13 @@ class Report:
         self.lines   = analyzer.lines
         self.events  = _chronological(analyzer.events)
         self.context = analyzer.context
-        self.severity      = Counter(e.severity for e in self.events)
+        self.severity      = analyzer.severity
+        self.formats       = analyzer.formats
+        self.unparsed      = analyzer.unparsed
+        self.devices       = analyzer.devices
+        self.issues        = analyzer.issues
+        self.fw            = analyzer.fw
+        self.parsed        = sum(analyzer.formats.values())
         self.fail_by_event = Counter(e.label for e in self.events if e.kind == 'failure')
         times = [e.ts for e in self.events if e.ts is not None]
         self.first_ts = min(times) if times else None
@@ -1899,6 +4001,137 @@ class Report:
 
         self.ap_baseline  = self._flag_hotspots(self.aps.values(), rules)
         self.loc_baseline = self._flag_hotspots(self.locations.values(), rules)
+        self.findings     = []      # network-wide: (category, severity, subject, text)
+        self._network(rules)
+        self._firewall(rules)
+
+    # ── Switching, routing, auth and infrastructure ──────────────────────────
+
+    def _network(self, rules):
+        self.links     = {}         # (host, iface) → LinkStats
+        self.neighbors = {}         # (host, neighbor) → [downs, ups, last_state, last_ts]
+        self.l2        = Counter()  # (kind, host, iface) for loop / err_disable / stp / ...
+        self.l2_msg    = {}
+        self.login_src = {}         # src → [fail times]
+        self.login_usr = Counter()
+        self.login_ok_after = []    # (src, failures, ev) successful login after failures
+        self.configs   = []
+        self.threats   = Counter()
+        self.threat_src = Counter()
+        self.infra     = {}         # (category, subject) → [count, last_ts, sample]
+        fails_since_ok = Counter()
+        for ev in self.events:
+            k, f = ev.kind, ev.fields
+            host = f.get('host') or '?'
+            if k in ('link_down', 'link_up'):
+                key = (host, f.get('iface') or '?')
+                ls  = self.links.get(key) or self.links.setdefault(key, LinkStats(*key))
+                ls.add(ev)
+            elif k in ('neighbor_down', 'neighbor_up'):
+                key = (host, f.get('neighbor') or f.get('peer') or ev.name)
+                st  = self.neighbors.setdefault(key, [0, 0, None, None, []])
+                if k == 'neighbor_down':
+                    st[0] += 1
+                    st[4].append(ev.eff)
+                else:
+                    st[1] += 1
+                st[2], st[3] = k, ev.ts
+            elif k in ('loop', 'err_disable', 'stp', 'violation', 'port_error', 'poe'):
+                key = (k, host, f.get('iface') or f.get('vlan') and f'vlan {f["vlan"]}' or '')
+                self.l2[key] += 1
+                self.l2_msg[key] = f.get('msg') or ev.name
+                if k == 'err_disable':
+                    ls = self.links.get((host, f.get('iface') or '?'))
+                    if ls is None:
+                        ls = self.links.setdefault((host, f.get('iface') or '?'),
+                                                   LinkStats(host, f.get('iface') or '?'))
+                    ls.err_disable += 1
+                    ls.state, ls.last_ts = 'err-disabled', ev.ts
+            elif k == 'login_fail':
+                src = f.get('src_ip') or (f'user {f["user"]}' if 'user' in f else host)
+                self.login_src.setdefault(src, []).append(ev.eff)
+                if 'user' in f:
+                    self.login_usr[f['user']] += 1
+                fails_since_ok[src] += 1
+            elif k == 'login':
+                src = f.get('src_ip') or (f'user {f["user"]}' if 'user' in f else host)
+                if fails_since_ok[src] >= rules.brute_threshold:
+                    self.login_ok_after.append((src, fails_since_ok[src], ev))
+                fails_since_ok[src] = 0
+            elif k == 'config':
+                self.configs.append(ev)
+            elif k == 'threat':
+                self.threats[f.get('signature') or ev.name] += 1
+                self.threat_src[f.get('src_ip') or '?'] += 1
+            elif k in ('vpn_down', 'vpn_up', 'service_down', 'service_up', 'failover', 'hw',
+                       'reboot', 'ap_down', 'ap_up'):
+                subject = {'vpn_down': f.get('peer') or f.get('tunnel') or host,
+                           'vpn_up': f.get('peer') or f.get('tunnel') or host,
+                           'ap_down': ev.ap or host, 'ap_up': ev.ap or host,
+                           'reboot': ev.ap or host}.get(k, host)
+                st = self.infra.setdefault((k, subject), [0, None, ''])
+                st[0] += 1
+                st[1] = ev.ts
+                st[2] = f.get('msg') or ev.name
+
+        F = self.findings
+        for ls in self.links.values():
+            n = _max_in_window(ls.downs, rules.flap_window) if ls.downs else 0
+            ls.flapping = n >= rules.flap_threshold
+            if ls.flapping:
+                F.append(('flap', 'error', f'{ls.host} {ls.iface}',
+                          f'interface flapping: {n} link downs within {_fmt_dur(rules.flap_window)} '
+                          f'({len(ls.downs)} total)'))
+            if ls.err_disable:
+                F.append(('errdisable', 'error', f'{ls.host} {ls.iface}', 'port err-disabled'))
+        for (kind, host, where), n in self.l2.items():
+            if kind in ('loop', 'violation'):
+                F.append((kind, 'error' if kind == 'loop' else 'warning',
+                          f'{host} {where}'.strip(), f'{n} × {self.l2_msg[(kind, host, where)][:90]}'))
+        for (host, nbr), (downs, ups, last, last_ts, times) in self.neighbors.items():
+            if downs:
+                flaps = _max_in_window(sorted(times), rules.flap_window)
+                state = 'currently down' if last == 'neighbor_down' else 'recovered'
+                F.append(('routing', 'error', f'{host} → {nbr}',
+                          f'routing neighbor down {downs}× ({state})'
+                          + (f', flapping ({flaps} within {_fmt_dur(rules.flap_window)})'
+                             if flaps >= 2 else '')))
+        for src, times in self.login_src.items():
+            times.sort()
+            n = _max_in_window(times, rules.brute_window)
+            if n >= rules.brute_threshold:
+                F.append(('brute', 'error', src, f'{n} login failures within '
+                          f'{_fmt_dur(rules.brute_window)} ({len(times)} total)'))
+        for src, n, ev in self.login_ok_after:
+            F.append(('brute', 'error', src, f'successful login'
+                      + (f' as {ev.fields["user"]}' if 'user' in ev.fields else '')
+                      + f' after {n} failures — check this account'))
+        labels = {'vpn_down': ('vpn', 'error', 'VPN tunnel down'),
+                  'service_down': ('service', 'error', 'server/service unreachable'),
+                  'ap_down': ('ap', 'error', 'access point down/disconnected'),
+                  'failover': ('failover', 'warning', 'failover / redundancy change'),
+                  'hw': ('hw', 'warning', 'hardware / environment'),
+                  'reboot': ('reboot', 'warning', 'reboot / restart')}
+        for (kind, subject), (n, last_ts, sample) in self.infra.items():
+            if kind in labels:
+                cat, sev, text = labels[kind]
+                F.append((cat, sev, subject, f'{text}: {n}×' +
+                          (f', last {_fmt_ts(last_ts)}' if last_ts else '') +
+                          (f' — {sample[:70]}' if sample and kind in ('hw', 'service_down') else '')))
+
+    def _firewall(self, rules):
+        for src, st in self.fw.sources.items():
+            if st.max_ports >= rules.scan_ports:
+                self.findings.append(('scan', 'warning', src,
+                                      f'possible port scan: {st.max_ports} distinct ports denied '
+                                      f'within {_fmt_dur(rules.scan_window)}'))
+            if st.max_dsts >= rules.scan_hosts:
+                self.findings.append(('scan', 'warning', src,
+                                      f'possible host sweep: {st.max_dsts} distinct hosts denied '
+                                      f'within {_fmt_dur(rules.scan_window)}'))
+        for sig, n in self.threats.most_common(rules.top):
+            self.findings.append(('threat', 'error', sig[:70], f'{n} threat event'
+                                  f'{"s" * (n != 1)}'))
 
     @staticmethod
     def _client_findings(cs, rules):
@@ -2015,33 +4248,11 @@ def _client_label(cs, vendors):
     return f'{cs.mac} ({"; ".join(bits)})' if bits else cs.mac
 
 
-def format_summary(rep, vendors, color=False, sources=''):
-    s, rules, top = _Style(color), rep.rules, rep.rules.top
-    H   = lambda t: ['', s(t, '1;37'), s('─' * len(t), '2;37')]
-    out = [s(f'netlog health summary{" — " + sources if sources else ""}', '1;36'),
-           s('═' * 60, '2;37')]
+def _banner(title, s):
+    return ['', s(f'▌{title.upper()}', '1;36')]
 
-    span = ''
-    if rep.first_ts is not None:
-        span = (f'{_fmt_ts(rep.first_ts)} → {_fmt_ts(rep.last_ts)} '
-                f'({_fmt_dur(rep.last_ts - rep.first_ts)})')
-    out.append(f'Lines read: {rep.lines:,}   Structured events: {len(rep.events):,}'
-               + (f'   Span: {span}' if span else ''))
-    if not rep.events:
-        out.append('')
-        out.append('No structured key=value events found. netlog looks for lines with fields')
-        out.append('such as clientMac=, userName=, apName=, apMac=, apLocation=, ssid=, rssi=.')
-        return '\n'.join(out)
 
-    out.append(f'Clients: {len(rep.clients):,}   Users: {len(rep.users):,}   '
-               f'APs: {len(rep.aps):,}   Locations: {len(rep.locations):,}')
-    sv = rep.severity
-    out.append('Severity: ' + '   '.join([
-        s(f'✗ {sv["error"]:,} errors', ANSI_EV_DENY),
-        s(f'! {sv["warning"]:,} warnings', ANSI_EV_ERROR),
-        s(f'✓ {sv["success"]:,} success', ANSI_EV_ALLOW),
-        f'· {sv["info"]:,} info']))
-
+def _summary_wireless(out, rep, vendors, s, H, rules, top):
     # Failures by type
     out += H('Failures by event type')
     if rep.fail_by_event:
@@ -2109,6 +4320,206 @@ def format_summary(rep, vendors, color=False, sources=''):
             out.append(s(f'  ⚠ = at least {rules.hotspot_min_failures} failures and a failure rate '
                          f'≥ {min(max(baseline * rules.hotspot_factor, 0.2), 0.9):.0%}', '2;37'))
 
+
+
+_SEV_CODE = {'error': '1;31', 'warning': '1;33'}
+
+
+def _summary_network(out, rep, s, H, rules, top):
+    links = sorted((l for l in rep.links.values() if l.downs or l.err_disable),
+                   key=lambda l: (-l.flapping, -l.err_disable, -len(l.downs), l.host, l.iface))
+    if links:
+        out += H('Interfaces with link-down events')
+        rows = [['', 'Device', 'Interface', 'Downs', 'Ups', 'Err-dis', 'Now', 'Last change']]
+        for l in links[:top]:
+            flag = ('⚠', '1;31') if (l.flapping or l.err_disable) else ''
+            rows.append([flag, l.host, (l.iface, '1;31' if l.flapping else None),
+                         str(len(l.downs)), str(l.ups),
+                         (str(l.err_disable), '1;31') if l.err_disable else '0',
+                         (l.state or '?', '1;31' if l.state == 'down' else ANSI_EV_ALLOW),
+                         _fmt_ts(l.last_ts)])
+        out += _table(rows, s, 'lllrrrll')
+        if len(links) > top:
+            out.append(f'  … and {len(links) - top} more')
+        if any(l.flapping for l in links):
+            out.append(s(f'  ⚠ = flapping ({rules.flap_threshold}+ downs within '
+                         f'{_fmt_dur(rules.flap_window)}) or err-disabled', '2;37'))
+    if rep.neighbors:
+        out += H('Routing neighbors')
+        rows = [['Device', 'Neighbor', 'Downs', 'Ups', 'State', 'Last change']]
+        for (host, nbr), (downs, ups, last, last_ts, _t) in sorted(
+                rep.neighbors.items(), key=lambda kv: (-kv[1][0], kv[0]))[:top]:
+            down = last == 'neighbor_down'
+            rows.append([host, nbr, (str(downs), '1;31' if downs else None), str(ups),
+                         ('down', '1;31') if down else ('up', ANSI_EV_ALLOW), _fmt_ts(last_ts)])
+        out += _table(rows, s, 'llrrll')
+    if rep.l2:
+        out += H('Layer-2 events (loops, STP, security, errors, PoE)')
+        rows = [['Type', 'Device', 'Where', 'Count', 'Last message']]
+        names = {'loop': 'loop/MAC flap', 'err_disable': 'err-disable', 'stp': 'STP',
+                 'violation': 'security', 'port_error': 'port errors', 'poe': 'PoE'}
+        order = {'loop': 0, 'err_disable': 1, 'violation': 2, 'stp': 3, 'port_error': 4, 'poe': 5}
+        for (kind, host, where), n in sorted(rep.l2.items(),
+                                             key=lambda kv: (order[kv[0][0]], -kv[1]))[:top]:
+            code = '1;31' if kind in ('loop', 'err_disable') else '1;33'
+            rows.append([(names[kind], code), host, where or '-', str(n),
+                         rep.l2_msg[(kind, host, where)][:60]])
+        out += _table(rows, s, 'lllrl')
+
+
+def _svc(port, proto):
+    try:
+        name = WELL_KNOWN_PORTS.get(int(port))
+    except ValueError:
+        name = None
+    return f'{port}/{proto}' + (f' ({name})' if name else '') if proto else \
+        port + (f' ({name})' if name else '')
+
+
+def _summary_firewall(out, rep, s, H, rules, top):
+    fw = rep.fw
+    out.append(f'  Denied: {s(f"{fw.deny:,}", "1;31")}   Allowed: {fw.allow:,}   '
+               f'Other session events: {fw.session:,}')
+    if fw.sources:
+        out += H('Top denied sources')
+        rows = [['Source', 'Denies', 'Ports', 'Hosts', 'First', 'Last', 'Note']]
+        for src, st in sorted(fw.sources.items(), key=lambda kv: -kv[1].count)[:top]:
+            note = []
+            if st.max_ports >= rules.scan_ports:
+                note.append(('port scan?', '1;31'))
+            if st.max_dsts >= rules.scan_hosts:
+                note.append(('host sweep?', '1;31'))
+            rows.append([src, str(st.count),
+                         f'{len(st.ports)}{"+" if len(st.ports) >= FirewallStats._CAP else ""}',
+                         f'{len(st.dsts)}{"+" if len(st.dsts) >= FirewallStats._CAP else ""}',
+                         _fmt_ts(st.first), _fmt_ts(st.last),
+                         note[0] if note else ''])
+        out += _table(rows, s, 'lrrrlll')
+    if fw.ports:
+        out += H('Top denied destination ports')
+        rows = [[_svc(port, proto), str(n)] for (port, proto), n in fw.ports.most_common(top)]
+        out += _table(rows, s, 'lr')
+    if fw.rule:
+        out += H('Top deny rules / policies')
+        out += _table([[r, str(n)] for r, n in fw.rule.most_common(top)], s, 'lr')
+    if rep.threats:
+        out += H('Threats (IPS / AV / attack signatures)')
+        out += _table([[(sig[:70], '1;31'), str(n)] for sig, n in rep.threats.most_common(top)],
+                      s, 'lr')
+        srcs = [(src, n) for src, n in rep.threat_src.most_common(top) if src != '?']
+        if srcs:
+            out.append('  Top threat sources: ' + ', '.join(f'{a} ({n})' for a, n in srcs[:5]))
+
+
+def _summary_auth(out, rep, s, H, rules, top):
+    if rep.login_src:
+        out += H('Login failures by source')
+        rows = [['Source', 'Failures', f'Max/{_fmt_dur(rules.brute_window)}', 'Last']]
+        for src, times in sorted(rep.login_src.items(), key=lambda kv: -len(kv[1]))[:top]:
+            n = _max_in_window(sorted(times), rules.brute_window)
+            rows.append([src, (str(len(times)), '1;31' if n >= rules.brute_threshold else None),
+                         str(n), _fmt_ts(max(times) if times else None)])
+        out += _table(rows, s, 'lrrl')
+        if rep.login_usr:
+            out.append('  Accounts targeted: ' + ', '.join(
+                f'{u} ({n})' for u, n in rep.login_usr.most_common(8)))
+    if rep.configs:
+        out += H(f'Configuration changes ({len(rep.configs)})')
+        rows = []
+        for ev in rep.configs[-top:]:
+            rows.append([_fmt_ts(ev.ts), ev.fields.get('host') or '-',
+                         ev.fields.get('user') or '-', (ev.fields.get('msg') or ev.name)[:70]])
+        out += _table(rows, s, 'llll')
+
+
+def _summary_infra(out, rep, s, H, rules, top):
+    names = {'vpn_down': 'VPN down', 'vpn_up': 'VPN up', 'service_down': 'Service down',
+             'service_up': 'Service up', 'failover': 'Failover', 'hw': 'Hardware',
+             'reboot': 'Reboot', 'ap_down': 'AP down', 'ap_up': 'AP up'}
+    bad = {'vpn_down', 'service_down', 'ap_down', 'hw', 'failover', 'reboot'}
+    out += H('VPN, services, access points and hardware')
+    rows = [['Type', 'Subject', 'Count', 'Last', 'Detail']]
+    items = sorted(rep.infra.items(), key=lambda kv: (kv[0][0] not in bad, -kv[1][0]))
+    for (kind, subject), (n, last_ts, sample) in items[:top * 2]:
+        rows.append([(names.get(kind, kind), '1;31' if kind in bad else ANSI_EV_ALLOW),
+                     subject, str(n), _fmt_ts(last_ts), sample[:60]])
+    out += _table(rows, s, 'llrll')
+
+
+def format_summary(rep, vendors, color=False, sources=''):
+    s, rules, top = _Style(color), rep.rules, rep.rules.top
+    H   = lambda t: ['', s(t, '1;37'), s('─' * len(t), '2;37')]
+    out = [s(f'netlog health summary{" — " + sources if sources else ""}', '1;36'),
+           s('═' * 60, '2;37')]
+
+    span = ''
+    if rep.first_ts is not None:
+        span = (f'{_fmt_ts(rep.first_ts)} → {_fmt_ts(rep.last_ts)} '
+                f'({_fmt_dur(rep.last_ts - rep.first_ts)})')
+    out.append(f'Lines read: {rep.lines:,}   Recognised events: {rep.parsed:,}'
+               + (f'   Span: {span}' if span else ''))
+    if not rep.parsed:
+        out.append('')
+        out.append('No recognised events. netlog understands the vendor formats listed by')
+        out.append('`netlog --formats`, plus any key=value log with fields such as clientMac=,')
+        out.append('userName=, apName=, apLocation=, ssid=, rssi=.')
+        return '\n'.join(out)
+
+    fmts = ' · '.join(f'{FORMAT_BY_ID[f].short if f in FORMAT_BY_ID else f} {n:,}'
+                      for f, n in rep.formats.most_common())
+    out.append(f'Sources: {fmts}' + (f' · unrecognised {rep.unparsed:,}' if rep.unparsed else ''))
+    if rep.clients or rep.aps:
+        out.append(f'Clients: {len(rep.clients):,}   Users: {len(rep.users):,}   '
+                   f'APs: {len(rep.aps):,}   Locations: {len(rep.locations):,}')
+    sv = rep.severity
+    out.append('Severity: ' + '   '.join([
+        s(f'✗ {sv["error"]:,} errors', ANSI_EV_DENY),
+        s(f'! {sv["warning"]:,} warnings', ANSI_EV_ERROR),
+        s(f'✓ {sv["success"]:,} success', ANSI_EV_ALLOW),
+        f'· {sv["info"]:,} info']))
+
+    devs = [d for d in rep.devices.values() if d.host != '(no host)']
+    if len(devs) > 1 or (devs and len(rep.formats) > 1):
+        out += H('Devices')
+        rows = [['Device', 'Format', 'Events', 'Errors', 'Warnings', 'Top issue']]
+        for d in sorted(devs, key=lambda d: (-d.severity['error'], -d.severity['warning'],
+                                             -d.events, d.host))[:top]:
+            fid = d.formats.most_common(1)[0][0]
+            rows.append([d.host, FORMAT_BY_ID[fid].short if fid in FORMAT_BY_ID else fid,
+                         f'{d.events:,}',
+                         (f'{d.severity["error"]:,}', '1;31' if d.severity['error'] else None),
+                         (f'{d.severity["warning"]:,}', '1;33' if d.severity['warning'] else None),
+                         (d.issues.most_common(1)[0][0][:50] if d.issues else '-')])
+        out += _table(rows, s, 'llrrrl')
+        if len(devs) > top:
+            out.append(f'  … and {len(devs) - top} more')
+
+    if rep.issues:
+        out += H('Errors and warnings by event type')
+        rows = []
+        for (sev, label), n in sorted(rep.issues.items(),
+                                      key=lambda kv: (kv[0][0] != 'error', -kv[1]))[:top]:
+            g = '✗' if sev == 'error' else '!'
+            rows.append([(g, _SEV_CODE[sev]), label[:60], f'{n:,}'])
+        out += _table(rows, s, 'llr')
+
+    has_wifi = bool(rep.clients or rep.aps or rep.fail_by_event)
+    if has_wifi:
+        out += _banner('Wireless & client access', s)
+        _summary_wireless(out, rep, vendors, s, H, rules, top)
+    if rep.links or rep.neighbors or rep.l2:
+        out += _banner('Switching & routing', s)
+        _summary_network(out, rep, s, H, rules, top)
+    if rep.fw.deny or rep.fw.allow or rep.fw.session or rep.threats:
+        out += _banner('Firewall & security', s)
+        _summary_firewall(out, rep, s, H, rules, top)
+    if rep.login_src or rep.login_ok_after or rep.configs:
+        out += _banner('Authentication & administration', s)
+        _summary_auth(out, rep, s, H, rules, top)
+    if rep.infra:
+        out += _banner('Infrastructure', s)
+        _summary_infra(out, rep, s, H, rules, top)
+
     # Anomalies
     out += H('Anomalies')
     any_anom = False
@@ -2145,6 +4556,33 @@ def format_summary(rep, vendors, color=False, sources=''):
         out.append(s(f'  {title}: {len(hits)}', '1;33'))
         for cs, text in hits[:top]:
             out.append(f'    {_client_label(cs, vendors)}: {text}')
+        if len(hits) > top:
+            out.append(f'    … and {len(hits) - top} more')
+
+    titles = {
+        'flap':       f'Interface flapping ({rules.flap_threshold}+ downs within '
+                      f'{_fmt_dur(rules.flap_window)})',
+        'errdisable': 'Err-disabled ports', 'loop': 'Layer-2 loops / MAC flapping / BPDU guard',
+        'violation':  'Port security / DHCP snooping / duplicate address',
+        'routing':    'Routing neighbor instability',
+        'brute':      f'Login attacks ({rules.brute_threshold}+ failures within '
+                      f'{_fmt_dur(rules.brute_window)})',
+        'scan':       f'Scans ({rules.scan_ports}+ ports or {rules.scan_hosts}+ hosts denied '
+                      f'within {_fmt_dur(rules.scan_window)})',
+        'threat':     'Threat signatures', 'vpn': 'VPN tunnels down',
+        'service':    'Servers / services unreachable (RADIUS, AAA, ...)',
+        'ap':         'Access points down', 'failover': 'Failover / redundancy changes',
+        'hw':         'Hardware / environment', 'reboot': 'Reboots',
+    }
+    for cat, title in titles.items():
+        hits = [(subj, text, sev) for c, sev, subj, text in rep.findings if c == cat]
+        if not hits:
+            continue
+        any_anom = True
+        worst = 'error' if any(h[2] == 'error' for h in hits) else 'warning'
+        out.append(s(f'  {title}: {len(hits)}', _SEV_CODE[worst]))
+        for subj, text, _sev in hits[:top]:
+            out.append(f'    {subj}: {text}')
         if len(hits) > top:
             out.append(f'    … and {len(hits) - top} more')
 
@@ -2301,12 +4739,41 @@ def format_timeline(rep, query, vendors, color=False):
 
 # ── Live correlation (piped / follow mode) ────────────────────────────────────
 
-class LiveCorrelator:
-    """Groups a client's failure loop visually as lines stream past.
+def _client_key(f):
+    if f.get('client_mac'):
+        return f['client_mac']
+    return f'user:{norm_user(f["user"])}' if 'user' in f else None
 
-    When a client hits the loop threshold, a banner is printed and that
-    client's following lines get a side bar in the client's MAC color, until
-    it recovers (successful join/auth) or the loop window passes quietly.
+
+def _login_key(f):
+    if f.get('src_ip'):
+        return f['src_ip']
+    return f'user:{f["user"]}' if 'user' in f else None
+
+
+def _link_key(f):
+    return f'{f.get("host", "?")} {f["iface"]}' if f.get('iface') else None
+
+
+# (id, failure kinds, recovery kinds, key, threshold rule, window rule, banner title)
+_LIVE_TRACKERS = (
+    ('client', {'failure'}, {'join', 'auth'}, _client_key,
+     'loop_threshold', 'loop_window', 'FAILURE LOOP'),
+    ('login', {'login_fail'}, {'login'}, _login_key,
+     'brute_threshold', 'brute_window', 'LOGIN ATTACK'),
+    ('link', {'link_down'}, set(), _link_key,
+     'flap_threshold', 'flap_window', 'INTERFACE FLAPPING'),
+)
+
+
+class LiveCorrelator:
+    """Groups related problem lines visually as they stream past.
+
+    Three trackers: a client's failure loop (keyed by client MAC/user), login
+    failures from one source (brute force), and link-downs on one interface
+    (flapping). When one hits its threshold a banner is printed, and the
+    following lines for that key get a side bar until it recovers (successful
+    join/auth or login) or the window passes quietly.
     """
     def __init__(self, mac_map, ctr, rules=None, color=True):
         self.rules   = rules or RULES
@@ -2315,60 +4782,83 @@ class LiveCorrelator:
         self.s       = _Style(color)
         self.state   = {}
 
-    def _code(self, key):
-        if key.startswith('user:'):
-            return '1;31'
-        return ANSI_MAC[mac_color(key.replace(':', '').upper(), self.mac_map, self.ctr)]
+    def _code(self, tid, key):
+        if tid == 'client' and not key.startswith('user:'):
+            return ANSI_MAC[mac_color(key.replace(':', '').upper(), self.mac_map, self.ctr)]
+        return '1;33' if tid == 'link' else '1;31'
 
     def process(self, line):
         """Return (before_lines, gutter, suffix) to decorate `line` with."""
         p = parse_event(line)
         if p is None or p.kind is None:
             return [], '', ''
-        f   = p.fields
-        key = f.get('client_mac') or (f'user:{norm_user(f["user"])}' if 'user' in f else None)
-        if key is None:
-            return [], '', ''
-        rules = self.rules
-        st = self.state.get(key)
+        before, gutter, suffix = [], '', ''
+        for tracker in _LIVE_TRACKERS:
+            key = tracker[3](p.fields)
+            if key is None:
+                continue
+            b, g, sfx = self._track(tracker, key, p)
+            before += b
+            if g and not gutter:
+                gutter, suffix = g, sfx
+        return before, gutter, suffix
+
+    def _track(self, tracker, key, p):
+        tid, fails, recovers, _keyfn, thr_name, win_name, title = tracker
+        threshold = getattr(self.rules, thr_name)
+        window    = getattr(self.rules, win_name)
+        sk = (tid, key)
+        st = self.state.get(sk)
         if st is None:
-            st = self.state[key] = {'fails': collections.deque(), 'loop': None, 'last': None}
+            if p.kind not in fails:
+                return [], '', ''
+            st = self.state[sk] = {'fails': collections.deque(), 'loop': None, 'last': None}
         ts = p.ts if p.ts is not None else (st['last'] if st['last'] is not None else 0.0)
         st['last'] = ts
 
-        code   = self._code(key)
-        s      = self.s
+        s, f   = self.s, p.fields
+        code   = self._code(tid, key)
         who    = key[5:] if key.startswith('user:') else key
-        if 'user' in f and not key.startswith('user:'):
+        if tid in ('client', 'login') and 'user' in f and not key.startswith('user:'):
             who += f' ({f["user"]})'
         before, gutter, suffix = [], '', ''
         lp = st['loop']
-        if lp and ts - lp['last'] > rules.loop_window:
-            before.append(s(f'┗━ {who}: loop ended — {lp["count"]} failures over '
-                            f'{_fmt_dur(lp["last"] - lp["start"])}, no recovery seen', code))
+        if lp and ts - lp['last'] > window:
+            before.append(s(f'┗━ {who}: {title.lower()} ended — {lp["count"]} events over '
+                            f'{_fmt_dur(lp["last"] - lp["start"])}'
+                            + (', no recovery seen' if recovers else ''), code))
             st['loop'] = lp = None
 
-        if p.kind == 'failure':
+        kind = p.kind
+        if tid == 'link':
+            # LINK + LINEPROTO both report each flap; only a down after an up counts.
+            if kind == 'link_down' and st.get('down'):
+                kind = 'repeat'
+            st['down'] = kind in ('link_down', 'repeat') or (st.get('down') and kind != 'link_up')
+        if kind in fails:
             dq = st['fails']
             dq.append(ts)
-            while ts - dq[0] > rules.loop_window:
+            while ts - dq[0] > window:
                 dq.popleft()
-            ap = f.get('ap_name') or f.get('ap_mac')
             if lp:
                 lp['count'] += 1
                 lp['last']   = ts
                 gutter = s('┃ ', code)
-            elif len(dq) >= rules.loop_threshold:
+            elif len(dq) >= threshold:
                 st['loop'] = {'start': dq[0], 'last': ts, 'count': len(dq)}
-                before.append(s(f'┏━ ⚠ FAILURE LOOP: {who} — {len(dq)} failures in '
-                                f'{_fmt_dur(ts - dq[0])}' + (f' @ {ap}' if ap else ''), code))
+                where = f.get('ap_name') or f.get('ap_mac') if tid == 'client' else None
+                before.append(s(f'┏━ ⚠ {title}: {who} — {len(dq)} '
+                                f'{"failures" if tid != "link" else "link downs"} in '
+                                f'{_fmt_dur(ts - dq[0])}' + (f' @ {where}' if where else ''), code))
                 gutter = s('┃ ', code)
-        elif p.kind in ('join', 'auth'):
+        elif kind in recovers:
             st['fails'].clear()
             if lp:
                 gutter = s('┗━', code)
-                suffix = s(f'  ✓ recovered after {lp["count"]} failures '
-                           f'({_fmt_dur(ts - lp["start"])})', ANSI_EV_ALLOW)
+                dur = _fmt_dur(ts - lp['start'])
+                suffix = (s(f'  ✓ recovered after {lp["count"]} failures ({dur})', ANSI_EV_ALLOW)
+                          if tid == 'client' else
+                          s(f'  ⚠ login succeeded after {lp["count"]} failures ({dur})', '1;31'))
                 st['loop'] = None
         elif lp:
             gutter = s('┃ ', code)
@@ -2453,9 +4943,10 @@ def build_arg_parser():
     p.add_argument('--setup-geoip', dest='setup_geoip', action='store_true',
                     help='Configure (or reconfigure) MaxMind GeoIP credentials, then exit')
     a = p.add_argument_group(
-        'analysis', 'For logs with key="value" fields (clientMac=, userName=, apName=, '
-                    'apLocation=, ssid=, rssi=, ...). Both modes read the FILEs, '
-                    'or stdin if none are given.')
+        'analysis', 'For wireless, switch, router, firewall and NAC logs from the vendors listed '
+                    'by --formats (Cisco, Aruba/HPE, Juniper, Ruckus, Fortinet, Palo Alto, '
+                    'Meraki, UniFi, MikroTik, ...) or any key=value log. Both modes read the '
+                    'FILEs, or stdin if none are given.')
     a.add_argument('--summary', action='store_true',
                     help='Print a health summary: top failing clients/users, AP and '
                          'location failure rates, failure types, and anomalies')
@@ -2473,6 +4964,8 @@ def build_arg_parser():
                     help='RSSI below this is flagged as low signal (default: -75)')
     a.add_argument('--top', type=int, default=10, metavar='N',
                     help='Rows per section in --summary (default: 10)')
+    a.add_argument('--formats', action='store_true',
+                    help='List the vendor log formats netlog recognises, with examples, and exit')
     p.add_argument('--version', action='version', version=f'netlog {VERSION}')
     p.add_argument('args', nargs='*', metavar='FILE',
                     help='Log file(s) to view; shell globs are supported. In follow mode, '
@@ -2532,6 +5025,10 @@ def main():
     alert_pat, egrep_pat, setup_geoip = opts.alert_pat, opts.egrep_pat, opts.setup_geoip
     RULES = Rules(loop_threshold=opts.loop_threshold, loop_window=opts.loop_window,
                   legacy_ssid=opts.legacy_ssid, low_rssi=opts.low_rssi, top=opts.top)
+
+    if opts.formats:
+        print(format_list(sys.stdout.isatty() and 'NO_COLOR' not in os.environ))
+        return
 
     cfg = load_config()
     if setup_geoip:

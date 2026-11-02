@@ -1,6 +1,6 @@
 # netlog
 
-A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. For wireless controller and other `key="value"` logs it also correlates events per client, user, AP and location to find failure loops and other problems, and produces health summaries and per-client timelines. No external dependencies beyond the Python standard library.
+A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. It recognises the log formats of 27 vendor platforms (Cisco, Juniper, Aruba, Ruckus, Fortinet, Palo Alto, UniFi, Meraki, MikroTik, pfSense and more) across wireless, switching, routing and firewalls, plus any `key="value"` log. It correlates events per client, user, AP, interface and source IP to find failure loops, flapping links, login attacks, port scans and other problems, and produces health summaries and per-client timelines. No external dependencies beyond the Python standard library.
 
 ---
 
@@ -20,6 +20,8 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 - **Client timeline (`--client`)** — a clean chronological narrative for one MAC or username, with its session path and findings
 - **Failure-loop detection** — flags clients with N+ failures inside a rolling window, and groups those lines visually (banner + colored side bar) in the timeline, piped and follow modes
 - **Diagnostic rules** — legacy SSID use, inconsistent username formats on one device, rapid roaming, low RSSI, and AP/location failure hotspots
+- **Vendor format detection** — 27 wireless, switch, router, firewall and NAC log formats are detected per line and normalised to common fields and event kinds (`netlog --formats` lists them)
+- **Network and security findings** — interface flapping, err-disabled ports, MAC flapping and loops, routing neighbor loss, login brute force (and success after failures), port and host scans, VPN, failover, hardware and service events
 
 ---
 
@@ -95,6 +97,7 @@ netlog -f --alert PATTERN <file>            Follow with alert bell on pattern ma
 cat file.log | netlog                       Piped/ANSI mode
 netlog --summary <file> [file2 ...]         Health summary of structured events
 netlog --client <MAC|user> <file> ...       Timeline for one client or user
+netlog --formats                            List recognised vendor log formats
 netlog --setup-geoip                        Configure (or reconfigure) MaxMind GeoIP
 netlog --version                            Print version and exit
 netlog --help                               Full option reference
@@ -156,7 +159,12 @@ Structured `key="value"` events (see [Structured Log Analysis](#structured-log-a
 | `! ` | Yellow bold | Warning: legacy SSID or low RSSI |
 | `✓ ` | Green bold | Success: join / association / authorization |
 | `↔ ` | Cyan | Roaming |
-| `↓ ` | Dim | Disconnect / deauth / idle timeout |
+| `↓ ` | Dim | Disconnect / deauth / idle timeout / logout / session end |
+| `↓ ` | Yellow bold | Interface link down |
+| `↑ ` | Green bold | Interface link up |
+| `↑ ` | Cyan | Firewall session start |
+
+Recognised vendor events (see [Supported log formats](#supported-log-formats)) use the same table: anything at error severity shows `✗ `, firewall denies `✗ ` and allows `✓ `, then the kinds above, then `! ` / `✓ ` for other warnings and successes.
 
 ---
 
@@ -261,6 +269,53 @@ netlog --client F4F5.D8DE.7350 /var/log/wlc.log   # MAC in any notation
 ssh ctrl1 'cat /var/log/wlc.log' | netlog --summary
 ```
 
+### Supported log formats
+
+Each line is checked against the vendor formats below (most specific first, with the format that matched the previous line tried first), and falls back to the generic `key=value` parser. Every format is normalised to the same fields (`host`, `client_mac`, `user`, `ap`, `ssid`, `src_ip`/`dst_ip`, `src_port`/`dst_port`, `proto`, `iface`, `rule`, …) and an event *kind*. `netlog --formats` prints this list with an example line for each.
+
+| Vendor | Product | Class | Recognised by | Confidence |
+|--------|---------|-------|---------------|------------|
+| Ruckus | SmartZone / vSZ | wifi | `Core: @@<code>,<eventType>,"k"="v"` (codes 201–211 client events, AP events) | documented |
+| CEF | UniFi Network and any CEF source | wifi, firewall | `CEF:Version\|Vendor\|Product\|…` | documented |
+| LEEF | IBM LEEF 1.0/2.0 sources | firewall | `LEEF:` header | documented |
+| Fortinet | FortiGate (incl. FortiAP/FortiSwitch) | firewall, wifi | `logid=` with `type=`/`subtype=`/`action=` | documented |
+| Palo Alto Networks | PAN-OS CSV syslog | firewall | positional CSV: `TRAFFIC`, `THREAT`, `SYSTEM`, `CONFIG`, `GLOBALPROTECT`, … | documented |
+| Cisco | ASA / Firepower FTD | firewall | `%ASA-n-NNNNNN:` / `%FTD-` message IDs | well known |
+| Dell | OS10 | switch | `%Dell EMC (OS10)` | lower |
+| Cisco / Arista / Dell | IOS, IOS-XE, NX-OS, 9800 & AireOS WLC, EOS | switch, router, wifi | `%FACILITY-SEV-MNEMONIC:` | documented |
+| Sophos | Firewall (XG / SFOS) | firewall | `log_component=` key=value | lower |
+| SonicWall | SonicOS | firewall | `id=firewall … m=<id>` | lower |
+| Check Point | Quantum / Gaia syslog export | firewall | `product:"…"` / `origin:"…"` | lower |
+| Cisco | ISE | NAC | `CISE_` categories | lower |
+| FreeRADIUS | radiusd | NAC | `Auth: (n) Login OK/incorrect` | lower |
+| Cisco Meraki | MR / MS / MX | wifi, switch, firewall | RFC 5424 version `1` + epoch time, `events`/`flows`/`urls`/`ids-alerts` categories | documented |
+| Aruba (HPE) | ArubaOS controller / Instant AP | wifi | `<6-digit ID> <LEVEL>` (522xxx authmgr, 501xxx stm) | documented |
+| Aruba (HPE) | AOS-CX switch | switch | `Event\|<id>\|LOG_<LEVEL>\|…` | lower |
+| Juniper | Junos (EX, QFX, MX, SRX) | switch, router, firewall | uppercase tags (`RT_FLOW_*`, `RPD_*`, `UI_*`, `SNMP_TRAP_*`…), plain or `[junos@2636…]` | well known |
+| HPE Comware / Huawei | FlexNetwork (H3C), VRP | switch, router | `MODULE/SEV/MNEMONIC:` | lower |
+| Netgate / Deciso | pfSense / OPNsense | firewall | `filterlog:` CSV | well known |
+| Linux | iptables / nftables / UFW, UniFi & EdgeOS gateways | firewall | `IN= OUT= SRC= DST= PROTO=` | well known |
+| Ubiquiti | UniFi AP station tracker | wifi | `stahtd … STA-TRACKER` JSON | documented |
+| hostapd | UniFi, OpenWrt and other Linux APs | wifi | `hostapd: <iface>: STA <mac> …` | well known |
+| MikroTik | RouterOS | router, firewall, wifi | comma topics with a level (`system,error,critical`) | lower |
+| Extreme Networks | EXOS | switch | `<Sev:Component.Event>` | lower |
+| Ruckus / Brocade | ICX / FastIron | switch | known text prefixes (`Interface`, `Security:`, `STP:`, `DOT1X:`, …) | lower |
+| Ruckus | ZoneDirector / Unleashed | wifi | `User[…]` / `AP[…]` text events | lower |
+| Aruba / HP | AOS-S (ProCurve) | switch | `<5-digit ID> <subsystem>:` | lower |
+
+*documented*: field layout checked against the vendor's published reference or vendor-community samples. *well known*: widely used, stable formats. *lower*: built from general knowledge of the format; message wording varies by firmware, so some events may only be recognised generically. Sample lines from your devices that are missed or misclassified are welcome as issues.
+
+Event kinds and their default severity:
+
+| Severity | Kinds |
+|----------|-------|
+| Error | client failure, AP down, threat, err-disabled port, loop / MAC flap, routing neighbor down, VPN down, service/server down |
+| Warning | firewall deny, login failure, link down, STP change, port-security violation, port error, PoE, failover, hardware, reboot |
+| Success | join, auth, AP up, login, link up, neighbor up, VPN up, service up |
+| Info | roam, disconnect, allow, session, logout, config change |
+
+For hardware, STP, PoE, reboot, failover and port-error events the device's own syslog level decides instead (a `crit` fan failure is an error, a `notice` STP change is info), and a threat's own severity (`critical`/`high` vs lower) decides between error and warning. Events of unknown kind use the syslog level. An info or success event with a diagnostic finding (legacy SSID, low RSSI) becomes a warning.
+
 ### What it extracts
 
 Field names are matched case-insensitively, with common aliases:
@@ -275,7 +330,7 @@ Field names are matched case-insensitively, with common aliases:
 
 The event name comes from an `event=`/`eventType=` field, or else the camelCase word before the fields (`clientJoinFailure`). Its lifecycle kind is inferred from the name: *failure* (fail, error, timeout, reject, denied…), *join*, *auth*, *roam* or *disconnect*. A `result`/`status` of failure turns any event into a failure. Timestamps are read from ISO-8601 or BSD syslog prefixes, or a numeric `timestamp=` field.
 
-A line counts as a structured event when it has at least one `key=value` pair and either an event name or a client/user/AP field. Other lines (firewall, DHCP, etc.) are left to the normal highlighter.
+For the generic parser, a line counts as a structured event when it has at least one `key=value` pair and either an event name or a client/user/AP field. Lines that match no format are left to the normal highlighter.
 
 ### Diagnostic rules
 
@@ -287,12 +342,24 @@ A line counts as a structured event when it has at least one `key=value` pair an
 | **Identity inconsistency**: one MAC seen as `bob` and `bob@corp.org` (or with different users) | — | — |
 | **Rapid roaming**: 3+ roams within 60 s | — | — |
 | **AP / location hotspot**: 3+ failures and a failure rate (failures ÷ failures + joins) at least 2× the overall rate (min 20%, capped at 90%) | — | — |
+| **Interface flapping**: link downs on one device + interface | 3 in 10 min | — |
+| **Login attack**: login failures from one source IP (or user, if no IP); also flags a successful login from that source after failures | 5 in 5 min | — |
+| **Port / host scan**: distinct destination ports, or distinct hosts, denied for one source | 15 in 5 min | — |
+| **Err-disable, loop / MAC flap, routing neighbor down, VPN down, service down**: reported per device/interface/peer, noting whether it recovered | — | — |
 
 Events without an `apLocation` field are attributed to the location their AP reports elsewhere in the log. For logs with no timestamps, a failure loop means N failures in a row with no success between them.
 
 ### `--summary`
 
-A report with: overall counts and time span, severity totals, failures by event type, top failing clients (with users, vendor, loops, main AP), top failing users, APs and locations ranked by failure rate (hotspots marked `⚠`), and the anomaly list. `--top N` sets the rows per section.
+A report with a header (counts, time span, sources by format, severity totals, a per-device table and errors/warnings by event type), then a section for each kind of data present:
+
+- **Wireless** — failures by event type, top failing clients (with users, vendor, loops, main AP), top failing users, APs and locations ranked by failure rate (hotspots marked `⚠`)
+- **Switching & routing** — interfaces with link-down events (flapping marked `⚠`), routing neighbors, err-disable / loop / port-security events
+- **Firewall & security** — deny/allow totals, top denied sources (scans marked), destination ports with service names, deny rules/policies, threats, VPN tunnels
+- **Authentication & administration** — login failures by source and account, successful logins after failures, config changes
+- **Infrastructure** — AP up/down, reboots, failover, hardware, PoE and service events
+
+It ends with the anomaly list across all sections. `--top N` sets the rows per section. Firewall allow/deny lines are aggregated rather than stored, so large firewall logs use little memory.
 
 ### `--client`
 
@@ -315,9 +382,9 @@ Findings:
 
 When you look up a MAC, other log lines mentioning it (DHCP, RADIUS, etc.) are shown too, dimmed. A username with several devices gets one section per device.
 
-### Live loop grouping (piped and follow modes)
+### Live grouping (piped and follow modes)
 
-As lines stream past, netlog tracks each client. When a client reaches the loop threshold it prints a banner, and that client's following lines get a side bar in the client's MAC color until it recovers (or the window passes quietly):
+As lines stream past, netlog tracks clients (failure loops), login sources (`LOGIN ATTACK`, using the login-attack rule) and interfaces (`INTERFACE FLAPPING`, using the flapping rule). When one reaches its threshold it prints a banner, and its following lines get a side bar until it recovers (or the window passes quietly). A successful login from an attacking source is marked `⚠ login succeeded after N failures`:
 
 ```
 ┏━ ⚠ FAILURE LOOP: f4:f5:d8:de:73:50 (alice) — 3 failures in 1m20s @ AP-Gym-2

@@ -189,8 +189,7 @@ class ParseEventTest(unittest.TestCase):
 
     def test_plain_lines_are_not_events(self):
         self.assertIsNone(netlog.parse_event('sshd[1]: Accepted publickey for root'))
-        self.assertIsNone(netlog.parse_event(
-            'kernel: ACCEPT IN=br0 OUT=eth4 SRC=1.2.3.4 DST=1.1.1.1 PROTO=UDP'))
+        self.assertIsNone(netlog.parse_event('dnsmasq[7]: query[A] example.com from 10.0.0.5'))
 
     def test_invalid_mac_field_is_dropped(self):
         p = netlog.parse_event('clientJoin clientMac="not-a-mac" userName="bob"')
@@ -370,7 +369,7 @@ class FormatTest(unittest.TestCase):
     def test_summary_with_no_structured_events(self):
         an = netlog.Analyzer()
         an.feed('sshd[1]: hello')
-        self.assertIn('No structured key=value events', netlog.format_summary(netlog.Report(an), {}))
+        self.assertIn('No recognised events', netlog.format_summary(netlog.Report(an), {}))
 
     def test_timeline_by_user_groups_loop(self):
         text, found = netlog.format_timeline(_report(self.LINES), 'ALICE', {}, color=False)
@@ -413,6 +412,155 @@ class LiveCorrelatorTest(unittest.TestCase):
         self.assertEqual(corr.process(_ev('clientJoin', mac='11:11:11:11:11:11')), ([], '', ''))
 
 
+# ── Vendor formats ───────────────────────────────────────────────────────────
+
+_T = 'May  1 09:{:02d}:{:02d}'
+
+
+def _cisco_link(i, state):
+    return (f'{_T.format(i // 60, i % 60)} sw1 %LINK-3-UPDOWN: '
+            f'Interface GigabitEthernet1/0/24, changed state to {state}')
+
+
+def _login(i, ok=False):
+    t = _T.format(8 + i // 60, i % 60)
+    if ok:
+        return (f'{t} sw1 %SEC_LOGIN-5-LOGIN_SUCCESS: Login Success [user: admin] '
+                f'[Source: 198.51.100.7] [localport: 22]')
+    return (f'{t} sw1 %SEC_LOGIN-4-LOGIN_FAILED: Login failed [user: admin] '
+            f'[Source: 198.51.100.7] [localport: 22] [Reason: Login Authentication Failed]')
+
+
+def _fgt_deny(port):
+    return (f'date=2024-05-01 time=09:10:{port % 60:02d} devname="FGT60F" logid="0000000013" '
+            f'type="traffic" subtype="forward" level="notice" srcip=203.0.113.66 '
+            f'srcport=40000 srcintf="wan1" dstip=10.0.0.10 dstport={port} '
+            f'dstintf="internal" proto=6 action="deny" policyid=0')
+
+
+class VendorFormatTest(unittest.TestCase):
+    def setUp(self):
+        netlog.parse_event.cache_clear()
+
+    def test_every_documented_example(self):
+        n = 0
+        for fmt, line, kind, fields in netlog.format_examples():
+            with self.subTest(fmt=fmt.id, line=line[:60]):
+                netlog._LAST_FMT[0] = None
+                p = netlog._parse_event(line)
+                self.assertIsNotNone(p)
+                self.assertEqual(p.fmt, fmt.id)
+                self.assertEqual(p.kind, kind)
+                for k, v in fields.items():
+                    self.assertEqual(p.fields.get(k), v, k)
+            n += 1
+        self.assertGreaterEqual(n, len(netlog.FORMATS))
+
+    def test_detection_does_not_stick_to_previous_format(self):
+        lines = list(netlog.format_examples())
+        for fmt, line, kind, _ in lines + lines[::-1]:
+            with self.subTest(fmt=fmt.id):
+                self.assertEqual(netlog._parse_event(line).fmt, fmt.id)
+
+    def test_format_ids_unique_and_listed(self):
+        ids = [f.id for f in netlog.FORMATS]
+        self.assertEqual(len(ids), len(set(ids)))
+        text = netlog.format_list(color=False)
+        for f in netlog.FORMATS:
+            self.assertIn(f.product, text)
+
+    def test_classify_text(self):
+        cases = [
+            (('LINK-3-UPDOWN', 'Interface Gi1/0/1, changed state to down'), 'link_down'),
+            (('LINK-3-UPDOWN', 'Interface Gi1/0/1, changed state to up'), 'link_up'),
+            (('PM-4-ERR_DISABLE', 'bpduguard error detected on Gi1/0/7'), 'err_disable'),
+        ]
+        for args, kind in cases:
+            with self.subTest(args=args):
+                self.assertEqual(netlog.classify_text(*args), kind)
+
+    def test_syslog_header(self):
+        self.assertEqual(netlog.syslog_header('<134>May  1 09:00:00 sw1 %LINK-3-UPDOWN: x'),
+                         (6, 'sw1'))
+        self.assertEqual(netlog.syslog_header('no header here'), (None, None))
+
+    def test_vendor_severity_and_host(self):
+        p = netlog.parse_event(_cisco_link(0, 'down'))
+        self.assertEqual((p.fmt, p.kind, p.fields['host']), ('cisco', 'link_down', 'sw1'))
+        self.assertEqual(netlog.event_severity(p, netlog.Rules(), ()), 'warning')
+
+
+class NetworkFindingsTest(unittest.TestCase):
+    @staticmethod
+    def _cats(rep):
+        return {(c, subj): text for c, _sev, subj, text in rep.findings}
+
+    def test_interface_flapping(self):
+        lines = []
+        for i in range(4):
+            lines += [_cisco_link(i * 20, 'down'), _cisco_link(i * 20 + 10, 'up')]
+        found = self._cats(_report(lines))
+        self.assertIn(('flap', 'sw1 GigabitEthernet1/0/24'), found)
+        self.assertIn('4 link downs', found[('flap', 'sw1 GigabitEthernet1/0/24')])
+
+    def test_two_flaps_are_not_flapping(self):
+        lines = [_cisco_link(0, 'down'), _cisco_link(5, 'up'),
+                 _cisco_link(10, 'down'), _cisco_link(15, 'up')]
+        self.assertFalse([f for f in _report(lines).findings if f[0] == 'flap'])
+
+    def test_brute_force_then_success(self):
+        rep   = _report([_login(i * 5) for i in range(6)] + [_login(40, ok=True)])
+        texts = [t for c, _s, subj, t in rep.findings if c == 'brute' and subj == '198.51.100.7']
+        self.assertTrue(any('6 login failures' in t for t in texts), texts)
+        self.assertTrue(any('successful login as admin after 6 failures' in t for t in texts),
+                        texts)
+
+    def test_port_scan(self):
+        rep = _report([_fgt_deny(p) for p in range(20, 45)])
+        found = self._cats(rep)
+        self.assertIn(('scan', '203.0.113.66'), found)
+        self.assertIn('25 distinct ports', found[('scan', '203.0.113.66')])
+
+    def test_err_disable_and_neighbor(self):
+        rep = _report([
+            'May  1 09:00:00 sw1 %PM-4-ERR_DISABLE: bpduguard error detected on Gi1/0/7, '
+            'putting Gi1/0/7 in err-disable state',
+            'May  1 09:05:10 rtr1 %OSPF-5-ADJCHG: Process 1, Nbr 10.0.0.2 on Gi0/0 from '
+            'FULL to DOWN, Neighbor Down: Dead timer expired'])
+        found = self._cats(rep)
+        self.assertIn(('errdisable', 'sw1 Gi1/0/7'), found)
+        self.assertIn('currently down', found[('routing', 'rtr1 → 10.0.0.2')])
+
+    def test_summary_sections(self):
+        lines = ([_cisco_link(i * 20, 'down') for i in range(4)] +
+                 [_login(i * 5) for i in range(6)] + [_fgt_deny(p) for p in range(20, 45)])
+        text = netlog.format_summary(_report(lines), {}, color=False)
+        for heading in ('SWITCHING & ROUTING', 'FIREWALL & SECURITY',
+                        'AUTHENTICATION & ADMINISTRATION', 'Devices'):
+            self.assertIn(heading, text)
+
+
+class LiveTrackerTest(unittest.TestCase):
+    def setUp(self):
+        netlog.parse_event.cache_clear()
+
+    def test_login_attack_banner_and_success_warning(self):
+        corr = netlog.LiveCorrelator({}, [0], rules=netlog.Rules(), color=False)
+        out  = [corr.process(_login(i * 5)) for i in range(5)]
+        self.assertFalse(out[3][0])
+        self.assertIn('LOGIN ATTACK', out[4][0][0])
+        _before, _gutter, suffix = corr.process(_login(40, ok=True))
+        self.assertIn('login succeeded after 5 failures', suffix)
+
+    def test_interface_flapping_banner(self):
+        corr = netlog.LiveCorrelator({}, [0], rules=netlog.Rules(), color=False)
+        banners = []
+        for i in range(3):
+            banners += corr.process(_cisco_link(i * 20, 'down'))[0]
+            banners += corr.process(_cisco_link(i * 20 + 10, 'up'))[0]
+        self.assertTrue(any('INTERFACE FLAPPING' in b for b in banners), banners)
+
+
 class AnalysisCliTest(unittest.TestCase):
     def test_analysis_options(self):
         ns = netlog.parse_cli(['--summary', '--client', 'alice', '--loop-window', '5m',
@@ -422,6 +570,9 @@ class AnalysisCliTest(unittest.TestCase):
         self.assertEqual(ns.loop_window, 300)
         self.assertEqual(ns.loop_threshold, 4)
         self.assertEqual(ns.log_files, [Path('x.log')])
+
+    def test_formats_flag(self):
+        self.assertTrue(netlog.parse_cli(['--formats']).formats)
 
     def test_bad_values_rejected(self):
         for argv in (['-f', '--summary', 'x.log'], ['--legacy-ssid', '(', 'x.log'],
