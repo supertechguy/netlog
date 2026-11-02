@@ -1,6 +1,6 @@
 # netlog
 
-A terminal network log viewer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file, with no external dependencies beyond the Python standard library.
+A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. For wireless controller and other `key="value"` logs it also correlates events per client, user, AP and location to find failure loops and other problems, and produces health summaries and per-client timelines. No external dependencies beyond the Python standard library.
 
 ---
 
@@ -15,6 +15,11 @@ A terminal network log viewer written in Python. Designed for sysadmins and netw
 - **Automatic `.gz` decompression** — open compressed logs directly; follow mode handles them gracefully too
 - **Follow mode** — `tail -f`-style real-time monitoring with optional egrep filter and audio/visual alerts
 - **Piped input** — `cat file.log | netlog` works; all highlighting applies
+- **Structured log analysis** — parses `key="value"` fields (`clientMac=`, `userName=`, `apName=`, `apLocation=`, `ssid=`, `rssi=`, …), classifies events as error / warning / success, and tracks each client's session lifecycle
+- **Health summary (`--summary`)** — top failing clients and users, AP and location failure rates against the overall baseline, failure counts by event type, and an anomaly list
+- **Client timeline (`--client`)** — a clean chronological narrative for one MAC or username, with its session path and findings
+- **Failure-loop detection** — flags clients with N+ failures inside a rolling window, and groups those lines visually (banner + colored side bar) in the timeline, piped and follow modes
+- **Diagnostic rules** — legacy SSID use, inconsistent username formats on one device, rapid roaming, low RSSI, and AP/location failure hotspots
 
 ---
 
@@ -88,6 +93,8 @@ netlog -f -n 50 <file>                      Follow, showing last 50 lines first
 netlog -f "pattern" <file>                  Follow, only showing lines matching pattern
 netlog -f --alert PATTERN <file>            Follow with alert bell on pattern match
 cat file.log | netlog                       Piped/ANSI mode
+netlog --summary <file> [file2 ...]         Health summary of structured events
+netlog --client <MAC|user> <file> ...       Timeline for one client or user
 netlog --setup-geoip                        Configure (or reconfigure) MaxMind GeoIP
 netlog --version                            Print version and exit
 netlog --help                               Full option reference
@@ -140,6 +147,16 @@ Every line in the viewer (and in piped output) starts with a 2-character glyph s
 | `  ` | — | anything else |
 
 Priority is deny → error → allow → start → end, so a line containing both "permit" and "failed" correctly shows `! `.
+
+Structured `key="value"` events (see [Structured Log Analysis](#structured-log-analysis)) are classified by event name instead, which also catches camelCase names like `clientJoinFailure` that the keyword table can't:
+
+| Glyph | Color | Structured event |
+|-------|-------|------------------|
+| `✗ ` | Red bold | Error: a failure (`clientJoinFailure`, `authTimeout`, or any event with `result="failure"`) |
+| `! ` | Yellow bold | Warning: legacy SSID or low RSSI |
+| `✓ ` | Green bold | Success: join / association / authorization |
+| `↔ ` | Cyan | Roaming |
+| `↓ ` | Dim | Disconnect / deauth / idle timeout |
 
 ---
 
@@ -227,6 +244,91 @@ Running `netlog` straight from a git clone (as in "Run in place" above) keeps ev
 
 ---
 
+## Structured Log Analysis
+
+Wireless controllers and many other appliances log an event name followed by `key="value"` fields:
+
+```
+May  1 08:01:00 ctrl1 wlc: clientJoinFailure apName="AP-Gym-2" apMac="aa:bb:cc:00:00:02" apLocation="Gym" clientMac="f4:f5:d8:de:73:50" userName="alice" ssid="WCSDaccess-old" reason="802.1X timeout"
+```
+
+netlog parses these automatically: in every mode for the glyphs, and in `--summary` / `--client` for full analysis. Both modes read the given files (`.gz` included) or stdin:
+
+```bash
+netlog --summary /var/log/wlc.log*
+netlog --client alice /var/log/wlc.log            # username: alice, alice@corp.org and CORP\alice all match
+netlog --client F4F5.D8DE.7350 /var/log/wlc.log   # MAC in any notation
+ssh ctrl1 'cat /var/log/wlc.log' | netlog --summary
+```
+
+### What it extracts
+
+Field names are matched case-insensitively, with common aliases:
+
+| Meaning | Field names |
+|---------|-------------|
+| Client MAC | `clientMac`, `client_mac`, `staMac`, `stationMac`, `callingStationId` |
+| User | `userName`, `user_name`, `user`, `identity`, `login` |
+| AP | `apName`, `ap_name`, `ap`, `apMac`, `ap_mac`, `apEthMac` |
+| Location | `apLocation`, `ap_location`, `location` |
+| Other | `ssid`, `rssi`, `reason`, `result`/`status`, `event`/`eventType`, `timestamp` |
+
+The event name comes from an `event=`/`eventType=` field, or else the camelCase word before the fields (`clientJoinFailure`). Its lifecycle kind is inferred from the name: *failure* (fail, error, timeout, reject, denied…), *join*, *auth*, *roam* or *disconnect*. A `result`/`status` of failure turns any event into a failure. Timestamps are read from ISO-8601 or BSD syslog prefixes, or a numeric `timestamp=` field.
+
+A line counts as a structured event when it has at least one `key=value` pair and either an event name or a client/user/AP field. Other lines (firewall, DHCP, etc.) are left to the normal highlighter.
+
+### Diagnostic rules
+
+| Rule | Default | Option |
+|------|---------|--------|
+| **Failure loop**: a client with N failures inside a rolling window (a successful join/auth ends the run) | 3 in 5 min | `--loop-threshold N`, `--loop-window 5m` |
+| **Legacy SSID**: SSID matches a regex | names ending `-old` / `_legacy` | `--legacy-ssid REGEX` |
+| **Low signal**: RSSI below a level | -75 dBm | `--low-rssi DBM` |
+| **Identity inconsistency**: one MAC seen as `bob` and `bob@corp.org` (or with different users) | — | — |
+| **Rapid roaming**: 3+ roams within 60 s | — | — |
+| **AP / location hotspot**: 3+ failures and a failure rate (failures ÷ failures + joins) at least 2× the overall rate (min 20%, capped at 90%) | — | — |
+
+Events without an `apLocation` field are attributed to the location their AP reports elsewhere in the log. For logs with no timestamps, a failure loop means N failures in a row with no success between them.
+
+### `--summary`
+
+A report with: overall counts and time span, severity totals, failures by event type, top failing clients (with users, vendor, loops, main AP), top failing users, APs and locations ranked by failure rate (hotspots marked `⚠`), and the anomaly list. `--top N` sets the rows per section.
+
+### `--client`
+
+Header (users, APs, SSIDs, event counts), the compressed session path and the client's findings, then every event in order. Failure loops are grouped:
+
+```
+Path:   Join Failure ×4 (retry loop) → Join → Authorization
+Findings:
+  ⚠ failure loop: 4 failures in 1m50s
+  ⚠ legacy SSID WCSDaccess-old (4 events, 4 failed)
+
+  ┏━ ⚠ FAILURE LOOP: 4 failures in 1m50s @ AP-Gym-2
+  ┃ May 01 08:01:00  ✗ clientJoinFailure      AP-Gym-2 [Gym] · ssid WCSDaccess-old · reason 802.1X timeout
+  ┃ May 01 08:01:40  ✗ clientJoinFailure      AP-Gym-2 [Gym] · ssid WCSDaccess-old · reason 802.1X timeout
+  ┃ May 01 08:02:10  · dhcpd: DHCPDISCOVER from f4:f5:d8:de:73:50 via eth0
+  ┃ ...
+  ┗━ recovered via clientJoin at 08:03:30 after 2m30s
+  May 01 08:03:30  ! clientJoin             AP-Gym-2 [Gym] · ssid WCSDaccess · rssi -81  ⚠ low RSSI -81 dBm
+```
+
+When you look up a MAC, other log lines mentioning it (DHCP, RADIUS, etc.) are shown too, dimmed. A username with several devices gets one section per device.
+
+### Live loop grouping (piped and follow modes)
+
+As lines stream past, netlog tracks each client. When a client reaches the loop threshold it prints a banner, and that client's following lines get a side bar in the client's MAC color until it recovers (or the window passes quietly):
+
+```
+┏━ ⚠ FAILURE LOOP: f4:f5:d8:de:73:50 (alice) — 3 failures in 1m20s @ AP-Gym-2
+┃ ✗ May  1 08:02:20 ctrl1 wlc: clientJoinFailure apName="AP-Gym-2" ...
+┗━! May  1 08:03:30 ctrl1 wlc: clientJoin apName="AP-Gym-2" ...  ✓ recovered after 4 failures (2m30s)
+```
+
+Output for logs without structured events is unchanged.
+
+---
+
 ## Follow Mode
 
 ```bash
@@ -260,7 +362,7 @@ All ANSI highlighting — including event glyphs — is applied to stdout. Color
 
 ## Testing
 
-A small `unittest` suite (stdlib only, no test framework dependency) covers the pure logic — highlighting/segment priority, dedup, column stripping, search, and CLI argument parsing:
+A `unittest` suite (stdlib only, no test framework dependency) covers the pure logic — highlighting/segment priority, dedup, column stripping, search, CLI argument parsing, and the structured analysis (field parsing, timestamps, failure loops, diagnostic rules, report and timeline output, live loop grouping):
 
 ```bash
 python3 -m unittest discover -s tests -v

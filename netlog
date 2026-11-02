@@ -18,7 +18,10 @@ import gzip
 import os
 import tempfile
 import argparse
-from collections import Counter
+import collections
+import datetime
+import functools
+from collections import Counter, namedtuple
 from pathlib import Path
 
 try:
@@ -33,7 +36,7 @@ try:
 except ImportError:
     HAS_GEOIP = False
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
 
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # bytes — above this, use mmap index
 
@@ -191,7 +194,14 @@ _EV_TABLE = [
 ]
 
 def _event_type(text):
-    """Return (glyph, ansi, pair, bold) for the first matching event category, or None."""
+    """Return (glyph, ansi, pair, bold) for the line's event category, or None.
+
+    Structured key=value events (e.g. clientJoinFailure clientMac=...) are
+    classified by the analysis rules first; everything else falls back to
+    the keyword table."""
+    st = _structured_glyph(text)
+    if st:
+        return st
     for pat, glyph, ansi, pair, bold in _EV_TABLE:
         if pat.search(text):
             return glyph, ansi, pair, bold
@@ -1092,9 +1102,11 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
 # ── Run modes ─────────────────────────────────────────────────────────────────
 
 def piped_mode(vendors, mac_map, ctr):
+    corr = LiveCorrelator(mac_map, ctr)
     try:
         for line in sys.stdin:
-            print(highlight_ansi(line.rstrip('\n'), vendors, mac_map, ctr))
+            line = line.rstrip('\n')
+            print(render_live(line, line, corr, vendors, mac_map, ctr))
     finally:
         save_color_map(COLOR_FILE, mac_map, ctr[0])
 
@@ -1151,6 +1163,7 @@ def _read_new_lines(log_file, state):
 def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
               col_hidden=None, file_base=None, egrep_pat=None):
     hidden_cols = (col_hidden or {}).get(file_base or '', 0)
+    corr        = LiveCorrelator(mac_map, ctr)
 
     egrep_re = None
     if egrep_pat:
@@ -1167,7 +1180,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
             all_lines = [l for l in all_lines if egrep_re.search(l)]
         for line in all_lines[-tail_lines_count:]:
             out = _strip_cols(line, hidden_cols) if hidden_cols else line
-            print(highlight_ansi(out, vendors, mac_map, ctr))
+            print(render_live(line, out, corr, vendors, mac_map, ctr))
         save_color_map(COLOR_FILE, mac_map, ctr[0])
         return   # can't follow a compressed file
 
@@ -1176,7 +1189,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
         tail_lines = [l for l in tail_lines if egrep_re.search(l)]
     for line in tail_lines:
         out = _strip_cols(line, hidden_cols) if hidden_cols else line
-        print(highlight_ansi(out, vendors, mac_map, ctr))
+        print(render_live(line, out, corr, vendors, mac_map, ctr))
 
     st          = log_file.stat()
     state       = {'size': st.st_size, 'ino': st.st_ino}
@@ -1202,10 +1215,10 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                     buf.append(line)
                     if len(buf) > 10000: buf.pop(0)
                     out = _strip_cols(line, hidden_cols) if hidden_cols else line
-                    colored = highlight_ansi(out, vendors, mac_map, ctr)
+                    colored = render_live(line, out, corr, vendors, mac_map, ctr)
                     if alert_re and alert_re.search(line):
                         sys.stdout.write('\a')
-                        colored = _a('▶ ', '1;31') + colored
+                        colored = _prefix_last_line(colored, _a('▶ ', '1;31'))
                     print(colored, flush=True)
                 time.sleep(0.2)
         except KeyboardInterrupt:
@@ -1259,10 +1272,10 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                 buf.append(line)
                 if len(buf) > 10000: buf.pop(0)
                 out = _strip_cols(line, hidden_cols) if hidden_cols else line
-                colored = highlight_ansi(out, vendors, mac_map, ctr)
+                colored = render_live(line, out, corr, vendors, mac_map, ctr)
                 if alert_re and alert_re.search(line):
                     sys.stdout.write('\a')
-                    colored = _a('▶ ', '1;31') + colored
+                    colored = _prefix_last_line(colored, _a('▶ ', '1;31'))
                 print(colored, flush=True)
 
     except KeyboardInterrupt:
@@ -1326,6 +1339,1091 @@ def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=No
             except OSError:
                 pass
 
+# ── Structured event analysis ─────────────────────────────────────────────────
+#
+# Wireless controllers and many network appliances log an event name plus
+# key="value" pairs, e.g.
+#
+#   May  1 08:12:03 ctrl1 wlc: clientJoinFailure apName="AP-Lib-2"
+#       apMac="aa:bb:cc:00:11:22" clientMac="11:22:33:44:55:66" ssid="Staff-old"
+#
+# The code below pulls those fields out, classifies each event, and correlates
+# events per client / user / AP / location to find failure patterns. Field
+# names are matched case-insensitively against a list of common aliases, so
+# clientMac=, client_mac= and staMac= all mean the same thing.
+
+KV_RE = re.compile(r'''(?<![\w.\-])([A-Za-z_][\w.\-]*)=("[^"]*"|'[^']*'|[^\s,;"']*)''')
+# camelCase event names such as clientJoinFailure (keys are stripped first).
+_CAMEL_RE = re.compile(r'(?<![\w.\-])[a-z]+(?:[A-Z][a-z0-9]*)+(?![\w.\-=])')
+
+_FIELD_ALIASES = {
+    'client_mac': ('clientmac', 'client_mac', 'stamac', 'sta_mac', 'stationmac',
+                   'station_mac', 'clientmacaddress', 'callingstationid',
+                   'calling_station_id'),
+    'user':       ('username', 'user_name', 'user', 'identity', 'login'),
+    'ap_mac':     ('apmac', 'ap_mac', 'apethmac', 'ap_eth_mac', 'apmacaddress'),
+    'ap_name':    ('apname', 'ap_name', 'ap'),
+    'ap_loc':     ('aplocation', 'ap_location', 'aploc', 'location'),
+    'ssid':       ('ssid', 'essid'),
+    'rssi':       ('rssi', 'signal', 'signalstrength', 'signal_strength'),
+    'event':      ('event', 'eventtype', 'event_type', 'eventname', 'event_name',
+                   'msgtype', 'msg_type', 'type'),
+    'status':     ('result', 'status', 'outcome'),
+    'reason':     ('reason', 'reasoncode', 'reason_code', 'failurereason',
+                   'failure_reason', 'reasonstr'),
+    'epoch':      ('timestamp', 'time', 'ts', 'eventtime', 'event_time'),
+}
+_FIELD_KEY     = {a: canon for canon, aliases in _FIELD_ALIASES.items() for a in aliases}
+_MAC_FIELDS    = ('client_mac', 'ap_mac')
+_ENTITY_FIELDS = ('client_mac', 'user', 'ap_mac', 'ap_name')
+
+_FAIL_WORD = re.compile(
+    r'fail|error|timeout|timedout|reject|denied|refus|invalid|unreachable|mismatch', re.I)
+# Event-name → lifecycle kind, first match wins. Idle/session timeouts are a
+# normal disconnect, not a failure, so they're checked before the failure rule.
+_KIND_RULES = [
+    ('disconnect', re.compile(r'idle|sessiontimeout|session_timeout', re.I)),
+    ('failure',    _FAIL_WORD),
+    ('disconnect', re.compile(r'disconnect|deauth|disassoc|leave|left\b|logout|logoff|expir', re.I)),
+    ('roam',       re.compile(r'roam', re.I)),
+    ('auth',       re.compile(r'auth', re.I)),
+    ('join',       re.compile(r'join|associat|connect', re.I)),
+]
+
+_MAC_FULL_RE = re.compile(
+    r'[0-9A-Fa-f]{2}([:\-]?)(?:[0-9A-Fa-f]{2}\1){4}[0-9A-Fa-f]{2}'
+    r'|[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}\.[0-9A-Fa-f]{4}')
+
+
+_MAC_CANON_RE = re.compile(r'(?:[0-9a-f]{2}:){5}[0-9a-f]{2}')
+
+
+def norm_mac(s):
+    """Normalize a MAC in any common notation to aa:bb:cc:dd:ee:ff, or None."""
+    s = s.strip()
+    if len(s) == 17 and _MAC_CANON_RE.fullmatch(s.lower()):
+        return s.lower()                  # fast path: already colon-separated
+    if not _MAC_FULL_RE.fullmatch(s):
+        return None
+    h = re.sub(r'[^0-9A-Fa-f]', '', s).lower()
+    return ':'.join(h[i:i + 2] for i in range(0, 12, 2))
+
+
+@functools.lru_cache(maxsize=65536)
+def norm_user(u):
+    """'DOMAIN\\Alice' / 'alice@corp.org' / 'Alice' → 'alice'."""
+    u = u.strip().lower()
+    if '\\' in u:
+        u = u.rsplit('\\', 1)[1]
+    return u.split('@', 1)[0]
+
+
+@functools.lru_cache(maxsize=4096)
+def _kind_of(name):
+    for kind, pat in _KIND_RULES:
+        if pat.search(name):
+            return kind
+    return None
+
+
+_MONTHS = {m: i for i, m in enumerate(
+    ('jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'), 1)}
+_TS_ISO_RE = re.compile(
+    r'(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:[.,](\d{1,6})\d*)?'
+    r'(Z|[+-]\d{2}:?\d{2})?')
+_TS_BSD_RE = re.compile(
+    r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+'
+    r'(\d{2}):(\d{2}):(\d{2})\b')
+_NOW = time.time()
+
+
+def parse_timestamp(line, fields=None):
+    """Epoch seconds for a log line, or None.
+
+    Understands ISO-8601 and BSD syslog ('Mar 29 20:41:26') timestamps near
+    the start of the line, then a numeric timestamp=/time= field. BSD
+    timestamps have no year: the current year is assumed, or last year if
+    that would put the line more than a day in the future.
+    """
+    head  = line[:80]
+    iso   = _TS_ISO_RE.search(head)
+    bsd   = _TS_BSD_RE.search(head)
+    if iso and (not bsd or iso.start() <= bsd.start()):
+        t = _iso_epoch(iso.group())
+    elif bsd:
+        t = _bsd_epoch(bsd.group())
+    else:
+        t = None
+    if t is None and fields:
+        v = fields.get('epoch', '')
+        if v.isdigit() and len(v) in (10, 13):
+            t = int(v) / (1000 if len(v) == 13 else 1)
+    return t
+
+
+# Conversions are memoized on the matched text: every line logged in the
+# same second shares it, and building datetimes is the slow part.
+@functools.lru_cache(maxsize=4096)
+def _iso_epoch(text):
+    m = _TS_ISO_RE.fullmatch(text)
+    try:
+        y, mo, d, h, mi, s = map(int, m.groups()[:6])
+        frac = m.group(7)
+        us   = int(frac.ljust(6, '0')) if frac else 0
+        tz   = m.group(8)
+        if not tz:
+            return datetime.datetime(y, mo, d, h, mi, s, us).timestamp()
+        if tz == 'Z':
+            tzinfo = datetime.timezone.utc
+        else:
+            digits = tz[1:].replace(':', '')
+            off    = datetime.timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+            tzinfo = datetime.timezone(off if tz[0] == '+' else -off)
+        return datetime.datetime(y, mo, d, h, mi, s, us, tzinfo=tzinfo).timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
+@functools.lru_cache(maxsize=4096)
+def _bsd_epoch(text):
+    m = _TS_BSD_RE.fullmatch(text)
+    try:
+        mon = _MONTHS[m.group(1).lower()]
+        d, h, mi, s = (int(g) for g in m.groups()[1:])
+        year = time.localtime(_NOW).tm_year
+        t    = datetime.datetime(year, mon, d, h, mi, s).timestamp()
+        if t > _NOW + 86400:
+            t = datetime.datetime(year - 1, mon, d, h, mi, s).timestamp()
+        return t
+    except (ValueError, OverflowError):
+        return None
+
+
+_HAS_ALPHA  = re.compile(r'[A-Za-z]')
+ParsedEvent = namedtuple('ParsedEvent', 'name fields kind ts')
+
+
+def _parse_event(line):
+    """Parse a key=value log line into a ParsedEvent, or None if it isn't one.
+
+    A line counts as a structured event when it has at least one key=value
+    pair AND either an event name or a client/AP/user field. The returned
+    fields dict uses canonical names (client_mac, user, ap_mac, ap_name,
+    ap_loc, ssid, rssi, event, status, reason, epoch) and must not be mutated
+    (results are cached).
+    """
+    if '=' not in line:
+        return None
+    pairs = KV_RE.findall(line)
+    if not pairs:
+        return None
+    fields = {}
+    intern = sys.intern
+    for key, val in pairs:
+        canon = _FIELD_KEY.get(key.lower())
+        if canon is None or canon in fields:
+            continue
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in '"\'':
+            val = val[1:-1]
+        if canon in _MAC_FIELDS:
+            val = norm_mac(val)
+        if val:
+            # Interned: AP names, SSIDs, users etc. repeat on many lines.
+            fields[canon] = intern(val)
+
+    name = fields.get('event')
+    if name and not _HAS_ALPHA.search(name):
+        name = None                       # e.g. event=156 is a code, not a name
+    if not name:
+        # The name nearly always comes before the fields; only scan the rest
+        # of the line (with the fields blanked out) if it doesn't.
+        head = line[:line.find('=')]
+        head = head[:max(head.rfind(' '), head.rfind(','), head.rfind('\t')) + 1]
+        m = _CAMEL_RE.search(head) or _CAMEL_RE.search(KV_RE.sub(' ', line))
+        name = intern(m.group()) if m else ''
+    if not name and not any(f in fields for f in _ENTITY_FIELDS):
+        return None
+
+    kind   = _kind_of(name) if name else None
+    status = fields.get('status', '')
+    if status and _FAIL_WORD.search(status):
+        kind = 'failure'                  # e.g. clientAuthorization result="failure"
+    return ParsedEvent(name, fields, kind, parse_timestamp(line, fields))
+
+
+# Cached for the TUI, which re-classifies the same visible lines on every
+# redraw. Batch analysis calls _parse_event directly: every line there is
+# new, so a cache would only add overhead.
+parse_event = functools.lru_cache(maxsize=8192)(_parse_event)
+
+
+class Rules:
+    """Thresholds for the diagnostic rules (all overridable from the CLI)."""
+    def __init__(self, loop_threshold=3, loop_window=300,
+                 legacy_ssid=r'[-_](?:old|legacy)$', low_rssi=-75,
+                 roam_threshold=3, roam_window=60,
+                 hotspot_min_failures=3, hotspot_factor=2.0, top=10):
+        self.loop_threshold       = loop_threshold
+        self.loop_window          = loop_window
+        self.legacy_ssid          = legacy_ssid
+        self.legacy_re            = re.compile(legacy_ssid, re.I)
+        self.low_rssi             = low_rssi
+        self.roam_threshold       = roam_threshold
+        self.roam_window          = roam_window
+        self.hotspot_min_failures = hotspot_min_failures
+        self.hotspot_factor       = hotspot_factor
+        self.top                  = top
+
+
+RULES = Rules()
+
+
+_RSSI_RE = re.compile(r'\s*(-?\d+)')
+
+
+def rssi_value(fields):
+    v = fields.get('rssi')
+    return _rssi_int(v) if v else None
+
+
+@functools.lru_cache(maxsize=1024)
+def _rssi_int(text):
+    m = _RSSI_RE.match(text)
+    return int(m.group(1)) if m else None
+
+
+def event_findings(p, rules=None):
+    """Per-event (stateless) warnings: legacy SSID and low RSSI."""
+    rules = rules or RULES
+    out   = []
+    ssid  = p.fields.get('ssid')
+    if ssid and rules.legacy_re.search(ssid):
+        out.append(f'legacy SSID {ssid}')
+    rssi = rssi_value(p.fields)
+    if rssi is not None and rssi < 0 and rssi < rules.low_rssi:
+        out.append(f'low RSSI {rssi} dBm')
+    return out
+
+
+def event_severity(p, rules=None, findings=None):
+    """'error' | 'warning' | 'success' | 'info' for a ParsedEvent."""
+    if p.kind == 'failure':
+        return 'error'
+    if findings if findings is not None else event_findings(p, rules):
+        return 'warning'
+    if p.kind in ('join', 'auth'):
+        return 'success'
+    return 'info'
+
+
+_STRUCT_GLYPH = {
+    'error':      ('✗ ', ANSI_EV_DENY,  _P_EV_DENY,  True),
+    'warning':    ('! ', ANSI_EV_ERROR, _P_EV_ERROR, True),
+    'success':    ('✓ ', ANSI_EV_ALLOW, _P_EV_ALLOW, True),
+    'roam':       ('↔ ', ANSI_EV_START, _P_EV_START, False),
+    'disconnect': ('↓ ', ANSI_EV_END,   _P_EV_END,   False),
+}
+
+
+def _structured_glyph(text):
+    p = parse_event(text)
+    if p is None:
+        return None
+    sev = event_severity(p)
+    if sev != 'info':
+        return _STRUCT_GLYPH[sev]
+    return _STRUCT_GLYPH.get(p.kind)
+
+
+def failure_label(name, fields):
+    """Name to report a failure under: the event name, plus the status when
+    the name alone doesn't say it failed (clientAuthorization result=failure)."""
+    name = name or '(unnamed)'
+    st   = fields.get('status')
+    if st and not _FAIL_WORD.search(name):
+        return f'{name} ({st})'
+    return name
+
+
+class LogEvent:
+    """One structured event (or, with kind None and no fields, a plain line
+    kept for --client context)."""
+    __slots__ = ('seq', 'ts', 'eff', 'name', 'kind', 'severity', 'fields', 'findings', 'raw')
+
+    def __init__(self, seq, ts, name, kind, severity, fields, findings, raw=None):
+        self.seq, self.ts, self.eff = seq, ts, ts
+        self.name, self.kind, self.severity = name, kind, severity
+        self.fields, self.findings, self.raw = fields, findings, raw
+
+    @property
+    def client(self):
+        return self.fields.get('client_mac')
+
+    @property
+    def ap(self):
+        return self.fields.get('ap_name') or self.fields.get('ap_mac')
+
+    @property
+    def label(self):
+        return failure_label(self.name, self.fields) if self.kind == 'failure' \
+            else (self.name or '(event)')
+
+
+class Analyzer:
+    """Feeds log lines in, keeps the structured events for analyze()."""
+    def __init__(self, rules=None, keep_raw=False, context_macs=None):
+        self.rules        = rules or RULES
+        self.keep_raw     = keep_raw
+        self.context_macs = context_macs   # keep non-structured lines naming these MACs
+        self.events       = []
+        self.context      = []
+        self.lines        = 0
+
+    def feed(self, line):
+        self.lines += 1
+        p = _parse_event(line)
+        if p is None:
+            if self.context_macs and MAC_RE.search(line):
+                for m in MAC_RE.finditer(line):
+                    if norm_mac(m.group()) in self.context_macs:
+                        self.context.append(LogEvent(self.lines, parse_timestamp(line),
+                                                     '', None, 'other', {}, [], line))
+                        break
+            return None
+        findings = event_findings(p, self.rules) or ()
+        ev = LogEvent(self.lines, p.ts, p.name, p.kind,
+                      event_severity(p, self.rules, findings), p.fields, findings,
+                      line if self.keep_raw else None)
+        self.events.append(ev)
+        return ev
+
+
+def _chronological(events):
+    """Sort events by time, keeping input order for ties. Events with no
+    timestamp inherit the previous event's time (set as .eff) so they stay
+    next to their neighbours instead of all sorting to the start."""
+    out  = sorted(events, key=lambda e: e.seq)
+    last = None
+    for ev in out:
+        ev.eff = ev.ts if ev.ts is not None else (last if last is not None else 0.0)
+        last   = ev.eff
+    out.sort(key=lambda e: (e.eff, e.seq))
+    return out
+
+
+def _max_in_window(times, window):
+    """Largest number of entries of the sorted list `times` within any `window`."""
+    best, lo = 0, 0
+    for hi, t in enumerate(times):
+        while t - times[lo] > window:
+            lo += 1
+        best = max(best, hi - lo + 1)
+    return best
+
+
+class FailureLoop:
+    def __init__(self, client, events, recovery):
+        self.client   = client
+        self.events   = events
+        self.recovery = recovery
+        self.count    = len(events)
+        self.start    = events[0].eff
+        self.end      = events[-1].eff
+        self.timed    = all(e.ts is not None for e in events)
+        self.aps      = Counter(e.ap for e in events if e.ap)
+        self.names    = Counter(e.label for e in events)
+        self.users    = Counter(e.fields['user'] for e in events if 'user' in e.fields)
+
+
+def find_failure_loops(events, rules=None, client=None):
+    """Failure loops in one client's chronological events.
+
+    Failures are grouped into runs that end at a successful join/auth or a
+    quiet gap longer than the loop window. A run is a loop when at least
+    `loop_threshold` of its failures fall inside one `loop_window`. Events
+    without timestamps count as simultaneous, so for logs with no times this
+    becomes 'N failures in a row without a success'.
+    """
+    rules = rules or RULES
+    loops, run = [], []
+
+    def close(recovery):
+        if len(run) >= rules.loop_threshold and \
+           _max_in_window([e.eff for e in run], rules.loop_window) >= rules.loop_threshold:
+            loops.append(FailureLoop(client, list(run), recovery))
+        run.clear()
+
+    for ev in events:
+        if ev.kind == 'failure':
+            if run and ev.eff - run[-1].eff > rules.loop_window:
+                close(None)
+            run.append(ev)
+        elif ev.kind in ('join', 'auth') and run:
+            close(ev)
+    close(None)
+    return loops
+
+
+class SiteStats:
+    """Failure / join counts for one AP or one location."""
+    def __init__(self, key):
+        self.key      = key
+        self.ap_mac   = None
+        self.location = None
+        self.failures = 0
+        self.joins    = 0
+        self.auths    = 0
+        self.total    = 0
+        self.clients  = set()
+        self.fail_by  = Counter()
+        self.flagged  = False
+
+    @property
+    def successes(self):
+        # Prefer joins as the "normal" baseline; fall back to authorizations
+        # for logs that only record those.
+        return self.joins or self.auths
+
+    @property
+    def rate(self):
+        attempts = self.failures + self.successes
+        return self.failures / attempts if attempts else 0.0
+
+
+class ClientStats:
+    def __init__(self, mac):
+        self.mac       = mac
+        self.events    = []
+        self.users     = Counter()
+        self.aps       = Counter()
+        self.ssids     = Counter()
+        self.failures  = 0
+        self.loops     = []
+        self.findings  = []      # (category, text)
+        self.legacy    = Counter()
+        self.legacy_fail = 0
+        self.low_rssi  = 0
+        self.min_rssi  = None
+
+
+class UserStats:
+    def __init__(self, norm):
+        self.norm     = norm
+        self.forms    = Counter()
+        self.macs     = set()
+        self.failures = 0
+        self.total    = 0
+
+    @property
+    def label(self):
+        return self.forms.most_common(1)[0][0] if self.forms else self.norm
+
+
+class Report:
+    """Everything --summary and --client need, computed once from events."""
+    def __init__(self, analyzer):
+        rules        = analyzer.rules
+        self.rules   = rules
+        self.lines   = analyzer.lines
+        self.events  = _chronological(analyzer.events)
+        self.context = analyzer.context
+        self.severity      = Counter(e.severity for e in self.events)
+        self.fail_by_event = Counter(e.label for e in self.events if e.kind == 'failure')
+        times = [e.ts for e in self.events if e.ts is not None]
+        self.first_ts = min(times) if times else None
+        self.last_ts  = max(times) if times else None
+
+        self.clients   = {}
+        self.users     = {}
+        self.aps       = {}
+        self.locations = {}
+        # Many controllers only include apLocation on some events; attribute
+        # the rest to the location their AP reports elsewhere in the log.
+        ap_loc = {}
+        for ev in self.events:
+            if ev.ap and ev.fields.get('ap_loc'):
+                ap_loc.setdefault(ev.ap, ev.fields['ap_loc'])
+        for ev in self.events:
+            f   = ev.fields
+            mac = f.get('client_mac')
+            loc = f.get('ap_loc') or ap_loc.get(ev.ap)
+            if mac:
+                cs = self.clients.get(mac) or self.clients.setdefault(mac, ClientStats(mac))
+                cs.events.append(ev)
+                if 'user' in f:   cs.users[f['user']] += 1
+                if ev.ap:         cs.aps[ev.ap] += 1
+                if 'ssid' in f:   cs.ssids[f['ssid']] += 1
+                if ev.kind == 'failure':
+                    cs.failures += 1
+                if 'ssid' in f and rules.legacy_re.search(f['ssid']):
+                    cs.legacy[f['ssid']] += 1
+                    if ev.kind == 'failure':
+                        cs.legacy_fail += 1
+                rssi = rssi_value(f)
+                if rssi is not None and rssi < 0:
+                    if rssi < rules.low_rssi:
+                        cs.low_rssi += 1
+                    cs.min_rssi = rssi if cs.min_rssi is None else min(cs.min_rssi, rssi)
+            if 'user' in f:
+                n  = norm_user(f['user'])
+                us = self.users.get(n) or self.users.setdefault(n, UserStats(n))
+                us.forms[f['user']] += 1
+                us.total += 1
+                if mac:
+                    us.macs.add(mac)
+                if ev.kind == 'failure':
+                    us.failures += 1
+            for table, key in ((self.aps, ev.ap), (self.locations, loc)):
+                if not key:
+                    continue
+                ss = table.get(key) or table.setdefault(key, SiteStats(key))
+                ss.total += 1
+                if mac:
+                    ss.clients.add(mac)
+                if table is self.aps:
+                    ss.ap_mac   = ss.ap_mac or f.get('ap_mac')
+                    ss.location = ss.location or loc
+                if ev.kind == 'failure':
+                    ss.failures += 1
+                    ss.fail_by[ev.label] += 1
+                elif ev.kind == 'join':
+                    ss.joins += 1
+                elif ev.kind == 'auth':
+                    ss.auths += 1
+
+        self.loops = []
+        for cs in self.clients.values():
+            self._client_findings(cs, rules)
+            self.loops.extend(cs.loops)
+        self.loops.sort(key=lambda lp: (-lp.count, lp.start))
+
+        self.ap_baseline  = self._flag_hotspots(self.aps.values(), rules)
+        self.loc_baseline = self._flag_hotspots(self.locations.values(), rules)
+
+    @staticmethod
+    def _client_findings(cs, rules):
+        cs.loops = find_failure_loops(cs.events, rules, cs.mac)
+        for lp in cs.loops:
+            span = f' in {_fmt_dur(lp.end - lp.start)}' if lp.timed else ' in a row'
+            cs.findings.append(('loop', f'failure loop: {lp.count} failures{span}'))
+
+        if cs.legacy:
+            names = ', '.join(cs.legacy)
+            n     = sum(cs.legacy.values())
+            fail  = f', {cs.legacy_fail} failed' if cs.legacy_fail else ''
+            cs.findings.append(('legacy', f'legacy SSID {names} ({n} event{"s" * (n != 1)}{fail})'))
+
+        by_norm = {}
+        for u in cs.users:
+            by_norm.setdefault(norm_user(u), set()).add(u)
+        for forms in by_norm.values():
+            if len(forms) > 1:
+                cs.findings.append(('identity', 'username format varies: ' +
+                                    ' vs '.join(sorted(forms, key=len))))
+        if len(by_norm) > 1:
+            cs.findings.append(('identity', 'multiple users on one device: ' +
+                                ', '.join(sorted(by_norm))))
+
+        roams = [e.ts for e in cs.events if e.kind == 'roam' and e.ts is not None]
+        if roams and _max_in_window(roams, rules.roam_window) >= rules.roam_threshold:
+            n = _max_in_window(roams, rules.roam_window)
+            cs.findings.append(('roam', f'rapid roaming: {n} roams within '
+                                        f'{_fmt_dur(rules.roam_window)}'))
+
+        if cs.low_rssi:
+            cs.findings.append(('rssi', f'low RSSI on {cs.low_rssi} event'
+                                        f'{"s" * (cs.low_rssi != 1)} (min {cs.min_rssi} dBm)'))
+
+    @staticmethod
+    def _flag_hotspots(sites, rules):
+        """Flag sites whose failure rate is well above the overall rate.
+        Returns the overall (baseline) failure rate."""
+        sites    = list(sites)
+        failures = sum(s.failures for s in sites)
+        attempts = failures + sum(s.successes for s in sites)
+        baseline = failures / attempts if attempts else 0.0
+        limit    = min(max(baseline * rules.hotspot_factor, 0.2), 0.9)
+        for s in sites:
+            s.flagged = s.failures >= rules.hotspot_min_failures and s.rate >= limit
+        return baseline
+
+    def clients_matching(self, query):
+        """Client MACs for a MAC (any notation) or a username (any format)."""
+        mac = norm_mac(query)
+        if mac:
+            return {mac}
+        n = norm_user(query)
+        us = self.users.get(n)
+        return set(us.macs) if us else set()
+
+
+# ── Report formatting ─────────────────────────────────────────────────────────
+
+class _Style:
+    def __init__(self, color):
+        self.color = color
+
+    def __call__(self, text, code):
+        return _a(text, code) if (self.color and code) else text
+
+
+def _fmt_dur(sec):
+    sec = int(round(sec))
+    if sec < 60:
+        return f'{sec}s'
+    if sec < 3600:
+        return f'{sec // 60}m{sec % 60:02d}s'
+    if sec < 86400:
+        return f'{sec // 3600}h{sec % 3600 // 60:02d}m'
+    return f'{sec // 86400}d{sec % 86400 // 3600:02d}h'
+
+
+def _fmt_ts(t, with_date=True):
+    if t is None:
+        return '?' * (15 if with_date else 8)
+    return time.strftime('%b %d %H:%M:%S' if with_date else '%H:%M:%S', time.localtime(t))
+
+
+def _table(rows, style, aligns=None, indent='  '):
+    """rows: list of lists of str or (str, ansi_code). Returns list of lines."""
+    if not rows:
+        return []
+    cells  = [[c if isinstance(c, tuple) else (c, None) for c in r] for r in rows]
+    ncol   = max(len(r) for r in cells)
+    widths = [max((len(r[i][0]) for r in cells if i < len(r)), default=0) for i in range(ncol)]
+    aligns = aligns or 'l' * ncol
+    out    = []
+    for r in cells:
+        parts = []
+        for i, (text, code) in enumerate(r):
+            pad = text.rjust(widths[i]) if aligns[i] == 'r' else text.ljust(widths[i])
+            if i == len(r) - 1 and aligns[i] != 'r':
+                pad = text
+            parts.append(style(pad, code))
+        out.append(indent + '  '.join(parts))
+    return out
+
+
+def _vendor(vendors, mac):
+    return vendors.get(mac.replace(':', '').upper()[:6], '') if mac else ''
+
+
+def _client_label(cs, vendors):
+    users = ', '.join(u for u, _ in cs.users.most_common(2))
+    vend  = _vendor(vendors, cs.mac)
+    bits  = [b for b in (users, vend) if b]
+    return f'{cs.mac} ({"; ".join(bits)})' if bits else cs.mac
+
+
+def format_summary(rep, vendors, color=False, sources=''):
+    s, rules, top = _Style(color), rep.rules, rep.rules.top
+    H   = lambda t: ['', s(t, '1;37'), s('─' * len(t), '2;37')]
+    out = [s(f'netlog health summary{" — " + sources if sources else ""}', '1;36'),
+           s('═' * 60, '2;37')]
+
+    span = ''
+    if rep.first_ts is not None:
+        span = (f'{_fmt_ts(rep.first_ts)} → {_fmt_ts(rep.last_ts)} '
+                f'({_fmt_dur(rep.last_ts - rep.first_ts)})')
+    out.append(f'Lines read: {rep.lines:,}   Structured events: {len(rep.events):,}'
+               + (f'   Span: {span}' if span else ''))
+    if not rep.events:
+        out.append('')
+        out.append('No structured key=value events found. netlog looks for lines with fields')
+        out.append('such as clientMac=, userName=, apName=, apMac=, apLocation=, ssid=, rssi=.')
+        return '\n'.join(out)
+
+    out.append(f'Clients: {len(rep.clients):,}   Users: {len(rep.users):,}   '
+               f'APs: {len(rep.aps):,}   Locations: {len(rep.locations):,}')
+    sv = rep.severity
+    out.append('Severity: ' + '   '.join([
+        s(f'✗ {sv["error"]:,} errors', ANSI_EV_DENY),
+        s(f'! {sv["warning"]:,} warnings', ANSI_EV_ERROR),
+        s(f'✓ {sv["success"]:,} success', ANSI_EV_ALLOW),
+        f'· {sv["info"]:,} info']))
+
+    # Failures by type
+    out += H('Failures by event type')
+    if rep.fail_by_event:
+        mx   = max(rep.fail_by_event.values())
+        rows = [[name, str(n), (('█' * max(1, round(20 * n / mx))), '0;31')]
+                for name, n in rep.fail_by_event.most_common(top)]
+        out += _table(rows, s, 'lrl')
+    else:
+        out.append(s('  No failures. ', ANSI_EV_ALLOW))
+
+    # Clients
+    failing = sorted((c for c in rep.clients.values() if c.failures),
+                     key=lambda c: (-c.failures, c.mac))
+    out += H('Top failing clients')
+    if failing:
+        rows = [['Client MAC', 'User', 'Vendor', 'Fail', 'Loops', 'Top AP']]
+        for c in failing[:top]:
+            rows.append([c.mac,
+                         ', '.join(u for u, _ in c.users.most_common(2)) or '-',
+                         (_vendor(vendors, c.mac) or '-')[:24],
+                         (str(c.failures), '1;31'),
+                         (str(len(c.loops)), '1;33' if c.loops else None),
+                         c.aps.most_common(1)[0][0] if c.aps else '-'])
+        out += _table(rows, s, 'lllrrl')
+        if len(failing) > top:
+            out.append(f'  … and {len(failing) - top} more')
+    else:
+        out.append('  None.')
+
+    # Users
+    ufail = sorted((u for u in rep.users.values() if u.failures),
+                   key=lambda u: (-u.failures, u.norm))
+    out += H('Top failing users')
+    if ufail:
+        rows = [['User', 'Fail', 'Events', 'Devices']]
+        for u in ufail[:top]:
+            rows.append([u.label, (str(u.failures), '1;31'), str(u.total), str(len(u.macs))])
+        out += _table(rows, s, 'lrrr')
+        if len(ufail) > top:
+            out.append(f'  … and {len(ufail) - top} more')
+    else:
+        out.append('  None.')
+
+    # APs and locations
+    for title, table, baseline in (('Access points', rep.aps, rep.ap_baseline),
+                                   ('Locations', rep.locations, rep.loc_baseline)):
+        out += H(f'{title} by failure rate (overall {baseline:.1%})')
+        sites = sorted((x for x in table.values() if x.failures),
+                       key=lambda x: (-x.flagged, -x.rate, -x.failures, x.key))
+        if not sites:
+            out.append('  No failures.' if table else '  No data.')
+            continue
+        is_ap = table is rep.aps
+        rows  = [['', 'AP' if is_ap else 'Location'] + (['Location'] if is_ap else []) +
+                 ['Fail', 'OK', 'Rate', 'Clients', 'Top failure']]
+        for x in sites[:top]:
+            flag = ('⚠', '1;31') if x.flagged else ''
+            rate = (f'{x.rate:.0%}', '1;31' if x.flagged else None)
+            rows.append([flag, (x.key, '1;31' if x.flagged else None)] +
+                        ([x.location or '-'] if is_ap else []) +
+                        [str(x.failures), str(x.successes), rate, str(len(x.clients)),
+                         x.fail_by.most_common(1)[0][0]])
+        out += _table(rows, s, 'll' + ('l' if is_ap else '') + 'rrrrl')
+        if any(x.flagged for x in sites):
+            out.append(s(f'  ⚠ = at least {rules.hotspot_min_failures} failures and a failure rate '
+                         f'≥ {min(max(baseline * rules.hotspot_factor, 0.2), 0.9):.0%}', '2;37'))
+
+    # Anomalies
+    out += H('Anomalies')
+    any_anom = False
+
+    if rep.loops:
+        any_anom = True
+        out.append(s(f'  Failure loops ({rules.loop_threshold}+ failures within '
+                     f'{_fmt_dur(rules.loop_window)}): {len(rep.loops)}', '1;31'))
+        for lp in rep.loops[:top]:
+            cs   = rep.clients[lp.client]
+            span = _fmt_dur(lp.end - lp.start) if lp.timed else '?'
+            aps  = ', '.join(a for a, _ in lp.aps.most_common(3)) or 'unknown AP'
+            rec  = (s(f'recovered via {lp.recovery.name} after '
+                      f'{_fmt_dur(lp.recovery.eff - lp.start)}', ANSI_EV_ALLOW)
+                    if lp.recovery else s('no recovery seen', '1;31'))
+            out.append(f'    {_client_label(cs, vendors)}: {lp.count} × '
+                       f'{lp.names.most_common(1)[0][0]} in {span} @ {aps} — {rec}')
+            out.append(s(f'      {_fmt_ts(lp.start if lp.timed else None)} → '
+                         f'{_fmt_ts(lp.end if lp.timed else None)}', '2;37'))
+        if len(rep.loops) > top:
+            out.append(f'    … and {len(rep.loops) - top} more')
+
+    for cat, title in (('legacy',   f'Legacy SSID usage (matches /{rules.legacy_ssid}/)'),
+                       ('identity', 'Identity inconsistencies'),
+                       ('roam',     f'Rapid roaming ({rules.roam_threshold}+ roams within '
+                                    f'{_fmt_dur(rules.roam_window)})'),
+                       ('rssi',     f'Low signal (RSSI below {rules.low_rssi} dBm)')):
+        hits = [(cs, text) for cs in rep.clients.values()
+                for c, text in cs.findings if c == cat]
+        if not hits:
+            continue
+        any_anom = True
+        hits.sort(key=lambda h: h[0].mac)
+        out.append(s(f'  {title}: {len(hits)}', '1;33'))
+        for cs, text in hits[:top]:
+            out.append(f'    {_client_label(cs, vendors)}: {text}')
+        if len(hits) > top:
+            out.append(f'    … and {len(hits) - top} more')
+
+    if not any_anom:
+        out.append(s('  None detected.', ANSI_EV_ALLOW))
+    return '\n'.join(out)
+
+
+_STATE_LABEL = {'join': 'Join', 'auth': 'Authorization', 'roam': 'Roaming',
+                'disconnect': 'Disconnect'}
+
+
+def _state_label(ev):
+    if ev.kind == 'failure':
+        n = ev.name.lower()
+        if 'join' in n or 'assoc' in n:
+            return 'Join Failure'
+        if 'auth' in n:
+            return 'Auth Failure'
+        return ev.name or 'Failure'
+    return _STATE_LABEL.get(ev.kind)
+
+
+def session_path(events, loops=()):
+    """Compress a client's events into a lifecycle path, e.g.
+    'Join Failure ×4 (retry loop) → Join → Authorization → Roaming ×2'."""
+    in_loop = {id(e) for lp in loops for e in lp.events}
+    steps   = []    # [label, count, looped]
+    for ev in events:
+        label = _state_label(ev)
+        if not label:
+            continue
+        if steps and steps[-1][0] == label:
+            steps[-1][1] += 1
+            steps[-1][2] |= id(ev) in in_loop
+        else:
+            steps.append([label, 1, id(ev) in in_loop])
+    return ' → '.join(f'{l}{f" ×{n}" if n > 1 else ""}{" (retry loop)" if lp else ""}'
+                      for l, n, lp in steps)
+
+
+def _event_details(ev, show_user):
+    f    = ev.fields
+    bits = []
+    if ev.ap:
+        bits.append(ev.ap + (f' [{f["ap_loc"]}]' if f.get('ap_loc') else ''))
+    if f.get('ssid'):
+        bits.append(f'ssid {f["ssid"]}')
+    if f.get('rssi'):
+        bits.append(f'rssi {f["rssi"]}')
+    if show_user and f.get('user'):
+        bits.append(f'user {f["user"]}')
+    if f.get('reason'):
+        bits.append(f'reason {f["reason"]}')
+    if f.get('status') and ev.kind == 'failure':
+        bits.append(f'status {f["status"]}')
+    return ' · '.join(bits)
+
+
+def format_timeline(rep, query, vendors, color=False):
+    """Chronological narrative for one client MAC or user. Returns
+    (text, found)."""
+    s     = _Style(color)
+    macs  = rep.clients_matching(query)
+    qnorm = None if norm_mac(query) else norm_user(query)
+    out   = []
+
+    groups = [(m, rep.clients[m].events) for m in sorted(macs) if m in rep.clients]
+    if qnorm:
+        # Events naming the user but no client MAC.
+        orphans = [e for e in rep.events if 'client_mac' not in e.fields
+                   and 'user' in e.fields and norm_user(e.fields['user']) == qnorm]
+        if orphans:
+            groups.append((None, orphans))
+    context = {m: [e for e in rep.context
+                   if any(norm_mac(x.group()) == m for x in MAC_RE.finditer(e.raw))]
+               for m in macs}
+    if not groups and not any(context.values()):
+        return f'No events found for {query}.', False
+
+    if qnorm and len(groups) > 1:
+        out.append(s(f'User {query}: {len(groups)} device'
+                     f'{"s" * (len(groups) != 1)}', '1;36'))
+
+    for mac, evs in groups:
+        cs = rep.clients.get(mac) if mac else None
+        if out:
+            out.append('')
+        if cs:
+            vend = _vendor(vendors, mac)
+            out.append(s(f'Client {mac}' + (f'  ({vend})' if vend else ''), '1;36'))
+            out.append(s('═' * 60, '2;37'))
+            if cs.users:
+                out.append(f'Users:  {", ".join(u for u, _ in cs.users.most_common())}')
+            if cs.aps:
+                out.append(f'APs:    {", ".join(a for a, _ in cs.aps.most_common(6))}'
+                           + (f' (+{len(cs.aps) - 6} more)' if len(cs.aps) > 6 else ''))
+            if cs.ssids:
+                out.append(f'SSIDs:  {", ".join(x for x, _ in cs.ssids.most_common())}')
+            loops = cs.loops
+        else:
+            out.append(s(f'User {query} — events with no client MAC', '1;36'))
+            out.append(s('═' * 60, '2;37'))
+            loops = find_failure_loops(evs, rep.rules)
+        times = [e.ts for e in evs if e.ts is not None]
+        nfail = sum(e.kind == 'failure' for e in evs)
+        line  = f'Events: {len(evs)}  ({nfail} failure{"s" * (nfail != 1)}'
+        line += f', {len(loops)} loop{"s" * (len(loops) != 1)})' if loops else ')'
+        if times:
+            line += f'   {_fmt_ts(min(times))} → {_fmt_ts(max(times))}'
+        out.append(line)
+        path = session_path(evs, loops)
+        if path:
+            out.append('Path:   ' + path)
+        if cs and cs.findings:
+            out.append(s('Findings:', '1;33'))
+            for cat, text in cs.findings:
+                out.append(s(f'  ⚠ {text}', '1;31' if cat == 'loop' else '1;33'))
+        out.append('')
+
+        items     = _chronological(list(evs) + (context.get(mac, []) if mac else []))
+        loop_of   = {id(e): lp for lp in loops for e in lp.events}
+        open_loop = None
+        show_user = len(cs.users) > 1 if cs else False
+        for ev in items:
+            lp = loop_of.get(id(ev))
+            if lp is not None and open_loop is not lp:
+                span = (f' in {_fmt_dur(lp.end - lp.start)}' if lp.timed else ' in a row')
+                aps  = ', '.join(a for a, _ in lp.aps.most_common(3))
+                out.append(s(f'  ┏━ ⚠ FAILURE LOOP: {lp.count} failures{span}'
+                             + (f' @ {aps}' if aps else ''), '1;31'))
+                open_loop = lp
+            gutter = s('  ┃ ', '1;31') if open_loop else '  '
+            when   = s(_fmt_ts(ev.ts), '2;37')
+            if ev.severity == 'other':
+                out.append(f'{gutter}{when}  {s("· " + ev.raw.strip(), "2;37")}')
+            else:
+                g = _STRUCT_GLYPH.get(ev.severity) or _STRUCT_GLYPH.get(ev.kind)
+                glyph = s(g[0], g[1]) if g else '  '
+                name  = s(f'{ev.label:<22}', g[1] if g else None)
+                det   = _event_details(ev, show_user)
+                warn  = ''.join(s(f'  ⚠ {w}', '1;33') for w in ev.findings)
+                out.append(f'{gutter}{when}  {glyph}{name} {det}{warn}'.rstrip())
+            if open_loop is not None and ev is open_loop.events[-1]:
+                if open_loop.recovery is not None:
+                    r = open_loop.recovery
+                    out.append(s(f'  ┗━ recovered via {r.name} at {_fmt_ts(r.ts, False)}'
+                                 f' after {_fmt_dur(r.eff - open_loop.start)}', ANSI_EV_ALLOW))
+                else:
+                    out.append(s('  ┗━ no recovery seen', '1;31'))
+                open_loop = None
+    return '\n'.join(out), True
+
+
+# ── Live correlation (piped / follow mode) ────────────────────────────────────
+
+class LiveCorrelator:
+    """Groups a client's failure loop visually as lines stream past.
+
+    When a client hits the loop threshold, a banner is printed and that
+    client's following lines get a side bar in the client's MAC color, until
+    it recovers (successful join/auth) or the loop window passes quietly.
+    """
+    def __init__(self, mac_map, ctr, rules=None, color=True):
+        self.rules   = rules or RULES
+        self.mac_map = mac_map
+        self.ctr     = ctr
+        self.s       = _Style(color)
+        self.state   = {}
+
+    def _code(self, key):
+        if key.startswith('user:'):
+            return '1;31'
+        return ANSI_MAC[mac_color(key.replace(':', '').upper(), self.mac_map, self.ctr)]
+
+    def process(self, line):
+        """Return (before_lines, gutter, suffix) to decorate `line` with."""
+        p = parse_event(line)
+        if p is None or p.kind is None:
+            return [], '', ''
+        f   = p.fields
+        key = f.get('client_mac') or (f'user:{norm_user(f["user"])}' if 'user' in f else None)
+        if key is None:
+            return [], '', ''
+        rules = self.rules
+        st = self.state.get(key)
+        if st is None:
+            st = self.state[key] = {'fails': collections.deque(), 'loop': None, 'last': None}
+        ts = p.ts if p.ts is not None else (st['last'] if st['last'] is not None else 0.0)
+        st['last'] = ts
+
+        code   = self._code(key)
+        s      = self.s
+        who    = key[5:] if key.startswith('user:') else key
+        if 'user' in f and not key.startswith('user:'):
+            who += f' ({f["user"]})'
+        before, gutter, suffix = [], '', ''
+        lp = st['loop']
+        if lp and ts - lp['last'] > rules.loop_window:
+            before.append(s(f'┗━ {who}: loop ended — {lp["count"]} failures over '
+                            f'{_fmt_dur(lp["last"] - lp["start"])}, no recovery seen', code))
+            st['loop'] = lp = None
+
+        if p.kind == 'failure':
+            dq = st['fails']
+            dq.append(ts)
+            while ts - dq[0] > rules.loop_window:
+                dq.popleft()
+            ap = f.get('ap_name') or f.get('ap_mac')
+            if lp:
+                lp['count'] += 1
+                lp['last']   = ts
+                gutter = s('┃ ', code)
+            elif len(dq) >= rules.loop_threshold:
+                st['loop'] = {'start': dq[0], 'last': ts, 'count': len(dq)}
+                before.append(s(f'┏━ ⚠ FAILURE LOOP: {who} — {len(dq)} failures in '
+                                f'{_fmt_dur(ts - dq[0])}' + (f' @ {ap}' if ap else ''), code))
+                gutter = s('┃ ', code)
+        elif p.kind in ('join', 'auth'):
+            st['fails'].clear()
+            if lp:
+                gutter = s('┗━', code)
+                suffix = s(f'  ✓ recovered after {lp["count"]} failures '
+                           f'({_fmt_dur(ts - lp["start"])})', ANSI_EV_ALLOW)
+                st['loop'] = None
+        elif lp:
+            gutter = s('┃ ', code)
+        return before, gutter, suffix
+
+
+def _prefix_last_line(text, prefix):
+    """Put `prefix` on the last line of `text` (after any loop banners)."""
+    head, nl, last = text.rpartition('\n')
+    return head + nl + prefix + last
+
+
+def render_live(line, display, corr, vendors, mac_map, ctr):
+    """ANSI output for one streamed line: loop banners + side bar + highlight.
+    `line` is the original text (for correlation), `display` what to show
+    (e.g. with columns hidden)."""
+    before, gutter, suffix = corr.process(line) if corr else ([], '', '')
+    return '\n'.join(before + [gutter + highlight_ansi(display, vendors, mac_map, ctr) + suffix])
+
+
+def iter_log_lines(files):
+    """Lines from the given files (.gz transparently), or stdin if none."""
+    if not files:
+        for line in sys.stdin:
+            yield line.rstrip('\r\n')
+        return
+    for f in files:
+        opener = gzip.open if f.name.endswith('.gz') else open
+        with opener(f, 'rt', errors='replace') as fh:
+            for line in fh:
+                yield line.rstrip('\r\n')
+
+
+def analysis_mode(files, vendors, summary=False, client=None):
+    color = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
+    ctx   = {norm_mac(client)} if client and norm_mac(client) else None
+    an    = Analyzer(context_macs=ctx)
+    try:
+        for line in iter_log_lines(files):
+            an.feed(line)
+    except OSError as e:
+        sys.exit(f'Error reading log: {e}')
+    rep = Report(an)
+    if summary:
+        sources = ', '.join(str(f) for f in files) if files else 'stdin'
+        print(format_summary(rep, vendors, color, sources))
+    if client:
+        if summary:
+            print()
+        text, found = format_timeline(rep, client, vendors, color)
+        print(text)
+        if not found:
+            sys.exit(1)
+
+
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def build_arg_parser():
@@ -1340,6 +2438,8 @@ def build_arg_parser():
             '  netlog -f "deny|drop" /var/log/fw.log    Follow, egrep-filtered\n'
             '  netlog -f --alert DENY /var/log/fw.log   Follow with alert bell\n'
             '  cat file.log | netlog                    Piped/ANSI mode\n'
+            '  netlog --summary /var/log/wlc.log        Health summary report\n'
+            '  netlog --client alice /var/log/wlc.log   Timeline for one user or MAC\n'
             '  netlog --setup-geoip                     Configure MaxMind GeoIP'
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1352,6 +2452,27 @@ def build_arg_parser():
                     help='Bell + highlight new lines matching this regex in follow mode')
     p.add_argument('--setup-geoip', dest='setup_geoip', action='store_true',
                     help='Configure (or reconfigure) MaxMind GeoIP credentials, then exit')
+    a = p.add_argument_group(
+        'analysis', 'For logs with key="value" fields (clientMac=, userName=, apName=, '
+                    'apLocation=, ssid=, rssi=, ...). Both modes read the FILEs, '
+                    'or stdin if none are given.')
+    a.add_argument('--summary', action='store_true',
+                    help='Print a health summary: top failing clients/users, AP and '
+                         'location failure rates, failure types, and anomalies')
+    a.add_argument('--client', metavar='MAC|USER',
+                    help='Print a chronological timeline for one client MAC (any notation) '
+                         'or username (alice, alice@corp.org and CORP\\alice all match)')
+    a.add_argument('--loop-threshold', type=int, default=3, metavar='N',
+                    help='Failures needed to call it a failure loop (default: 3)')
+    a.add_argument('--loop-window', type=_duration_arg, default=300, metavar='TIME',
+                    help='Rolling window for failure loops, e.g. 300, 90s, 5m (default: 5m)')
+    a.add_argument('--legacy-ssid', default=r'[-_](?:old|legacy)$', metavar='REGEX',
+                    help='SSIDs matching this regex count as legacy '
+                         '(default: names ending in -old/-legacy)')
+    a.add_argument('--low-rssi', type=int, default=-75, metavar='DBM',
+                    help='RSSI below this is flagged as low signal (default: -75)')
+    a.add_argument('--top', type=int, default=10, metavar='N',
+                    help='Rows per section in --summary (default: 10)')
     p.add_argument('--version', action='version', version=f'netlog {VERSION}')
     p.add_argument('args', nargs='*', metavar='FILE',
                     help='Log file(s) to view; shell globs are supported. In follow mode, '
@@ -1360,35 +2481,75 @@ def build_arg_parser():
     return p
 
 
-def parse_args(argv=None):
-    ns = build_arg_parser().parse_args(argv)
+def _duration_arg(text):
+    """'300' / '90s' / '5m' / '1h' → seconds."""
+    m = re.fullmatch(r'\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*', text, re.I)
+    if not m or float(m.group(1)) <= 0:
+        raise argparse.ArgumentTypeError(f'invalid duration: {text!r} (try 300, 90s, 5m)')
+    return float(m.group(1)) * {'': 1, 's': 1, 'm': 60, 'h': 3600}[m.group(2).lower()]
+
+
+def parse_cli(argv=None):
+    """Parse the command line. Returns the argparse namespace plus
+    log_files (expanded globs) and egrep_pat."""
+    p  = build_arg_parser()
+    ns = p.parse_args(argv)
+    if ns.follow and (ns.summary or ns.client):
+        p.error('-f cannot be combined with --summary or --client')
+    if ns.loop_threshold < 1:
+        p.error('--loop-threshold must be at least 1')
+    if ns.top < 1:
+        p.error('--top must be at least 1')
+    try:
+        re.compile(ns.legacy_ssid)
+    except re.error as e:
+        p.error(f'invalid --legacy-ssid regex: {e}')
 
     positionals = ns.args
     if ns.follow and len(positionals) >= 2:
-        egrep_pat, *file_args = positionals
+        ns.egrep_pat, *file_args = positionals
     else:
-        egrep_pat, file_args = None, positionals
+        ns.egrep_pat, file_args = None, positionals
 
-    log_files = []
+    ns.log_files = []
     for a in file_args:
         matches = sorted(glob.glob(a))
-        for p in (matches or [a]):
-            log_files.append(Path(p))
+        for f in (matches or [a]):
+            ns.log_files.append(Path(f))
+    return ns
 
-    return ns.follow, ns.tail_lines, log_files, ns.alert_pat, egrep_pat, ns.setup_geoip
+
+def parse_args(argv=None):
+    """Legacy tuple form of parse_cli()."""
+    ns = parse_cli(argv)
+    return ns.follow, ns.tail_lines, ns.log_files, ns.alert_pat, ns.egrep_pat, ns.setup_geoip
 
 
 def main():
-    global _GEO_READER
-    follow, tail_lines, log_files, alert_pat, egrep_pat, setup_geoip = parse_args()
+    global _GEO_READER, RULES
+    opts = parse_cli()
+    follow, tail_lines, log_files = opts.follow, opts.tail_lines, opts.log_files
+    alert_pat, egrep_pat, setup_geoip = opts.alert_pat, opts.egrep_pat, opts.setup_geoip
+    RULES = Rules(loop_threshold=opts.loop_threshold, loop_window=opts.loop_window,
+                  legacy_ssid=opts.legacy_ssid, low_rssi=opts.low_rssi, top=opts.top)
+
+    cfg = load_config()
+    if setup_geoip:
+        setup_geoip_cmd(cfg)   # exits the process
+
+    if opts.summary or opts.client:
+        missing = [f for f in log_files if not f.exists()]
+        if missing:
+            sys.exit(f"File not found: {missing[0]}")
+        if not log_files and sys.stdin.isatty():
+            sys.exit('Usage: netlog --summary|--client MAC|USER <file> [file2 ...]  '
+                     '(or pipe the log in)')
+        analysis_mode(log_files, load_oui(OUI_FILE), opts.summary, opts.client)
+        return
+
     vendors = load_oui(OUI_FILE)
     mac_map, idx, col_hidden = load_color_map(COLOR_FILE)
     ctr = [idx]
-
-    cfg = load_config()
-
-    if setup_geoip:
-        setup_geoip_cmd(cfg)   # exits the process
 
     # Never prompt interactively when stdin isn't a real terminal — e.g. piped
     # log input, cron, or CI would otherwise have input() read from the pipe.
