@@ -41,10 +41,17 @@ chmod +x netlog
 ```bash
 git clone <repo>
 cd netlog
-./install.sh              # installs to ~/.local/bin/netlog (no sudo needed)
-./install.sh --system     # installs to /usr/local/bin/netlog instead (may need sudo)
+./install.sh              # asks: user install or system install
+./install.sh --user       # installs to ~/.local/bin/netlog (just you, no sudo)
+./install.sh --system     # installs to /usr/local/bin/netlog (all users; uses sudo if needed)
 ./install.sh --prefix DIR # installs to DIR/bin/netlog
 ```
+
+Run `./install.sh` without `sudo`. If you choose a system install, the
+script uses `sudo` only for the step that copies the program into
+`/usr/local/bin`, so your own data folder still gets set up for you.
+(Running the whole script with `sudo` and picking a user install
+installs it for root only.)
 
 After installing, make sure the target `bin` directory is on your `PATH` (the
 script tells you if it isn't), then run it as `netlog` from anywhere:
@@ -55,6 +62,20 @@ netlog /var/log/syslog
 
 The OUI vendor database (`oui.txt`) is downloaded automatically from Wireshark on first run
 (`install.sh` pre-seeds it from this checkout if it's already been downloaded once).
+
+### Uninstall
+
+```bash
+./install.sh --uninstall              # removes netlog from ~/.local/bin and/or /usr/local/bin
+./install.sh --uninstall --system     # only from /usr/local/bin (likewise --user, --prefix DIR)
+./install.sh --uninstall --purge      # also delete your netlog data without asking
+./install.sh --uninstall --keep-data  # keep your netlog data without asking
+```
+
+Without `--purge` or `--keep-data`, it lists your netlog data files and asks
+whether to delete them. Non-interactive runs keep the data. Only netlog's own files
+(`oui.txt`, `mac_colors.json`, `netlog_config.json`, `GeoLite2-*.mmdb`) are
+deleted, and the data folder is removed only if it's then empty.
 
 ---
 
@@ -252,7 +273,7 @@ python3 -m unittest discover -s tests -v
 | File | Purpose |
 |------|---------|
 | `netlog` | Main script |
-| `install.sh` | Installs `netlog` on PATH |
+| `install.sh` | Installs/uninstalls `netlog` on PATH |
 | `tests/` | Unit tests (`python3 -m unittest discover -s tests`) |
 | `oui.txt` | IEEE OUI vendor database (auto-downloaded, in the data dir) |
 | `mac_colors.json` | Persistent MAC colors and column settings (in the data dir) |
