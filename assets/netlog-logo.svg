@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 770 256" width="770" height="256" role="img" aria-label="netlog — network log analyzer">
+  <title>netlog — network log analyzer</title>
+  <defs>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="5"/>
+    </filter>
+  </defs>
+  <rect width="770" height="256" rx="44" fill="#0D1117"/>
+  <g transform="translate(12 0)">
+
+  <!-- soft glow behind the nodes -->
+  <g fill="#39FF88" opacity="0.35" filter="url(#glow)">
+    <circle cx="68" cy="64" r="14"/>
+    <circle cx="172" cy="192" r="14"/>
+    <circle cx="172" cy="64" r="16"/>
+  </g>
+
+  <!-- the N: left stroke, cyan diagonal, right stroke -->
+  <g fill="none" stroke-linecap="round" stroke-width="20">
+    <line x1="68"  y1="64" x2="68"  y2="192" stroke="#39FF88"/>
+    <line x1="172" y1="192" x2="172" y2="64" stroke="#39FF88"/>
+    <line x1="68"  y1="64" x2="172" y2="192" stroke="#22D3EE"/>
+  </g>
+  <!-- subtle circuit trace off the right stroke -->
+  <polyline points="182,120 194,120 204,110" fill="none" stroke="#39FF88" stroke-width="4"
+            stroke-linecap="round" stroke-linejoin="round" opacity="0.7"/>
+  <circle cx="206" cy="108" r="4" fill="#39FF88" opacity="0.7"/>
+
+  <!-- packets travelling along the diagonal -->
+  <g fill="#E6EDF3">
+    <circle cx="102.7" cy="106.7" r="4.5"/>
+    <circle cx="137.3" cy="149.3" r="4.5"/>
+  </g>
+
+  <!-- network nodes -->
+  <g stroke-width="6" fill="#0D1117">
+    <circle cx="68"  cy="64"  r="14" stroke="#22D3EE"/>
+    <circle cx="68"  cy="192" r="14" stroke="#39FF88"/>
+    <circle cx="172" cy="192" r="14" stroke="#22D3EE"/>
+  </g>
+  <circle cx="172" cy="64" r="15" fill="#39FF88"/>
+
+  <!-- terminal cursor -->
+  <rect x="198" y="198" width="34" height="10" rx="2" fill="#39FF88"><animate attributeName="opacity" values="1;1;0;0" keyTimes="0;0.5;0.5;1" dur="1.2s" repeatCount="indefinite"/></rect>
+  </g>
+  <g font-family="'JetBrains Mono','IBM Plex Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,'DejaVu Sans Mono','Liberation Mono',monospace">
+    <text x="286" y="150" font-size="112" font-weight="600" letter-spacing="4"><tspan fill="#39FF88">net</tspan><tspan fill="#E6EDF3">log</tspan></text>
+    <text x="290" y="202" font-size="22" font-weight="500" letter-spacing="7.5" fill="#22D3EE" opacity="0.85">NETWORK LOG ANALYZER</text>
+  </g>
+</svg>

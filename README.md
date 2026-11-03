@@ -1,6 +1,34 @@
+<p align="center">
+  <img src="assets/netlog-logo.svg" alt="netlog — network log analyzer" width="560">
+</p>
+
 # netlog
 
-A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. It recognises the log formats of 28 vendor platforms (Cisco, Juniper, Aruba, Ruckus, Fortinet, Palo Alto, UniFi, Meraki, MikroTik, pfSense and more) across wireless, switching, routing and firewalls, plus any `key="value"` log. It correlates events per client, user, AP, interface and source IP to find failure loops, flapping links, login attacks, port scans and other problems, and produces health summaries and per-client timelines. No external dependencies beyond the Python standard library.
+A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. It recognises the log formats of 28 vendor platforms (Cisco, Juniper, Aruba, Ruckus, Fortinet, Palo Alto, UniFi, Meraki, MikroTik, pfSense and more) across wireless, switching, routing and firewalls, plus any `key="value"` log. It correlates events per client, user, AP, interface and source IP to find failure loops, flapping links, login attacks, port scans and other problems. It produces a ranked security and error analytics report, health summaries and per-client timelines. You can filter logs down to the lines you care about as they load (`-g`). No external dependencies beyond the Python standard library.
+
+---
+
+## What's new
+
+**1.5.0**
+- `-g PATTERN` / `--grep PATTERN` loads only matching lines, in every mode. It replaces a `grep … > little.log` step (see [Load only the lines you need](#load-only-the-lines-you-need--g----grep)).
+- New threshold options for the analytics: `--spray-accounts`, `--spray-sources`, `--spike-min`, `--spike-factor`, `--spike-window`.
+
+**1.4.0**
+- The statistics popup (`x`) became a full **analytics** report: ranked findings (critical → low) for brute force, password spraying, distributed login attacks, success after brute force, port/host scans, risky services exposed to the internet, internal hosts using risky services, spam bots, error spikes, noisy or silent devices and clock mismatches.
+- 23 text detectors work on any log line: DHCP exhaustion, ARP spoofing, rogue APs, IP conflicts, storms, loops, crashes, memory/disk/table exhaustion, hardware, VPN, certificate, NTP and more (see [Findings](#findings)).
+- New Linux / BSD format: OpenSSH `sshd`, `sudo` and PAM login failures and successes.
+- The firewall statistics add top allowed ports, top talkers and protocols. Plain syslog gets top sending hosts and programs, and port counting no longer picks up MAC or timestamp fragments.
+- `--summary` now starts with the same Findings list.
+
+**1.3.0**
+- 28 vendor log formats are detected and normalised (`netlog --formats`); see [Supported log formats](#supported-log-formats).
+- Network and security findings: interface flapping, err-disabled ports, loops, routing neighbors, login attacks, scans, VPN, failover, hardware.
+- `--flap-threshold`/`--flap-window`, `--brute-threshold`/`--brute-window` and `--scan-ports`/`--scan-hosts`/`--scan-window` options.
+- TUI fixes and additions:
+  - Search now highlights every match and `n`/`p` move between them, also in large-file mode.
+  - The `f` filter works, including in large-file mode, and has `a|b`, `!exclude` and `r:regex` syntax.
+  - New line wrapping, with indented continuation rows. Toggle it with `l` (remembered between runs) or `--wrap`/`--no-wrap`; wrapping also works in follow and piped output.
 
 ---
 
@@ -10,10 +38,12 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 - **Event-type prefix glyphs** — every line gets a 2-character indicator showing the nature of the event at a glance
 - **MAC vendor lookup** — IEEE OUI database is auto-downloaded; each unique MAC gets a persistent color across sessions
 - **GeoIP lookup** — optionally annotates IP addresses with city/country using MaxMind GeoLite2
-- **Interactive TUI** — full-screen curses viewer with search, filter, dedup, stats, column hiding, and export
+- **Interactive TUI** — full-screen curses viewer with search, filter, dedup, analytics, column hiding, line wrapping and export
+- **Load-time filter (`-g`)** — load only the lines matching one or more patterns, in the viewer, analytics, summaries, follow mode and piped mode
+- **Line wrapping** — long lines wrap at word boundaries with indented continuation rows, or are cut and panned sideways (`l`, `--wrap`/`--no-wrap`)
 - **Large file support** — files over 50 MB are accessed via `mmap` + a byte-offset index so only the visible screen is ever in RAM
 - **Automatic `.gz` decompression** — open compressed logs directly; follow mode handles them gracefully too
-- **Follow mode** — `tail -f`-style real-time monitoring with optional egrep filter and audio/visual alerts
+- **Follow mode** — `tail -f`-style real-time monitoring with optional egrep or `-g` filter and audio/visual alerts
 - **Piped input** — `cat file.log | netlog` works; all highlighting applies
 - **Structured log analysis** — parses `key="value"` fields (`clientMac=`, `userName=`, `apName=`, `apLocation=`, `ssid=`, `rssi=`, …), classifies events as error / warning / success, and tracks each client's session lifecycle
 - **Health summary (`--summary`)** — a ranked list of findings (critical → low), then per-domain statistics: wireless clients/APs/locations, switching and routing, firewall traffic, authentication and infrastructure
@@ -23,6 +53,7 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 - **Diagnostic rules** — legacy SSID use, inconsistent username formats on one device, rapid roaming, low RSSI, and AP/location failure hotspots
 - **Vendor format detection** — 28 wireless, switch, router, firewall and NAC log formats are detected per line and normalised to common fields and event kinds (`netlog --formats` lists them)
 - **Network and security findings** — interface flapping, err-disabled ports, MAC flapping and loops, routing neighbor loss, login brute force (and success after failures), port and host scans, VPN, failover, hardware and service events
+- **Configurable thresholds** — every detection rule's limits can be set on the command line (see [Diagnostic rules](#diagnostic-rules))
 
 ---
 
@@ -99,6 +130,8 @@ netlog -f --alert PATTERN <file>            Follow with alert bell on pattern ma
 cat file.log | netlog                       Piped/ANSI mode
 netlog --summary <file> [file2 ...]         Health summary of structured events
 netlog --client <MAC|user> <file> ...       Timeline for one client or user
+netlog --summary --brute-threshold 10 ...   Tune a detection rule (see Diagnostic rules)
+netlog --summary --top 25 <file>            More rows per section and per kind of finding
 netlog --formats                            List recognised vendor log formats
 netlog --no-wrap <file>                     Cut long lines instead of wrapping (--wrap to force on)
 netlog --setup-geoip                        Configure (or reconfigure) MaxMind GeoIP
@@ -150,7 +183,7 @@ The syntax is the same as the `f` filter in the viewer: plain text is a case-ins
 | `#` | Toggle line numbers |
 | `h` `u` | Hide / unhide leftmost column |
 | `x` | Analytics popup: ranked findings and statistics for the current view |
-| `e` | Export current view to file |
+| `e` | Export the current view (after filter/dedup) to `logview_filtered_export.txt` in the current directory |
 | `c` | Clear all filters and search |
 | `q` | Quit |
 
@@ -229,7 +262,9 @@ Files larger than 50 MB are automatically opened in large-file mode:
 - Only the lines visible on screen are read from disk during scrolling
 - A 1 GB file with 10 M lines uses ~80 MB for the index vs several GB for a full in-memory load
 
-Features unavailable in large-file mode (noted in the status bar): filter, dedup, search navigation (n/p), line numbers, and export. Scrolling, search highlighting, stats, column hiding, and event glyphs all work normally.
+Features unavailable in large-file mode (noted in the status bar): dedup, line numbers and export. Scrolling, search and `n`/`p`, filtering, wrapping, analytics, column hiding and event glyphs all work normally. Filtering a large file scans it once, showing progress (`Esc` cancels).
+
+With `-g`, only the matching lines are loaded, so a large log often becomes a small one. If the matches are still over 50 MB, they open in large-file mode.
 
 ---
 
@@ -276,6 +311,7 @@ Running `netlog` straight from a git clone (as in "Run in place" above) keeps ev
 
 - MaxMind GeoIP credentials (account ID + license key)
 - Whether GeoIP setup was declined, so netlog doesn't ask again
+- Whether long lines wrap (toggled with `l`)
 
 ---
 
@@ -447,10 +483,12 @@ netlog -f /var/log/firewall.log
 netlog -f "deny|drop" /var/log/firewall.log
 netlog -f -n 50 "WARN|ERR" /var/log/syslog
 netlog -f --alert "DENY" /var/log/firewall.log
+netlog -f -g 10.146. -g '!dhcp' /var/log/syslog
 ```
 
 - Displays the last 10 lines (configurable with `-n N`) then streams new lines as they arrive
 - An optional egrep-style filter pattern (extended regex, in quotes) placed **before the filename** limits output to matching lines only — both the initial tail and the live stream are filtered; a `[filter: ...]` header is printed at startup
+- `-g PATTERN` filters the same way, using the viewer's filter syntax; a `[grep: ...]` header is printed. Both kinds of filter can be combined
 - `Space` pauses/resumes the stream
 - `l` toggles wrapping of long lines: wrapped rows are indented, or with wrapping off lines are cut at the screen edge
 - `q` quits
@@ -466,6 +504,7 @@ netlog -f --alert "DENY" /var/log/firewall.log
 cat /var/log/syslog | netlog
 journalctl -f | netlog
 ssh host 'tail -f /var/log/auth.log' | netlog
+journalctl -f | netlog -g sshd -g '!session opened'
 ```
 
 All ANSI highlighting — including event glyphs — is applied to stdout. When stdout is a terminal, long lines are wrapped with indented continuation rows (or cut with `--no-wrap`); output redirected to a file or another program is left unwrapped. Color map is updated and saved on exit.
@@ -474,7 +513,12 @@ All ANSI highlighting — including event glyphs — is applied to stdout. When 
 
 ## Testing
 
-A `unittest` suite (stdlib only, no test framework dependency) covers the pure logic — highlighting/segment priority, dedup, column stripping, search, CLI argument parsing, and the structured analysis (field parsing, timestamps, failure loops, diagnostic rules, report and timeline output, live loop grouping):
+A `unittest` suite (stdlib only, no test framework dependency) covers the pure logic:
+
+- Viewer: highlighting/segment priority, dedup, column stripping, search and match navigation, the filter and `-g` syntax, line wrapping
+- CLI argument parsing, including every threshold option
+- Vendor format detection
+- Structured analysis: field parsing, timestamps, failure loops, diagnostic rules, network and security findings, the analytics alerts and text detectors, report and timeline output, live loop grouping
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -489,6 +533,7 @@ python3 -m unittest discover -s tests -v
 | `netlog` | Main script |
 | `install.sh` | Installs/uninstalls `netlog` on PATH |
 | `tests/` | Unit tests (`python3 -m unittest discover -s tests`) |
+| `assets/` | Logo (`netlog-logo.svg`) and square icon (`netlog-icon.svg`) |
 | `oui.txt` | IEEE OUI vendor database (auto-downloaded, in the data dir) |
 | `mac_colors.json` | Persistent MAC colors and column settings (in the data dir) |
 | `netlog_config.json` | GeoIP credentials and other config, mode `600` (in the data dir) |
