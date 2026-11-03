@@ -91,6 +91,7 @@ deleted, and the data folder is removed only if it's then empty.
 
 ```
 netlog <file> [file2 ...]                   Interactive TUI viewer
+netlog -g PATTERN <file> ...                Load only lines matching PATTERN (any mode)
 netlog -f <file>                            Follow mode (like tail -f)
 netlog -f -n 50 <file>                      Follow, showing last 50 lines first
 netlog -f "pattern" <file>                  Follow, only showing lines matching pattern
@@ -114,6 +115,20 @@ netlog /var/log/syslog /var/log/kern.log
 netlog /var/log/firewall.log*
 netlog /var/log/firewall.log.10.gz
 ```
+
+### Load only the lines you need (`-g` / `--grep`)
+
+`-g PATTERN` filters the logs as they are read, so the viewer, analytics, `--summary`, `--client`, follow mode and piped mode only see matching lines. It replaces a `grep … > little.log` step:
+
+```bash
+netlog -g 10.146. schools.log                  # only lines containing 10.146.
+netlog -g '10.146.|10.147.' schools.log        # either subnet
+netlog -g 10.146. -g '!dhcp' schools.log       # repeat -g: every pattern must match
+netlog -g 'r:\b10\.146\.2\.7\b' schools.log    # regex: exactly this address
+netlog --summary -g 10.146. schools.log        # analytics on just those lines
+```
+
+The syntax is the same as the `f` filter in the viewer: plain text is a case-insensitive substring (a `.` is a literal dot, unlike in `grep`), `a|b` matches either, a leading `!` excludes, and `r:REGEX` is a case-insensitive regex. Plain text matches anywhere, so `10.146.2.7` also matches `10.146.2.70`; use `r:\b…\b` for an exact address. Before the viewer opens, matching lines are copied to a temporary file (deleted on exit). Big results still use large-file mode. The status bar shows `[N of M lines loaded]` and `[Grep: …]`. You can still use `f` to narrow the view further. If nothing matches, netlog says so and exits.
 
 ---
 
@@ -358,6 +373,9 @@ For the generic parser, a line counts as a structured event when it has at least
 | **Interface flapping**: link downs on one device + interface | 3 in 10 min | `--flap-threshold N`, `--flap-window 10m` |
 | **Login attack**: login failures from one source IP (or user, if no IP); also flags a successful login from that source after failures | 5 in 5 min | `--brute-threshold N`, `--brute-window 5m` |
 | **Port / host scan**: distinct destination ports, or distinct hosts, denied for one source | 15 ports or 15 hosts in 5 min | `--scan-ports N`, `--scan-hosts N`, `--scan-window 5m` |
+| **Password spraying**: login failures from one source against N distinct accounts | 5 accounts | `--spray-accounts N` |
+| **Distributed login attack**: login failures against one account from N distinct sources | 5 sources | `--spray-sources N` |
+| **Error spike**: errors + warnings in one window, at least N and X × the median window | 20 and 5× per 5 min | `--spike-min N`, `--spike-factor X`, `--spike-window 5m` |
 | **Err-disable, loop / MAC flap, routing neighbor down, VPN down, service down**: reported per device/interface/peer, noting whether it recovered | — | — |
 
 Events without an `apLocation` field are attributed to the location their AP reports elsewhere in the log. For logs with no timestamps, a failure loop means N failures in a row with no success between them.
@@ -381,7 +399,7 @@ Every detector's results, most serious first, up to `--top` rows per kind (`… 
 | Level | Findings |
 |-------|----------|
 | Critical | Successful login from a source after a brute-force run · risky service (RDP, SMB, Telnet, databases, VNC, WinRM, SNMP, …) allowed in from an internet address · emergency/alert syslog messages · malware / intrusion text |
-| High | Login attack (brute force) · password spraying (one source, 5+ accounts) · distributed login attack (one account, 5+ sources) · port scan / host sweep from an internal host · internal host reaching risky services on the internet · spike in errors/warnings (5-minute bucket ≥ 20 and ≥ 5× the median) · interface flapping · err-disabled port · layer-2 loop / MAC flap · routing neighbor down · threat signatures · VPN tunnel / server / AP down · hardware faults · critical syslog messages · DoS/flood, ARP spoofing, IP conflict, rogue AP/DHCP, wireless attack, DHCP pool exhausted, broadcast storm, conntrack/session table full, memory exhaustion, crash/panic, disk full, AAA/RADIUS unreachable |
+| High | Login attack (brute force) · password spraying (one source, 5+ accounts; `--spray-accounts`) · distributed login attack (one account, 5+ sources; `--spray-sources`) · port scan / host sweep from an internal host · internal host reaching risky services on the internet · spike in errors/warnings (5-minute window ≥ 20 and ≥ 5× the median; `--spike-min`, `--spike-factor`, `--spike-window`) · interface flapping · err-disabled port · layer-2 loop / MAC flap · routing neighbor down · threat signatures · VPN tunnel / server / AP down · hardware faults · critical syslog messages · DoS/flood, ARP spoofing, IP conflict, rogue AP/DHCP, wireless attack, DHCP pool exhausted, broadcast storm, conntrack/session table full, memory exhaustion, crash/panic, disk full, AAA/RADIUS unreachable |
 | Medium | Port scan / host sweep from the internet · possible spam bot (SMTP to 10+ mail servers) · device with a high error rate (≥ 30%) · high overall error rate (≥ 25%) · device stopped logging · spanning-tree instability · interface errors · port-security violations · failover · reboots · wireless failure loops · AP / location failure hotspots · VPN/IPsec, high CPU, certificate/TLS, spoofed/martian packets |
 | Low | Legacy SSID · identity inconsistency · rapid roaming · low signal · PoE faults · device clock / timestamp mismatch · NTP problems |
 

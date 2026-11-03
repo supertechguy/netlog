@@ -842,6 +842,21 @@ def make_line_filter(spec):
     return test
 
 
+def make_grep(specs):
+    """Load-time filter from one or more --grep specs (same syntax as the TUI
+    filter); a line must match every spec. None when there are no specs."""
+    preds = [make_line_filter(s) for s in specs or ()]
+    if not preds:
+        return None
+    if len(preds) == 1:
+        return preds[0]
+    return lambda line: all(p(line) for p in preds)
+
+
+def grep_label(specs):
+    return ' & '.join(specs or ())
+
+
 # ── Statistics ────────────────────────────────────────────────────────────────
 
 def collect_stats(view, vendors, progress_cb=None):
@@ -1109,10 +1124,11 @@ def _layout(prefix, chunks, width, wrap=False, hoff=0, max_rows=None):
 
 def _draw_status(win, height, width, term, is_regex, filt, offset, total,
                  dedup_on, show_ln, alert_pat, large_file=False, hidden_cols=0, msg='',
-                 shown=None, wrap=False, hoff=0):
+                 shown=None, wrap=False, hoff=0, grep=''):
     mode  = "REGEX" if is_regex else "TEXT"
     parts = [f"[Search: {term or 'None'} ({mode})]"]
     if msg:         parts.append(f"[{msg}]")
+    if grep:        parts.append(f"[Grep: {grep}]")
     if large_file:  parts.append("[LARGE FILE]")
     if hidden_cols: parts.append(f"[COLS HIDDEN: {hidden_cols}]")
     if filt:        parts.append(f"[Filter: {filt}]")
@@ -1351,7 +1367,7 @@ def _read_line(stdscr, prompt):
 # ── Interactive TUI ───────────────────────────────────────────────────────────
 
 def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, file_base=None,
-         prefs=None):
+         prefs=None, grep='', msg=''):
     _init_colors()
     curses.curs_set(0)
     stdscr.keypad(True)
@@ -1372,7 +1388,7 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
     is_regex    = False
     matches     = []
     cur         = None      # index of the current search match
-    msg         = ''        # one-shot status message
+    # msg: one-shot status message (the caller may pass the first one)
     filt        = None
     hidden_cols = (col_hidden or {}).get(file_base or '', 0)
     stats_cache = {}
@@ -1421,7 +1437,7 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
         shown = _render(stdscr, view, offset, cells, wrap, hoff)
         _draw_status(stdscr, height, width, term, is_regex, filt, offset, len(view),
                      dedup_on, show_ln, alert_pat, large_file, hidden_cols, msg,
-                     shown, wrap, hoff)
+                     shown, wrap, hoff, grep)
         stdscr.refresh()
         msg = ''
 
@@ -1599,12 +1615,14 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
 
 # ── Run modes ─────────────────────────────────────────────────────────────────
 
-def piped_mode(vendors, mac_map, ctr, prefs=None):
+def piped_mode(vendors, mac_map, ctr, prefs=None, keep=None):
     corr = LiveCorrelator(mac_map, ctr)
     emit = _Output(prefs if prefs is not None else {})
     try:
         for line in sys.stdin:
             line = line.rstrip('\n')
+            if keep and not keep(line):
+                continue
             emit(render_live(line, line, corr, vendors, mac_map, ctr))
     finally:
         save_color_map(COLOR_FILE, mac_map, ctr[0])
@@ -1660,7 +1678,8 @@ def _read_new_lines(log_file, state):
 
 
 def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
-              col_hidden=None, file_base=None, egrep_pat=None, prefs=None):
+              col_hidden=None, file_base=None, egrep_pat=None, prefs=None, keep=None,
+              grep=''):
     hidden_cols = (col_hidden or {}).get(file_base or '', 0)
     corr        = LiveCorrelator(mac_map, ctr)
     prefs       = prefs if prefs is not None else {}
@@ -1673,12 +1692,16 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
         except re.error as e:
             sys.exit(f"Invalid egrep pattern: {e}")
         print(_a(f'[filter: {egrep_pat}]', '0;36'), flush=True)
+    if keep:
+        print(_a(f'[grep: {grep}]', '0;36'), flush=True)
+
+    def wanted(line):
+        return (egrep_re is None or egrep_re.search(line)) and (keep is None or keep(line))
 
     if log_file.name.endswith('.gz'):
         with gzip.open(log_file, 'rt', errors='replace') as gz:
             all_lines = gz.read().splitlines()
-        if egrep_re:
-            all_lines = [l for l in all_lines if egrep_re.search(l)]
+        all_lines = [l for l in all_lines if wanted(l)]
         for line in all_lines[-tail_lines_count:]:
             out = _strip_cols(line, hidden_cols) if hidden_cols else line
             emit(render_live(line, out, corr, vendors, mac_map, ctr))
@@ -1686,8 +1709,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
         return   # can't follow a compressed file
 
     tail_lines = _tail_lines(log_file, tail_lines_count)
-    if egrep_re:
-        tail_lines = [l for l in tail_lines if egrep_re.search(l)]
+    tail_lines = [l for l in tail_lines if wanted(l)]
     for line in tail_lines:
         out = _strip_cols(line, hidden_cols) if hidden_cols else line
         emit(render_live(line, out, corr, vendors, mac_map, ctr))
@@ -1711,7 +1733,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                 if rotated:
                     sys.stdout.write('\r\033[0;33m[Log rotated — resuming from new file]\033[0m\r\n')
                 for line in new_lines:
-                    if egrep_re and not egrep_re.search(line):
+                    if not wanted(line):
                         continue
                     buf.append(line)
                     if len(buf) > 10000: buf.pop(0)
@@ -1774,7 +1796,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
             if rotated:
                 sys.stdout.write('\r\033[0;33m[Log rotated — resuming from new file]\033[0m\r\n')
             for line in new_lines:
-                if egrep_re and not egrep_re.search(line):
+                if not wanted(line):
                     continue
                 buf.append(line)
                 if len(buf) > 10000: buf.pop(0)
@@ -1810,8 +1832,34 @@ def _decompress_gz(src):
     return Path(tf.name)
 
 
+def _prefilter(actual, keep, label):
+    """Copy the lines matching `keep` from each (real, display) file into one
+    temp file (with a separator line per file when there are several).
+    Returns (temp_path, matched, total)."""
+    tf = tempfile.NamedTemporaryFile('w', delete=False, suffix='.log',
+                                     encoding='utf-8', errors='replace')
+    matched = total = 0
+    try:
+        for real, disp in actual:
+            print(f'Filtering {disp} for {label}…', file=sys.stderr, flush=True)
+            header = f'{"─"*4} {disp} {"─"*4}\n' if len(actual) > 1 else None
+            with open(real, encoding='utf-8', errors='replace', newline='') as fh:
+                for line in fh:
+                    total += 1
+                    line = line.rstrip('\r\n')
+                    if keep(line):
+                        if header:
+                            tf.write(header)
+                            header = None
+                        tf.write(line + '\n')
+                        matched += 1
+    finally:
+        tf.close()
+    return Path(tf.name), matched, total
+
+
 def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, file_base=None,
-                     prefs=None):
+                     prefs=None, keep=None, grep=''):
     # Decompress any .gz files to temp files first
     temps   = []   # temp paths to delete on exit
     actual  = []   # (real_path, display_path) pairs
@@ -1824,6 +1872,14 @@ def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=No
             actual.append((f, f))
 
     try:
+        msg = ''
+        if keep:
+            tmp, matched, total = _prefilter(actual, keep, grep)
+            temps.append(tmp)
+            if not matched:
+                sys.exit(f'No lines match {grep} ({total:,} lines searched)')
+            actual = [(tmp, tmp)]
+            msg = f'{matched:,} of {total:,} lines loaded'
         real_files = [r for r, _ in actual]
         total_size = sum(r.stat().st_size for r in real_files)
 
@@ -1831,7 +1887,7 @@ def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=No
             lf = LargeFile(real_files[0])
             try:
                 curses.wrapper(_tui, lf, vendors, mac_map, ctr, alert_pat, col_hidden, file_base,
-                               prefs)
+                               prefs, grep, msg)
             finally:
                 lf.close()
         else:
@@ -1841,7 +1897,7 @@ def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=No
                     all_lines.append(f'{"─"*4} {disp} {"─"*4}')
                 all_lines.extend(real.read_text(errors='replace').splitlines())
             curses.wrapper(_tui, all_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base,
-                           prefs)
+                           prefs, grep, msg)
     finally:
         for tmp in temps:
             try:
@@ -4025,7 +4081,9 @@ class Rules:
                  roam_threshold=3, roam_window=60,
                  hotspot_min_failures=3, hotspot_factor=2.0, top=10,
                  flap_threshold=3, flap_window=600, brute_threshold=5, brute_window=300,
-                 scan_ports=15, scan_hosts=15, scan_window=300):
+                 scan_ports=15, scan_hosts=15, scan_window=300,
+                 spray_accounts=5, spray_sources=5,
+                 spike_min=20, spike_factor=5.0, spike_window=300):
         self.loop_threshold       = loop_threshold
         self.loop_window          = loop_window
         self.legacy_ssid          = legacy_ssid
@@ -4043,6 +4101,11 @@ class Rules:
         self.scan_ports           = scan_ports         # distinct denied ports from one source...
         self.scan_hosts           = scan_hosts         # ...or distinct denied hosts...
         self.scan_window          = scan_window        # ...within one window
+        self.spray_accounts       = spray_accounts     # distinct accounts failed from one source
+        self.spray_sources        = spray_sources      # distinct sources failing one account
+        self.spike_min            = spike_min          # errors+warnings in one bucket...
+        self.spike_factor         = spike_factor       # ...and this many times the median
+        self.spike_window         = spike_window       # bucket size in seconds
 
 
 RULES = Rules()
@@ -4481,8 +4544,8 @@ class Analyzer:
         self.devices      = {}
         self.fw           = FirewallStats(self.rules)
         self.text_issues  = {}             # (id, host) → [count, first_ts, last_ts, sample]
-        self.err_buckets  = Counter()      # 5-minute bucket → error + warning events
-        self.ev_buckets   = Counter()      # 5-minute bucket → all events
+        self.err_buckets  = Counter()      # spike_window bucket → error + warning events
+        self.ev_buckets   = Counter()      # spike_window bucket → all events
         self.critical     = {}             # (host, name) → [count, syslog sev, last_ts, sample]
 
     def _text_issue(self, line, host, ts, issue=None):
@@ -4554,7 +4617,7 @@ class Analyzer:
                 dev.first = ts
             if dev.last is None or ts > dev.last:
                 dev.last = ts
-            b = int(ts // 300)
+            b = int(ts // self.rules.spike_window)
             self.ev_buckets[b] += 1
             if sev in ('error', 'warning'):
                 self.err_buckets[b] += 1
@@ -5329,14 +5392,13 @@ def collect_alerts(rep, vendors=None):
             by_src.setdefault(src, Counter())[user] += 1
         if user and src:
             by_user.setdefault(user, set()).add(src)
-    spray_min = max(5, rules.brute_threshold)
     for src, users in by_src.items():
-        if len(users) >= spray_min:
+        if len(users) >= rules.spray_accounts:
             eg = ', '.join(u for u, _ in users.most_common(4))
             add(1, 'Password spraying', src,
                 f'login failures against {len(users)} different accounts (e.g. {eg})', len(users))
     for user, srcs in by_user.items():
-        if len(srcs) >= 5:
+        if len(srcs) >= rules.spray_sources:
             add(1, 'Distributed login attack', f'account {user}',
                 f'login failures from {len(srcs)} different source addresses', len(srcs))
 
@@ -5358,12 +5420,13 @@ def collect_alerts(rep, vendors=None):
 
     # Error volume: spikes over time, noisy devices, silent devices.
     if len(rep.ev_buckets) >= 6:
-        # Baseline: the median over 5-minute buckets that have any events (so
+        # Baseline: the median over spike_window buckets that have any events (so
         # gaps, or logs from devices with different clocks, don't drag it to 0).
         buckets = sorted(rep.ev_buckets)
         counts  = sorted(rep.err_buckets.get(b, 0) for b in buckets)
         base    = counts[len(counts) // 2]
-        limit   = max(20, 5 * base)
+        limit   = max(rules.spike_min, rules.spike_factor * base)
+        win     = rules.spike_window
         run, spikes = [], []
         for b in buckets + [None]:
             n = rep.err_buckets.get(b, 0) if b is not None else 0
@@ -5376,10 +5439,10 @@ def collect_alerts(rep, vendors=None):
         spikes = [r for r in spikes if len(r) <= max(1, len(buckets) // 4)]
         for run in sorted(spikes, key=lambda r: -sum(n for _, n in r))[:5]:
             total = sum(n for _, n in run)
-            start, end = run[0][0] * 300, (run[-1][0] + 1) * 300
+            start, end = run[0][0] * win, (run[-1][0] + 1) * win
             add(1, 'Spike in errors / warnings', f'{_fmt_ts(start)} → {_fmt_ts(end)}',
                 f'{total:,} errors and warnings in {_fmt_dur(end - start)} '
-                f'(usual {base} per 5m)', total)
+                f'(usual {base} per {_fmt_dur(win).replace("m00s", "m")})', total)
     sv = rep.severity
     total_ev = sum(sv.values())
     if total_ev >= 100 and sv['error'] / total_ev >= 0.25:
@@ -5892,18 +5955,21 @@ def iter_log_lines(files):
                 yield line.rstrip('\r\n')
 
 
-def analysis_mode(files, vendors, summary=False, client=None):
+def analysis_mode(files, vendors, summary=False, client=None, keep=None, grep=''):
     color = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
     ctx   = {norm_mac(client)} if client and norm_mac(client) else None
     an    = Analyzer(context_macs=ctx)
     try:
         for line in iter_log_lines(files):
-            an.feed(line)
+            if keep is None or keep(line):
+                an.feed(line)
     except OSError as e:
         sys.exit(f'Error reading log: {e}')
     rep = Report(an)
     if summary:
         sources = ', '.join(str(f) for f in files) if files else 'stdin'
+        if keep:
+            sources += f'  (grep: {grep})'
         print(format_summary(rep, vendors, color, sources))
     if client:
         if summary:
@@ -5928,6 +5994,7 @@ def build_arg_parser():
             '  netlog -f "deny|drop" /var/log/fw.log    Follow, egrep-filtered\n'
             '  netlog -f --alert DENY /var/log/fw.log   Follow with alert bell\n'
             '  cat file.log | netlog                    Piped/ANSI mode\n'
+            '  netlog -g 10.146. schools.log            Load only lines containing 10.146.\n'
             '  netlog --summary /var/log/wlc.log        Health summary report\n'
             '  netlog --client alice /var/log/wlc.log   Timeline for one user or MAC\n'
             '  netlog --setup-geoip                     Configure MaxMind GeoIP'
@@ -5985,6 +6052,24 @@ def build_arg_parser():
                          'as a host scan (default: 15)')
     a.add_argument('--scan-window', type=_duration_arg, default=300, metavar='TIME',
                     help='Window for port/host scans (default: 5m)')
+    a.add_argument('--spray-accounts', type=int, default=5, metavar='N',
+                    help='Distinct accounts failing from one source that count as password '
+                         'spraying (default: 5)')
+    a.add_argument('--spray-sources', type=int, default=5, metavar='N',
+                    help='Distinct sources failing against one account that count as a '
+                         'distributed login attack (default: 5)')
+    a.add_argument('--spike-min', type=int, default=20, metavar='N',
+                    help='Errors + warnings in one window needed to call it a spike '
+                         '(default: 20)')
+    a.add_argument('--spike-factor', type=float, default=5.0, metavar='X',
+                    help='A spike must also be at least X times the median window '
+                         '(default: 5)')
+    a.add_argument('--spike-window', type=_duration_arg, default=300, metavar='TIME',
+                    help='Window size for error spikes (default: 5m)')
+    a.add_argument('-g', '--grep', action='append', metavar='PATTERN',
+                    help='Load only lines matching PATTERN (works in every mode). Same syntax '
+                         'as the f filter: case-insensitive text, a|b for either, !text to '
+                         'exclude, r:REGEX for a regex. Repeat to require every pattern.')
     a.add_argument('--top', type=int, default=10, metavar='N',
                     help='Rows per section in --summary (default: 10)')
     a.add_argument('--formats', action='store_true',
@@ -6013,11 +6098,18 @@ def parse_cli(argv=None):
     if ns.follow and (ns.summary or ns.client):
         p.error('-f cannot be combined with --summary or --client')
     for opt in ('loop_threshold', 'flap_threshold', 'brute_threshold', 'scan_ports',
-                'scan_hosts'):
+                'scan_hosts', 'spray_accounts', 'spray_sources', 'spike_min'):
         if getattr(ns, opt) < 1:
             p.error(f"--{opt.replace('_', '-')} must be at least 1")
+    if not ns.spike_factor >= 1:
+        p.error('--spike-factor must be at least 1')
     if ns.top < 1:
         p.error('--top must be at least 1')
+    try:
+        ns.keep = make_grep(ns.grep)
+    except (ValueError, re.error) as e:
+        p.error(f'invalid --grep pattern: {e}')
+    ns.grep_label = grep_label(ns.grep)
     try:
         re.compile(ns.legacy_ssid)
     except re.error as e:
@@ -6052,7 +6144,10 @@ def main():
                   flap_threshold=opts.flap_threshold, flap_window=opts.flap_window,
                   brute_threshold=opts.brute_threshold, brute_window=opts.brute_window,
                   scan_ports=opts.scan_ports, scan_hosts=opts.scan_hosts,
-                  scan_window=opts.scan_window)
+                  scan_window=opts.scan_window,
+                  spray_accounts=opts.spray_accounts, spray_sources=opts.spray_sources,
+                  spike_min=opts.spike_min, spike_factor=opts.spike_factor,
+                  spike_window=opts.spike_window)
 
     if opts.formats:
         print(format_list(sys.stdout.isatty() and 'NO_COLOR' not in os.environ))
@@ -6069,7 +6164,8 @@ def main():
         if not log_files and sys.stdin.isatty():
             sys.exit('Usage: netlog --summary|--client MAC|USER <file> [file2 ...]  '
                      '(or pipe the log in)')
-        analysis_mode(log_files, load_oui(OUI_FILE), opts.summary, opts.client)
+        analysis_mode(log_files, load_oui(OUI_FILE), opts.summary, opts.client,
+                      opts.keep, opts.grep_label)
         return
 
     vendors = load_oui(OUI_FILE)
@@ -6098,7 +6194,7 @@ def _run_view_mode(opts, prefs, vendors, mac_map, ctr, col_hidden):
     follow, tail_lines, log_files = opts.follow, opts.tail_lines, opts.log_files
     alert_pat, egrep_pat = opts.alert_pat, opts.egrep_pat
     if not sys.stdin.isatty():
-        piped_mode(vendors, mac_map, ctr, prefs)
+        piped_mode(vendors, mac_map, ctr, prefs, opts.keep)
     elif follow:
         if not log_files:
             sys.exit('Usage: netlog -f [-n N] [--alert PATTERN] ["egrep_pattern"] <file>')
@@ -6107,14 +6203,14 @@ def _run_view_mode(opts, prefs, vendors, mac_map, ctr, col_hidden):
             sys.exit(f"File not found: {lf}")
         file_base = _file_base(lf)
         tail_mode(lf, tail_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base, egrep_pat,
-                  prefs)
+                  prefs, opts.keep, opts.grep_label)
     elif log_files:
         missing = [f for f in log_files if not f.exists()]
         if missing:
             sys.exit(f"File not found: {missing[0]}")
         file_base = _file_base(log_files[0])
         interactive_mode(log_files, vendors, mac_map, ctr, alert_pat, col_hidden, file_base,
-                         prefs)
+                         prefs, opts.keep, opts.grep_label)
     else:
         print('Usage: netlog [-f] [-n N] [--alert PATTERN] ["egrep_pattern"] <file> [file2 ...]',
               file=sys.stderr)

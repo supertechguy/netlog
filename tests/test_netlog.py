@@ -9,6 +9,7 @@ import sys
 import importlib.machinery
 import importlib.util
 import unittest
+import unittest.mock
 from pathlib import Path
 
 # netlog has no .py extension, so load it explicitly by path.
@@ -626,6 +627,11 @@ class AlertsTest(unittest.TestCase):
         got = self._titles(lines)
         self.assertIn(('Password spraying', '198.51.100.50'), got)
         self.assertIn(('Distributed login attack', 'account root'), got)
+        got = self._titles(lines, spray_accounts=7, spray_sources=6)
+        self.assertNotIn(('Password spraying', '198.51.100.50'), got)
+        self.assertNotIn(('Distributed login attack', 'account root'), got)
+        got = self._titles(lines, spray_accounts=3, brute_threshold=20)
+        self.assertIn(('Password spraying', '198.51.100.50'), got)
 
     def test_sshd_success_after_brute_force_is_critical(self):
         lines = [f'{_hms(9 * 3600 + i)} srv1 sshd[1]: Failed password for root from '
@@ -689,6 +695,22 @@ class AlertsTest(unittest.TestCase):
         spikes = [a for a in self._alerts(lines) if a.title == 'Spike in errors / warnings']
         self.assertEqual(len(spikes), 1)
         self.assertIn('09:00:00', spikes[0].subject)
+        self.assertIn('per 5m)', spikes[0].detail)
+        self.assertFalse([a for a in self._alerts(lines, spike_min=61)
+                          if a.title == 'Spike in errors / warnings'])
+        spikes = [a for a in self._alerts(lines, spike_window=60, spike_min=10)
+                  if a.title == 'Spike in errors / warnings']
+        self.assertEqual(len(spikes), 1)
+        self.assertIn('per 1m)', spikes[0].detail)
+        # With a non-zero baseline, the factor decides.
+        noisy = lines + [f'{_hms(8 * 3600 + i * 60 + 1)} sw1 %LINK-3-UPDOWN: Interface Gi1/0/48,'
+                         f' changed state to down' for i in range(120) if i % 5 == 0]
+        noisy.sort(key=lambda l: l[:15])
+        for factor, want in ((5, 1), (100, 0)):
+            with self.subTest(factor=factor):
+                got = [a for a in self._alerts(noisy, spike_factor=factor)
+                       if a.title == 'Spike in errors / warnings']
+                self.assertEqual(len(got), want)
 
     def test_device_stopped_logging_and_clock_mismatch(self):
         lines = []
@@ -763,6 +785,59 @@ class LineFilterTest(unittest.TestCase):
             netlog.make_line_filter('r:(')
         with self.assertRaises(ValueError):
             netlog.make_line_filter('|')
+
+
+class LoadGrepTest(unittest.TestCase):
+    def test_make_grep_requires_every_pattern(self):
+        self.assertIsNone(netlog.make_grep(None))
+        keep = netlog.make_grep(['10.146.', '!dhcp'])
+        self.assertTrue(keep('sw1: link up 10.146.2.7'))
+        self.assertFalse(keep('dhcpd: DHCPACK 10.146.2.7'))
+        self.assertFalse(keep('sw1: link up 10.147.2.7'))
+        self.assertEqual(netlog.grep_label(['10.146.', '!dhcp']), '10.146. & !dhcp')
+
+    def test_dot_is_literal_unlike_grep(self):
+        keep = netlog.make_grep(['10.146.'])
+        self.assertFalse(keep('host 10x146y5'))
+
+    def test_cli(self):
+        ns = netlog.parse_cli(['-g', '10.146.', '--grep', 'r:deny|drop', 'x.log'])
+        self.assertEqual(ns.grep, ['10.146.', 'r:deny|drop'])
+        self.assertTrue(ns.keep('10.146.1.1 deny'))
+        self.assertFalse(ns.keep('10.146.1.1 accept'))
+        self.assertIsNone(netlog.parse_cli(['x.log']).keep)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            netlog.parse_cli(['-g', 'r:(', 'x.log'])
+
+    def test_prefilter_multiple_files(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            a, b, c = (Path(d, n) for n in ('a.log', 'b.log', 'c.log'))
+            a.write_text('x 10.146.1.1\ny 10.1.1.1\r\n')
+            b.write_text('nothing here\n')
+            c.write_text('z 10.146.9.9')
+            with contextlib.redirect_stderr(io.StringIO()):
+                tmp, matched, total = netlog._prefilter(
+                    [(a, a), (b, b), (c, c)], netlog.make_grep(['10.146.']), '10.146.')
+            try:
+                self.assertEqual((matched, total), (2, 4))
+                self.assertEqual(tmp.read_text().splitlines(),
+                                 [f'──── {a} ────', 'x 10.146.1.1',
+                                  f'──── {c} ────', 'z 10.146.9.9'])
+            finally:
+                tmp.unlink()
+
+    def test_summary_only_counts_matching_lines(self):
+        lines = [f'{_hms(9 * 3600 + i)} srv1 sshd[1]: Failed password for root from '
+                 f'198.51.100.{i % 2} port 5000 ssh2' for i in range(10)]
+        keep = netlog.make_grep(['198.51.100.1 '])
+        with contextlib.redirect_stdout(io.StringIO()) as out, \
+                unittest.mock.patch.object(netlog, 'iter_log_lines', lambda files: iter(lines)):
+            netlog.analysis_mode([Path('x.log')], {}, summary=True, keep=keep,
+                                 grep='198.51.100.1 ')
+        text = out.getvalue()
+        self.assertIn('(grep: 198.51.100.1 )', text)
+        self.assertIn('Lines read: 5 ', text)
 
 
 class WrapLayoutTest(unittest.TestCase):
@@ -852,15 +927,20 @@ class AnalysisCliTest(unittest.TestCase):
         ns = netlog.parse_cli(['--flap-threshold', '2', '--flap-window', '1h',
                                '--brute-threshold', '10', '--brute-window', '90s',
                                '--scan-ports', '50', '--scan-hosts', '8', '--scan-window', '2m',
-                               'x.log'])
+                               '--spray-accounts', '9', '--spray-sources', '4',
+                               '--spike-min', '50', '--spike-factor', '2.5',
+                               '--spike-window', '10m', 'x.log'])
         self.assertEqual((ns.flap_threshold, ns.flap_window), (2, 3600))
         self.assertEqual((ns.brute_threshold, ns.brute_window), (10, 90))
         self.assertEqual((ns.scan_ports, ns.scan_hosts, ns.scan_window), (50, 8, 120))
+        self.assertEqual((ns.spray_accounts, ns.spray_sources), (9, 4))
+        self.assertEqual((ns.spike_min, ns.spike_factor, ns.spike_window), (50, 2.5, 600))
 
     def test_threshold_defaults_match_rules(self):
         ns, r = netlog.parse_cli(['x.log']), netlog.Rules()
         for opt in ('flap_threshold', 'flap_window', 'brute_threshold', 'brute_window',
-                    'scan_ports', 'scan_hosts', 'scan_window'):
+                    'scan_ports', 'scan_hosts', 'scan_window', 'spray_accounts',
+                    'spray_sources', 'spike_min', 'spike_factor', 'spike_window'):
             with self.subTest(opt=opt):
                 self.assertEqual(getattr(ns, opt), getattr(r, opt))
 
@@ -878,6 +958,8 @@ class AnalysisCliTest(unittest.TestCase):
         for argv in (['-f', '--summary', 'x.log'], ['--legacy-ssid', '(', 'x.log'],
                      ['--loop-window', 'soon', 'x.log'], ['--loop-threshold', '0', 'x.log'],
                      ['--flap-threshold', '0', 'x.log'], ['--brute-window', '0', 'x.log'],
+                     ['--spray-accounts', '0', 'x.log'], ['--spike-factor', '0.5', 'x.log'],
+                     ['--spike-factor', 'nan', 'x.log'], ['--spike-window', '0', 'x.log'],
                      ['--scan-ports', '0', 'x.log'], ['--scan-hosts', '-1', 'x.log']):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), \
                     self.assertRaises(SystemExit):
