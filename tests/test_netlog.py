@@ -65,6 +65,50 @@ class FindMatchesTest(unittest.TestCase):
         self.assertEqual(netlog.find_matches(self.view, '(', regex=True), [])
 
 
+class NextMatchTest(unittest.TestCase):
+    view = [('a', 1), ('hit', 1), ('b', 1), ('HIT', 1), ('c', 1)]
+
+    def test_forward_backward_and_wrap(self):
+        for matches in (None, [1, 3]):           # scanning (large file) and precomputed
+            with self.subTest(precomputed=matches is not None):
+                nm = lambda start, step: netlog.next_match(self.view, 'hit', False, start,
+                                                           step, matches)
+                self.assertEqual(nm(0, 1), (1, False))
+                self.assertEqual(nm(2, 1), (3, False))
+                self.assertEqual(nm(4, 1), (1, True))
+                self.assertEqual(nm(2, -1), (1, False))
+                self.assertEqual(nm(0, -1), (3, True))
+
+    def test_no_match(self):
+        self.assertEqual(netlog.next_match(self.view, 'zzz', False, 0), (None, False))
+        self.assertEqual(netlog.next_match(self.view, 'zzz', False, 0, 1, []), (None, False))
+        self.assertEqual(netlog.next_match(self.view, '(', True, 0), (None, False))
+
+
+class SearchHighlightTest(unittest.TestCase):
+    LINE = 'kernel: DROP IN=eth0 SRC=10.0.0.5 DST=1.1.1.1 error port 22 from'
+
+    def _hits(self, term, regex=False):
+        segs = netlog._collect_segments(self.LINE, {}, {}, [0], term, regex)
+        return [self.LINE[s:e] for s, e, _d, _a, pair, _b, _g in segs if pair == netlog._P_SRCH]
+
+    def test_hits_inside_colored_tokens_are_highlighted(self):
+        # IPs, interfaces, severities and ports are colored tokens; a search
+        # for them used to be silently dropped.
+        self.assertEqual(self._hits('10.0.0.5'), ['10.0.0.5'])
+        self.assertEqual(self._hits('0.0.5'), ['10.0.0.5'])
+        self.assertEqual(self._hits('ETH0'), ['eth0'])
+        self.assertEqual(self._hits('error'), ['error'])
+
+    def test_hit_spanning_token_and_plain_text(self):
+        self.assertEqual(self._hits('22 from'), ['port 22', ' from'])
+
+    def test_plain_hit_and_no_hit(self):
+        self.assertEqual(self._hits('drop'), ['DROP'])
+        self.assertEqual(self._hits('zzz'), [])
+        self.assertEqual(self._hits(r'\d+\.\d+\.1\.1', regex=True), ['1.1.1.1'])
+
+
 class EventTypeTest(unittest.TestCase):
     def test_deny_outranks_error(self):
         result = netlog._event_type('connection denied due to failed auth')
@@ -503,6 +547,15 @@ class NetworkFindingsTest(unittest.TestCase):
         self.assertIn(('flap', 'sw1 GigabitEthernet1/0/24'), found)
         self.assertIn('4 link downs', found[('flap', 'sw1 GigabitEthernet1/0/24')])
 
+    def test_thresholds_are_configurable(self):
+        flaps = [_cisco_link(0, 'down'), _cisco_link(5, 'up'),
+                 _cisco_link(10, 'down'), _cisco_link(15, 'up')]
+        self.assertIn('flap', {f[0] for f in _report(flaps, flap_threshold=2).findings})
+        logins = [_login(i * 5) for i in range(6)]
+        self.assertNotIn('brute', {f[0] for f in _report(logins, brute_threshold=7).findings})
+        denies = [_fgt_deny(p) for p in range(20, 45)]
+        self.assertNotIn('scan', {f[0] for f in _report(denies, scan_ports=30).findings})
+
     def test_two_flaps_are_not_flapping(self):
         lines = [_cisco_link(0, 'down'), _cisco_link(5, 'up'),
                  _cisco_link(10, 'down'), _cisco_link(15, 'up')]
@@ -571,12 +624,30 @@ class AnalysisCliTest(unittest.TestCase):
         self.assertEqual(ns.loop_threshold, 4)
         self.assertEqual(ns.log_files, [Path('x.log')])
 
+    def test_threshold_options(self):
+        ns = netlog.parse_cli(['--flap-threshold', '2', '--flap-window', '1h',
+                               '--brute-threshold', '10', '--brute-window', '90s',
+                               '--scan-ports', '50', '--scan-hosts', '8', '--scan-window', '2m',
+                               'x.log'])
+        self.assertEqual((ns.flap_threshold, ns.flap_window), (2, 3600))
+        self.assertEqual((ns.brute_threshold, ns.brute_window), (10, 90))
+        self.assertEqual((ns.scan_ports, ns.scan_hosts, ns.scan_window), (50, 8, 120))
+
+    def test_threshold_defaults_match_rules(self):
+        ns, r = netlog.parse_cli(['x.log']), netlog.Rules()
+        for opt in ('flap_threshold', 'flap_window', 'brute_threshold', 'brute_window',
+                    'scan_ports', 'scan_hosts', 'scan_window'):
+            with self.subTest(opt=opt):
+                self.assertEqual(getattr(ns, opt), getattr(r, opt))
+
     def test_formats_flag(self):
         self.assertTrue(netlog.parse_cli(['--formats']).formats)
 
     def test_bad_values_rejected(self):
         for argv in (['-f', '--summary', 'x.log'], ['--legacy-ssid', '(', 'x.log'],
-                     ['--loop-window', 'soon', 'x.log'], ['--loop-threshold', '0', 'x.log']):
+                     ['--loop-window', 'soon', 'x.log'], ['--loop-threshold', '0', 'x.log'],
+                     ['--flap-threshold', '0', 'x.log'], ['--brute-window', '0', 'x.log'],
+                     ['--scan-ports', '0', 'x.log'], ['--scan-hosts', '-1', 'x.log']):
             with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()), \
                     self.assertRaises(SystemExit):
                 netlog.parse_cli(argv)

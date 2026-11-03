@@ -122,9 +122,10 @@ netlog /var/log/firewall.log.10.gz
 | `↑` `↓` `W` `S` | Scroll one line |
 | `PgUp` `PgDn` `Space` | Scroll one page |
 | `g` `G` | Jump to top / bottom |
-| `/` | Search (plain text) |
+| `/` | Search (plain text, case-insensitive) from the current screen position |
 | `r` | Search (regex) |
-| `n` `p` | Next / previous match |
+| `n` `p` | Next / previous match, wrapping round the ends (also in large-file mode) |
+| `Esc` | Cancel a search or filter prompt |
 | `f` | Filter lines (plain or `r:regex`) |
 | `d` | Toggle consecutive-duplicate dedup |
 | `#` | Toggle line numbers |
@@ -133,6 +134,8 @@ netlog /var/log/firewall.log.10.gz
 | `e` | Export current view to file |
 | `c` | Clear all filters and search |
 | `q` | Quit |
+
+Matches are highlighted in yellow (even inside IPs, MACs and other colored tokens), the current match in cyan, and the status bar shows `match 3/17` or `No matches`.
 
 ---
 
@@ -342,9 +345,9 @@ For the generic parser, a line counts as a structured event when it has at least
 | **Identity inconsistency**: one MAC seen as `bob` and `bob@corp.org` (or with different users) | — | — |
 | **Rapid roaming**: 3+ roams within 60 s | — | — |
 | **AP / location hotspot**: 3+ failures and a failure rate (failures ÷ failures + joins) at least 2× the overall rate (min 20%, capped at 90%) | — | — |
-| **Interface flapping**: link downs on one device + interface | 3 in 10 min | — |
-| **Login attack**: login failures from one source IP (or user, if no IP); also flags a successful login from that source after failures | 5 in 5 min | — |
-| **Port / host scan**: distinct destination ports, or distinct hosts, denied for one source | 15 in 5 min | — |
+| **Interface flapping**: link downs on one device + interface | 3 in 10 min | `--flap-threshold N`, `--flap-window 10m` |
+| **Login attack**: login failures from one source IP (or user, if no IP); also flags a successful login from that source after failures | 5 in 5 min | `--brute-threshold N`, `--brute-window 5m` |
+| **Port / host scan**: distinct destination ports, or distinct hosts, denied for one source | 15 ports or 15 hosts in 5 min | `--scan-ports N`, `--scan-hosts N`, `--scan-window 5m` |
 | **Err-disable, loop / MAC flap, routing neighbor down, VPN down, service down**: reported per device/interface/peer, noting whether it recovered | — | — |
 
 Events without an `apLocation` field are attributed to the location their AP reports elsewhere in the log. For logs with no timestamps, a failure loop means N failures in a row with no success between them.

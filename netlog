@@ -19,6 +19,7 @@ import gzip
 import os
 import tempfile
 import argparse
+import bisect
 import collections
 import csv
 import datetime
@@ -178,6 +179,7 @@ _P_EV_ALLOW = 27
 _P_EV_START = 28
 _P_EV_END   = 29
 _P_GEO      = 30
+_P_SRCH_CUR = 31   # search hits on the current match line
 
 _MAC_CURSES = [
     curses.COLOR_RED, curses.COLOR_YELLOW, curses.COLOR_MAGENTA,
@@ -442,7 +444,10 @@ def _a(text, code):
 def _collect_segments(line, vendors, mac_map, ctr, search_term=None, search_is_regex=False):
     """
     Returns sorted list of (src_start, src_end, display_text, ansi_code, pair_num, bold).
-    No two segments overlap; priority order: MAC > IP4 > IP6 > SEV > PORT > IFACE > SEARCH.
+    No two segments overlap; priority order: MAC > IP4 > IP6 > SEV > PORT > IFACE.
+    Search hits are drawn over all of these: a token that overlaps a hit is
+    recolored as a hit (keeping its vendor/service/geo annotation), and the
+    rest of the hit gets its own segments.
     pair_num / bold are used by the curses renderer; curses.color_pair() is NOT called here
     so this function is safe to use before curses.initscr().
     """
@@ -502,17 +507,39 @@ def _collect_segments(line, vendors, mac_map, ctr, search_term=None, search_is_r
     for m in IFACE_RE.finditer(line):
         add(m.start(), m.end(), m.group(), ANSI_IFACE, _P_IFACE, False)
 
-    # Search (lowest priority)
     if search_term:
-        try:
-            pat = search_term if search_is_regex else re.escape(search_term)
-            for m in re.finditer(pat, line, re.I):
-                add(m.start(), m.end(), m.group(), ANSI_SEARCH, _P_SRCH, True)
-        except re.error:
-            pass
+        spans = search_spans(line, search_term, search_is_regex)
+        if spans:
+            for i, (s, e, disp, _ansi, _pair, _bold, geo) in enumerate(segs):
+                if any(hs < e and s < he for hs, he in spans):
+                    segs[i] = (s, e, disp, ANSI_SEARCH, _P_SRCH, True, geo)
+            for hs, he in spans:
+                pos = hs
+                for cs, ce in sorted(covered):
+                    if ce <= pos or cs >= he:
+                        continue
+                    if cs > pos:
+                        add(pos, cs, line[pos:cs], ANSI_SEARCH, _P_SRCH, True)
+                    pos = max(pos, ce)
+                if pos < he:
+                    add(pos, he, line[pos:he], ANSI_SEARCH, _P_SRCH, True)
 
     segs.sort(key=lambda s: s[0])
     return segs
+
+
+def search_spans(line, term, regex=False):
+    """(start, end) of every non-empty, case-insensitive match of term in line."""
+    try:
+        pat = _search_re(term, regex)
+    except re.error:
+        return []
+    return [(m.start(), m.end()) for m in pat.finditer(line) if m.end() > m.start()]
+
+
+@functools.lru_cache(maxsize=32)
+def _search_re(term, regex):
+    return re.compile(term if regex else re.escape(term), re.I)
 
 # ── ANSI rendering (piped / tail) ─────────────────────────────────────────────
 
@@ -542,6 +569,34 @@ def find_matches(view, term, regex=False):
         except re.error:
             pass
     return out
+
+
+def next_match(view, term, regex, start, step=1, matches=None):
+    """Index of the first line from `start` (inclusive) in direction `step`
+    that contains `term`, wrapping round the end. Uses the precomputed
+    `matches` list when given, otherwise scans `view` (large files).
+    Returns (index, wrapped) or (None, False)."""
+    n = len(view)
+    if not n or not term:
+        return None, False
+    start %= n
+    if matches is not None:
+        if not matches:
+            return None, False
+        if step > 0:
+            i = bisect.bisect_left(matches, start)
+            return (matches[i], False) if i < len(matches) else (matches[0], True)
+        i = bisect.bisect_right(matches, start) - 1
+        return (matches[i], False) if i >= 0 else (matches[-1], True)
+    try:
+        pat = _search_re(term, regex)
+    except re.error:
+        return None, False
+    for k in range(n):
+        i = (start + k * step) % n
+        if pat.search(view[i][0]):
+            return i, (i < start) if step > 0 else (i > start)
+    return None, False
 
 # ── Dedup / view helpers ──────────────────────────────────────────────────────
 
@@ -716,11 +771,13 @@ def _init_colors():
     curses.init_pair(_P_EV_START, curses.COLOR_CYAN,    -1)
     curses.init_pair(_P_EV_END,   curses.COLOR_WHITE,   -1)
     curses.init_pair(_P_GEO,      curses.COLOR_GREEN,   -1)
+    curses.init_pair(_P_SRCH_CUR, curses.COLOR_BLACK,   curses.COLOR_CYAN)
 
 # ── Curses line drawing ───────────────────────────────────────────────────────
 
 def _draw_line(win, y, text, count, vendors, mac_map, ctr,
-               search_term, search_is_regex, width, show_ln, linenum, dedup_on, hidden_cols=0):
+               search_term, search_is_regex, width, show_ln, linenum, dedup_on, hidden_cols=0,
+               current=False):
     # Detect event type from original text BEFORE column stripping so the
     # glyph still reflects the event even when the keyword column is hidden.
     ev      = _event_type(text)
@@ -747,6 +804,8 @@ def _draw_line(win, y, text, count, vendors, mac_map, ctr,
     segs = _collect_segments(text, vendors, mac_map, ctr, search_term, search_is_regex)
     prev = 0
     for src_s, src_e, disp, _ansi, pair, bold, geo in segs:
+        if current and pair == _P_SRCH:
+            pair = _P_SRCH_CUR
         cattr = curses.color_pair(pair) | (curses.A_BOLD if bold else 0)
         chunk = text[prev:src_s]
         if chunk and x < width - 1:
@@ -792,9 +851,10 @@ def _draw_line(win, y, text, count, vendors, mac_map, ctr,
 # ── Curses status bar ─────────────────────────────────────────────────────────
 
 def _draw_status(win, height, width, term, is_regex, filt, offset, total,
-                 dedup_on, show_ln, alert_pat, large_file=False, hidden_cols=0):
+                 dedup_on, show_ln, alert_pat, large_file=False, hidden_cols=0, msg=''):
     mode  = "REGEX" if is_regex else "TEXT"
     parts = [f"[Search: {term or 'None'} ({mode})]"]
+    if msg:         parts.append(f"[{msg}]")
     if large_file:  parts.append("[LARGE FILE]")
     if hidden_cols: parts.append(f"[COLS HIDDEN: {hidden_cols}]")
     if filt:        parts.append(f"Filter: {filt}")
@@ -805,7 +865,7 @@ def _draw_status(win, height, width, term, is_regex, filt, offset, total,
     line1 = "  ".join(parts) + f"  {offset+1}-{end}/{total}"
     if large_file:
         line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  "
-                 "/=text  r=regex  h/u=hide-col  x=stats  c=clear  q=quit")
+                 "/=text  r=regex  n/p=match  h/u=hide-col  x=stats  c=clear  q=quit")
     else:
         line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  "
                  "/=text  r=regex  n/p=match  f=filter  "
@@ -820,7 +880,8 @@ def _draw_status(win, height, width, term, is_regex, filt, offset, total,
 
 # ── Curses full render ────────────────────────────────────────────────────────
 
-def _render(win, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, dedup_on, hidden_cols=0):
+def _render(win, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, dedup_on,
+            hidden_cols=0, cur=None):
     height, width = win.getmaxyx()
     win.erase()
     for i in range(height - 2):
@@ -829,7 +890,7 @@ def _render(win, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, d
             break
         text, count = view[idx]
         _draw_line(win, i, text, count, vendors, mac_map, ctr,
-                   term, is_regex, width, show_ln, idx, dedup_on, hidden_cols)
+                   term, is_regex, width, show_ln, idx, dedup_on, hidden_cols, idx == cur)
 
 # ── Stats popup ───────────────────────────────────────────────────────────────
 
@@ -911,6 +972,9 @@ def _read_line(stdscr, prompt):
         ch = stdscr.getch()
         if ch in (10, 13, curses.KEY_ENTER):
             break
+        if ch == 27:                       # Esc cancels
+            buf = []
+            break
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             if buf:
                 buf.pop(); cx -= 1
@@ -935,6 +999,8 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
     _init_colors()
     curses.curs_set(0)
     stdscr.keypad(True)
+    if hasattr(curses, 'set_escdelay'):
+        curses.set_escdelay(25)            # Esc cancels prompts without a 1 s lag
 
     large_file  = isinstance(lines, LargeFile)
     filtered    = lines if large_file else lines[:]
@@ -944,6 +1010,8 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
     term        = None
     is_regex    = False
     matches     = []
+    cur         = None      # index of the current search match
+    msg         = ''        # one-shot status message
     filt        = None
     hidden_cols = (col_hidden or {}).get(file_base or '', 0)
 
@@ -958,10 +1026,36 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
         height, width = stdscr.getmaxyx()
         page = max(1, height - 2)
 
-        _render(stdscr, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, dedup_on, hidden_cols)
+        _render(stdscr, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, dedup_on,
+                hidden_cols, cur)
         _draw_status(stdscr, height, width, term, is_regex, filt, offset, len(view),
-                     dedup_on, show_ln, alert_pat, large_file, hidden_cols)
+                     dedup_on, show_ln, alert_pat, large_file, hidden_cols, msg)
         stdscr.refresh()
+        msg = ''
+
+        def goto(start, step, new_search=False):
+            """Move to the next match from `start`; returns the status message."""
+            nonlocal cur, offset
+            if large_file:
+                h, w = stdscr.getmaxyx()
+                try:
+                    stdscr.addstr(h - 2, 0, "Searching…"[:w - 1], curses.color_pair(_P_STAT))
+                    stdscr.clrtoeol(); stdscr.refresh()
+                except curses.error:
+                    pass
+            idx, wrapped = next_match(view, term, is_regex, start, step,
+                                      None if large_file else matches)
+            if idx is None:
+                cur = None
+                return f"No matches for {term!r}"
+            cur    = idx
+            offset = max(0, idx - 2)
+            where  = (f"match {bisect.bisect_left(matches, idx) + 1}/{len(matches)}"
+                      if not large_file
+                      else f"match at line {idx + 1}")
+            if wrapped and not new_search:
+                where += ", wrapped to " + ("top" if step > 0 else "bottom")
+            return where
 
         ch = stdscr.getch()
 
@@ -980,38 +1074,33 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
         elif ch == ord('G'):
             offset = max(0, len(view) - page)
 
-        elif ch == ord('/'):
-            t = _read_line(stdscr, "Search (plain text): ")
-            if t:
-                term, is_regex = t, False
-                if not large_file:
-                    matches = find_matches(view, term, False)
-                    if matches: offset = matches[0]
-
-        elif ch == ord('r'):
-            t = _read_line(stdscr, "Search (regex): ")
+        elif ch in (ord('/'), ord('r')):
+            regex = ch == ord('r')
+            t = _read_line(stdscr, "Search (regex): " if regex else "Search (plain text): ")
             if t:
                 try:
-                    re.compile(t, re.I)
-                    term, is_regex = t, True
-                    if not large_file:
-                        matches = find_matches(view, term, True)
-                        if matches: offset = matches[0]
+                    if regex:
+                        re.compile(t, re.I)
                 except re.error as e:
-                    h, w = stdscr.getmaxyx()
-                    stdscr.addstr(h - 2, 0, f"Invalid regex: {e}  (press any key)"[:w-1],
-                                  curses.color_pair(_P_STAT))
-                    stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
+                    msg = f"Invalid regex: {e}"
+                else:
+                    term, is_regex = t, regex
+                    if not large_file:
+                        matches = find_matches(view, term, is_regex)
+                    msg = goto(offset, 1, new_search=True)
 
-        elif ch == ord('n'):
-            if not large_file and term and matches:
-                for ln in matches:
-                    if ln > offset: offset = ln; break
-
-        elif ch == ord('p'):
-            if not large_file and term and matches:
-                for ln in reversed(matches):
-                    if ln < offset: offset = ln; break
+        elif ch in (ord('n'), ord('p')):
+            step = 1 if ch == ord('n') else -1
+            if not term:
+                msg = "No search yet: press / or r"
+            else:
+                # Continue from the current match if it's still on screen,
+                # otherwise from the screen position (like less).
+                if cur is not None and offset <= cur < offset + page:
+                    start = cur + step
+                else:
+                    start = offset if step > 0 else offset - 1
+                msg = goto(start, step)
 
         elif ch == ord('f'):
             if large_file:
@@ -1035,6 +1124,7 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
                         filtered = [l for l in lines if tl in l.lower()]
                     view    = get_view()
                     offset  = 0
+                    cur     = None
                     matches = find_matches(view, term, is_regex) if term else []
 
         elif ch == ord('d'):
@@ -1047,6 +1137,7 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
                 dedup_on = not dedup_on
                 view    = get_view()
                 offset  = max(0, min(offset, max(0, len(view) - 1)))
+                cur     = None
                 matches = find_matches(view, term, is_regex) if term else []
 
         elif ch == ord('#'):
@@ -1081,13 +1172,13 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
 
         elif ch == ord('c'):
             if large_file:
-                term = filt = None
+                term = filt = cur = None
                 is_regex = False
                 matches  = []
                 offset   = 0
             else:
                 filtered = lines[:]
-                filt = term = None
+                filt = term = cur = None
                 is_regex = dedup_on = False
                 matches = []; offset = 0
                 view = get_view()
@@ -4962,6 +5053,23 @@ def build_arg_parser():
                          '(default: names ending in -old/-legacy)')
     a.add_argument('--low-rssi', type=int, default=-75, metavar='DBM',
                     help='RSSI below this is flagged as low signal (default: -75)')
+    a.add_argument('--flap-threshold', type=int, default=3, metavar='N',
+                    help='Link downs on one interface needed to call it flapping (default: 3)')
+    a.add_argument('--flap-window', type=_duration_arg, default=600, metavar='TIME',
+                    help='Rolling window for interface flapping (default: 10m)')
+    a.add_argument('--brute-threshold', type=int, default=5, metavar='N',
+                    help='Login failures from one source needed to call it a login '
+                         'attack (default: 5)')
+    a.add_argument('--brute-window', type=_duration_arg, default=300, metavar='TIME',
+                    help='Rolling window for login attacks (default: 5m)')
+    a.add_argument('--scan-ports', type=int, default=15, metavar='N',
+                    help='Distinct denied destination ports from one source that count '
+                         'as a port scan (default: 15)')
+    a.add_argument('--scan-hosts', type=int, default=15, metavar='N',
+                    help='Distinct denied destination hosts from one source that count '
+                         'as a host scan (default: 15)')
+    a.add_argument('--scan-window', type=_duration_arg, default=300, metavar='TIME',
+                    help='Window for port/host scans (default: 5m)')
     a.add_argument('--top', type=int, default=10, metavar='N',
                     help='Rows per section in --summary (default: 10)')
     a.add_argument('--formats', action='store_true',
@@ -4989,8 +5097,10 @@ def parse_cli(argv=None):
     ns = p.parse_args(argv)
     if ns.follow and (ns.summary or ns.client):
         p.error('-f cannot be combined with --summary or --client')
-    if ns.loop_threshold < 1:
-        p.error('--loop-threshold must be at least 1')
+    for opt in ('loop_threshold', 'flap_threshold', 'brute_threshold', 'scan_ports',
+                'scan_hosts'):
+        if getattr(ns, opt) < 1:
+            p.error(f"--{opt.replace('_', '-')} must be at least 1")
     if ns.top < 1:
         p.error('--top must be at least 1')
     try:
@@ -5024,7 +5134,11 @@ def main():
     follow, tail_lines, log_files = opts.follow, opts.tail_lines, opts.log_files
     alert_pat, egrep_pat, setup_geoip = opts.alert_pat, opts.egrep_pat, opts.setup_geoip
     RULES = Rules(loop_threshold=opts.loop_threshold, loop_window=opts.loop_window,
-                  legacy_ssid=opts.legacy_ssid, low_rssi=opts.low_rssi, top=opts.top)
+                  legacy_ssid=opts.legacy_ssid, low_rssi=opts.low_rssi, top=opts.top,
+                  flap_threshold=opts.flap_threshold, flap_window=opts.flap_window,
+                  brute_threshold=opts.brute_threshold, brute_window=opts.brute_window,
+                  scan_ports=opts.scan_ports, scan_hosts=opts.scan_hosts,
+                  scan_window=opts.scan_window)
 
     if opts.formats:
         print(format_list(sys.stdout.isatty() and 'NO_COLOR' not in os.environ))
