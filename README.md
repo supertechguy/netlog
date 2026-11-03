@@ -4,11 +4,18 @@
 
 # netlog
 
-A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. It recognises the log formats of 28 vendor platforms (Cisco, Juniper, Aruba, Ruckus, Fortinet, Palo Alto, UniFi, Meraki, MikroTik, pfSense and more) across wireless, switching, routing and firewalls, plus any `key="value"` log. It correlates events per client, user, AP, interface and source IP to find failure loops, flapping links, login attacks, port scans and other problems. It produces a ranked security and error analytics report, health summaries and per-client timelines. You can filter logs down to the lines you care about as they load (`-g`). No external dependencies beyond the Python standard library.
+A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. It recognises 42 log formats: network gear from Cisco, Juniper, Aruba, Ruckus, Fortinet, Palo Alto, UniFi, Meraki, MikroTik, pfSense and more (wireless, switching, routing, firewalls), and Linux servers (Apache, nginx, Squid, BIND, dnsmasq, ISC dhcpd, Samba, Postfix, Dovecot, FTP, FreeRADIUS, fail2ban, systemd, auditd, sshd), plus any `key="value"` log. It correlates events per client, user, AP, interface and source IP to find failure loops, flapping links, login attacks, port scans and other problems. It produces a ranked security and error analytics report, health summaries and per-client timelines. You can filter logs down to the lines you care about as they load (`-g`). No external dependencies beyond the Python standard library.
 
 ---
 
 ## What's new
+
+**Unreleased**
+- Linux server and service logs: Apache and nginx access and error logs (with mod_security), Squid, BIND, dnsmasq, ISC dhcpd, Samba, Postfix, Dovecot, vsftpd / ProFTPD / Pure-FTPd, fail2ban, systemd and auditd. FreeRADIUS now also reports unknown clients, shared-secret mismatches and dead home servers.
+- New findings for them: web attacks (path traversal, SQL injection, XSS, command injection, Log4Shell, web shells, sensitive files, exploit probes, scanner tools) and whether they got a `2xx` answer, web vulnerability scans, web server errors, DNS tunneling, amplification and zone transfer attempts, DHCP conflicts and clients without a lease, open-relay probing, compromised mail accounts, Samba lockouts and mass file changes (possible ransomware), repeat fail2ban offenders, RADIUS problems and failed systemd services. Web, mail, FTP, Samba and audit logins feed the brute-force, spraying and success-after-failures rules.
+- `--summary` and the analytics popup have a **Servers & services** section (web, DNS, DHCP, mail, file shares, fail2ban, RADIUS), and the summary header now shows the time span for every kind of log.
+- `--client MAC` shows DHCP and other lines for a MAC that has no wireless events.
+- New options `--web-scan` and `--mass-change`; a 24th text detector for SELinux / AppArmor denials.
 
 **1.5.0**
 - `-g PATTERN` / `--grep PATTERN` loads only matching lines, in every mode. It replaces a `grep … > little.log` step (see [Load only the lines you need](#load-only-the-lines-you-need--g----grep)).
@@ -16,13 +23,13 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 
 **1.4.0**
 - The statistics popup (`x`) became a full **analytics** report: ranked findings (critical → low) for brute force, password spraying, distributed login attacks, success after brute force, port/host scans, risky services exposed to the internet, internal hosts using risky services, spam bots, error spikes, noisy or silent devices and clock mismatches.
-- 23 text detectors work on any log line: DHCP exhaustion, ARP spoofing, rogue APs, IP conflicts, storms, loops, crashes, memory/disk/table exhaustion, hardware, VPN, certificate, NTP and more (see [Findings](#findings)).
+- 23 text detectors (now 24) work on any log line: DHCP exhaustion, ARP spoofing, rogue APs, IP conflicts, storms, loops, crashes, memory/disk/table exhaustion, hardware, VPN, certificate, NTP and more (see [Findings](#findings)).
 - New Linux / BSD format: OpenSSH `sshd`, `sudo` and PAM login failures and successes.
 - The firewall statistics add top allowed ports, top talkers and protocols. Plain syslog gets top sending hosts and programs, and port counting no longer picks up MAC or timestamp fragments.
 - `--summary` now starts with the same Findings list.
 
 **1.3.0**
-- 28 vendor log formats are detected and normalised (`netlog --formats`); see [Supported log formats](#supported-log-formats).
+- 28 vendor log formats (now 42) are detected and normalised (`netlog --formats`); see [Supported log formats](#supported-log-formats).
 - Network and security findings: interface flapping, err-disabled ports, loops, routing neighbors, login attacks, scans, VPN, failover, hardware.
 - `--flap-threshold`/`--flap-window`, `--brute-threshold`/`--brute-window` and `--scan-ports`/`--scan-hosts`/`--scan-window` options.
 - TUI fixes and additions:
@@ -47,11 +54,12 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 - **Piped input** — `cat file.log | netlog` works; all highlighting applies
 - **Structured log analysis** — parses `key="value"` fields (`clientMac=`, `userName=`, `apName=`, `apLocation=`, `ssid=`, `rssi=`, …), classifies events as error / warning / success, and tracks each client's session lifecycle
 - **Health summary (`--summary`)** — a ranked list of findings (critical → low), then per-domain statistics: wireless clients/APs/locations, switching and routing, firewall traffic, authentication and infrastructure
-- **Security and error analytics** — brute force, password spraying, success after failures, port/host scans, risky services exposed to the internet, internal hosts reaching risky services, error spikes, noisy or silent devices, and 23 text detectors (DHCP exhaustion, ARP spoofing, rogue APs, IP conflicts, storms, crashes, memory/disk exhaustion, conntrack full, certificate, VPN and NTP failures, …) that work on any log line
+- **Security and error analytics** — brute force, password spraying, success after failures, port/host scans, risky services exposed to the internet, internal hosts reaching risky services, error spikes, noisy or silent devices, web attacks and scans, DNS tunneling, mail abuse, mass file changes, and 24 text detectors (DHCP exhaustion, ARP spoofing, rogue APs, IP conflicts, storms, crashes, memory/disk exhaustion, conntrack full, SELinux denials, certificate, VPN and NTP failures, …) that work on any log line
 - **Client timeline (`--client`)** — a clean chronological narrative for one MAC or username, with its session path and findings
 - **Failure-loop detection** — flags clients with N+ failures inside a rolling window, and groups those lines visually (banner + colored side bar) in the timeline, piped and follow modes
 - **Diagnostic rules** — legacy SSID use, inconsistent username formats on one device, rapid roaming, low RSSI, and AP/location failure hotspots
-- **Vendor format detection** — 28 wireless, switch, router, firewall and NAC log formats are detected per line and normalised to common fields and event kinds (`netlog --formats` lists them)
+- **Log format detection** — 42 wireless, switch, router, firewall, NAC and Linux server log formats are detected per line and normalised to common fields and event kinds (`netlog --formats` lists them)
+- **Server analytics** — web servers, DNS, DHCP, mail, file shares and fail2ban logs get their own statistics (status codes, top URLs and clients, queried domains, leases, rejected mail, file operations, bans)
 - **Network and security findings** — interface flapping, err-disabled ports, MAC flapping and loops, routing neighbor loss, login brute force (and success after failures), port and host scans, VPN, failover, hardware and service events
 - **Configurable thresholds** — every detection rule's limits can be set on the command line (see [Diagnostic rules](#diagnostic-rules))
 
@@ -350,7 +358,7 @@ Each line is checked against the vendor formats below (most specific first, with
 | SonicWall | SonicOS | firewall | `id=firewall … m=<id>` | lower |
 | Check Point | Quantum / Gaia syslog export | firewall | `product:"…"` / `origin:"…"` | lower |
 | Cisco | ISE | NAC | `CISE_` categories | lower |
-| FreeRADIUS | radiusd | NAC | `Auth: (n) Login OK/incorrect` | lower |
+| FreeRADIUS | radiusd (syslog or `radius.log`) | NAC | `Auth: (n) Login OK/incorrect`, `… from unknown client IP`, `invalid Message-Authenticator`, `Marking home server … as dead` | lower |
 | Cisco Meraki | MR / MS / MX | wifi, switch, firewall | RFC 5424 version `1` + epoch time, `events`/`flows`/`urls`/`ids-alerts` categories | documented |
 | Aruba (HPE) | ArubaOS controller / Instant AP | wifi | `<6-digit ID> <LEVEL>` (522xxx authmgr, 501xxx stm) | documented |
 | Aruba (HPE) | AOS-CX switch | switch | `Event\|<id>\|LOG_<LEVEL>\|…` | lower |
@@ -359,6 +367,20 @@ Each line is checked against the vendor formats below (most specific first, with
 | Netgate / Deciso | pfSense / OPNsense | firewall | `filterlog:` CSV | well known |
 | Linux | iptables / nftables / UFW, UniFi & EdgeOS gateways | firewall | `IN= OUT= SRC= DST= PROTO=` | well known |
 | Linux / BSD | OpenSSH sshd, sudo, PAM | server | `sshd: Failed password … from IP`, `Accepted …`, `sudo: … incorrect password attempts` | well known |
+| Apache / nginx | access log (combined, common, `vhost_combined`) | web | `IP - user [dd/Mon/yyyy:hh:mm:ss +zone] "GET /x HTTP/1.1" 200 …` | documented |
+| Apache | httpd `error_log` 2.2 / 2.4, mod_security | web | `[Fri Mar 01 …] [module:level] [pid …] [client …]` | documented |
+| nginx | `error.log` | web | `yyyy/mm/dd hh:mm:ss [level] pid#tid: *n …, client: …` | documented |
+| Squid | native `access.log` | web | `epoch elapsed client RESULT/code bytes method URL …` | documented |
+| ISC | BIND named | dns | `client @0x… IP#port (name): query: …`, `… denied`, `zone …/IN:`, `transfer of …` | well known |
+| dnsmasq | DNS and DHCP | dns, dhcp | `dnsmasq[n]: query[A] … from IP`, `dnsmasq-dhcp[n]: DHCPACK(iface) IP MAC` | well known |
+| ISC | dhcpd | dhcp | `DHCPDISCOVER from MAC via iface`, `DHCPACK on IP to MAC`, `DHCPNAK`, `DHCPDECLINE` | well known |
+| Samba | smbd auth audit, `vfs_full_audit`, `log.smbd` | server | `Auth: [SMB2,…] user [DOM]\[user] … status [NT_STATUS_…] … remote host [ipv4:IP:port]`, `smbd_audit: user\|IP\|…` | documented |
+| Postfix | smtpd, smtp, qmgr | mail | `postfix/smtpd[n]: … SASL LOGIN authentication failed`, `reject: RCPT from …`, `status=sent/deferred/bounced` | well known |
+| Dovecot | IMAP / POP3 | mail | `imap-login: Disconnected (auth failed, …): user=<…>, rip=…`, `Login: user=<…>` | well known |
+| FTP servers | vsftpd, ProFTPD, Pure-FTPd | server | `[user] FAIL LOGIN: Client "IP"`, `proftpd[n]: … - USER x: …`, `pure-ftpd: (?@IP) [WARNING] Authentication failed` | well known |
+| fail2ban | `fail2ban.log` | server | `fail2ban.actions [n]: NOTICE [jail] Ban IP` | well known |
+| systemd | unit failures | server | `x.service: Failed with result '…'`, `Scheduled restart job, restart counter is at N` | well known |
+| Linux audit | auditd `audit.log` | server | `type=USER_AUTH msg=audit(epoch:n): … acct="…" addr=… res=failed` | documented |
 | Ubiquiti | UniFi AP station tracker | wifi | `stahtd … STA-TRACKER` JSON | documented |
 | hostapd | UniFi, OpenWrt and other Linux APs | wifi | `hostapd: <iface>: STA <mac> …` | well known |
 | MikroTik | RouterOS | router, firewall, wifi | comma topics with a level (`system,error,critical`) | lower |
@@ -373,10 +395,12 @@ Event kinds and their default severity:
 
 | Severity | Kinds |
 |----------|-------|
-| Error | client failure, AP down, threat, err-disabled port, loop / MAC flap, routing neighbor down, VPN down, service/server down |
-| Warning | firewall deny, login failure, link down, STP change, port-security violation, port error, PoE, failover, hardware, reboot |
+| Error | client failure, AP down, threat, err-disabled port, loop / MAC flap, routing neighbor down, VPN down, service/server down, systemd service failed |
+| Warning | firewall deny, login failure, link down, STP change, port-security violation, port error, PoE, failover, hardware, reboot, RADIUS problem |
 | Success | join, auth, AP up, login, link up, neighbor up, VPN up, service up |
-| Info | roam, disconnect, allow, session, logout, config change |
+| Info | roam, disconnect, allow, session, logout, config change, web request, DNS query, DHCP message, mail, file operation, fail2ban action |
+
+Server events take their level from what happened: an HTTP 5xx is an error and a request matching an attack signature a warning; refused DNS queries, DHCP NAKs and declines, and deferred or bounced mail are warnings. These events are aggregated (like firewall traffic) rather than kept one by one, so large access and query logs use little memory.
 
 For hardware, STP, PoE, reboot, failover and port-error events the device's own syslog level decides instead (a `crit` fan failure is an error, a `notice` STP change is info), and a threat's own severity (`critical`/`high` vs lower) decides between error and warning. Events of unknown kind use the syslog level. An info or success event with a diagnostic finding (legacy SSID, low RSSI) becomes a warning.
 
@@ -412,6 +436,8 @@ For the generic parser, a line counts as a structured event when it has at least
 | **Password spraying**: login failures from one source against N distinct accounts | 5 accounts | `--spray-accounts N` |
 | **Distributed login attack**: login failures against one account from N distinct sources | 5 sources | `--spray-sources N` |
 | **Error spike**: errors + warnings in one window, at least N and X × the median window | 20 and 5× per 5 min | `--spike-min N`, `--spike-factor X`, `--spike-window 5m` |
+| **Web vulnerability scan**: distinct URLs answered 404 for one client | 30 URLs | `--web-scan N` |
+| **Mass file changes**: deletes, renames and writes by one user (Samba `full_audit`, FTP) | 100 in 5 min | `--mass-change N` |
 | **Err-disable, loop / MAC flap, routing neighbor down, VPN down, service down**: reported per device/interface/peer, noting whether it recovered | — | — |
 
 Events without an `apLocation` field are attributed to the location their AP reports elsewhere in the log. For logs with no timestamps, a failure loop means N failures in a row with no success between them.
@@ -424,7 +450,8 @@ A report with a header (counts, time span, sources by format, severity totals, a
 - **Switching & routing** — interfaces with link-down events (flapping marked `⚠`), routing neighbors, err-disable / loop / port-security events
 - **Firewall & security** — deny/allow totals, top denied sources (scans marked), destination ports with service names, deny rules/policies, threats, VPN tunnels
 - **Authentication & administration** — login failures by source and account, successful logins after failures, config changes
-- **Infrastructure** — AP up/down, reboots, failover, hardware, PoE and service events
+- **Servers & services** — web requests (status codes, sites, top clients and URLs, 404 and 5xx URLs, attacks by type, error-log messages), DNS (queries, top domains and clients, query types, refused queries), DHCP (messages by type, clients, leases, busiest clients), mail (delivery status, rejections by reason, deferrals, authenticated senders), file shares and FTP (operations by user and share, lockouts), fail2ban (bans by jail, most-banned addresses) and RADIUS problems
+- **Infrastructure** — AP up/down, reboots, failover, hardware, PoE and service events (including failed systemd services)
 
 It starts with the ranked **Findings** list (below). `--top N` sets the rows per section and per kind of finding. Firewall allow/deny lines are aggregated rather than stored, so large firewall logs use little memory.
 
@@ -434,10 +461,10 @@ Every detector's results, most serious first, up to `--top` rows per kind (`… 
 
 | Level | Findings |
 |-------|----------|
-| Critical | Successful login from a source after a brute-force run · risky service (RDP, SMB, Telnet, databases, VNC, WinRM, SNMP, …) allowed in from an internet address · emergency/alert syslog messages · malware / intrusion text |
-| High | Login attack (brute force) · password spraying (one source, 5+ accounts; `--spray-accounts`) · distributed login attack (one account, 5+ sources; `--spray-sources`) · port scan / host sweep from an internal host · internal host reaching risky services on the internet · spike in errors/warnings (5-minute window ≥ 20 and ≥ 5× the median; `--spike-min`, `--spike-factor`, `--spike-window`) · interface flapping · err-disabled port · layer-2 loop / MAC flap · routing neighbor down · threat signatures · VPN tunnel / server / AP down · hardware faults · critical syslog messages · DoS/flood, ARP spoofing, IP conflict, rogue AP/DHCP, wireless attack, DHCP pool exhausted, broadcast storm, conntrack/session table full, memory exhaustion, crash/panic, disk full, AAA/RADIUS unreachable |
-| Medium | Port scan / host sweep from the internet · possible spam bot (SMTP to 10+ mail servers) · device with a high error rate (≥ 30%) · high overall error rate (≥ 25%) · device stopped logging · spanning-tree instability · interface errors · port-security violations · failover · reboots · wireless failure loops · AP / location failure hotspots · VPN/IPsec, high CPU, certificate/TLS, spoofed/martian packets |
-| Low | Legacy SSID · identity inconsistency · rapid roaming · low signal · PoE faults · device clock / timestamp mismatch · NTP problems |
+| Critical | Successful login from a source after a brute-force run (SSH, web, WordPress, mail, FTP, Samba, …) · risky service (RDP, SMB, Telnet, databases, VNC, WinRM, SNMP, …) allowed in from an internet address · web attack (path traversal, command injection, web shell, sensitive file) answered with a `2xx` · emergency/alert syslog messages · malware / intrusion text |
+| High | Login attack (brute force) · password spraying (one source, 5+ accounts; `--spray-accounts`) · distributed login attack (one account, 5+ sources; `--spray-sources`) · port scan / host sweep from an internal host · internal host reaching risky services on the internet · spike in errors/warnings (5-minute window ≥ 20 and ≥ 5× the median; `--spike-min`, `--spike-factor`, `--spike-window`) · interface flapping · err-disabled port · layer-2 loop / MAC flap · routing neighbor down · threat signatures · VPN tunnel / server / AP down · hardware faults · critical syslog messages · DoS/flood, ARP spoofing, IP conflict, rogue AP/DHCP, wireless attack, DHCP pool exhausted, broadcast storm, conntrack/session table full, memory exhaustion, crash/panic, disk full, AAA/RADIUS unreachable · Log4Shell attempts · web attacks / scans from an internal host · DNS tunneling (many very long names), DNS amplification (refused ANY queries from the internet), zone transfer attempts · mail account used from 5+ internet addresses · account locked out · mass file changes (possible ransomware) · RADIUS requests from unknown internet clients, shared-secret mismatches · failed systemd services |
+| Medium | Port scan / host sweep from the internet · possible spam bot (SMTP to 10+ mail servers) · device with a high error rate (≥ 30%) · high overall error rate (≥ 25%) · device stopped logging · spanning-tree instability · interface errors · port-security violations · failover · reboots · wireless failure loops · AP / location failure hotspots · VPN/IPsec, high CPU, certificate/TLS, spoofed/martian packets · web attack attempts and vulnerability scans from the internet · web server errors (5xx ≥ 5% of a site's requests) · refused DNS queries, DNS zone problems, DNS server overloaded · DHCP declines (IP conflicts), clients with 20+ DISCOVERs and no lease · open-relay probing, high mail volume from one account, mail delivery problems (≥ 20% deferred) · repeat fail2ban offenders · RADIUS requests from unknown internal clients · SELinux / AppArmor denials |
+| Low | Legacy SSID · identity inconsistency · rapid roaming · low signal · PoE faults · device clock / timestamp mismatch · NTP problems · DNS resolution failures · DHCP NAKs · bounced mail · fail2ban bans (summary) |
 
 Internal means RFC 1918, CGNAT (100.64/10), loopback, link-local and IPv6 ULA addresses; anything else is treated as the internet. The text detectors run on lines that no format classified, so a recognised event isn't reported twice; they look for a few keywords first, so they add little time.
 

