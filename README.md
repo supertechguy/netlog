@@ -10,7 +10,7 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 
 ## What's new
 
-**Unreleased**
+**1.6.0**
 - Linux server and service logs: Apache and nginx access and error logs (with mod_security), Squid, BIND, dnsmasq, ISC dhcpd, Samba, Postfix, Dovecot, vsftpd / ProFTPD / Pure-FTPd, fail2ban, systemd and auditd. FreeRADIUS now also reports unknown clients, shared-secret mismatches and dead home servers.
 - New findings for them: web attacks (path traversal, SQL injection, XSS, command injection, Log4Shell, web shells, sensitive files, exploit probes, scanner tools) and whether they got a `2xx` answer, web vulnerability scans, web server errors, DNS tunneling, amplification and zone transfer attempts, DHCP conflicts and clients without a lease, open-relay probing, compromised mail accounts, Samba lockouts and mass file changes (possible ransomware), repeat fail2ban offenders, RADIUS problems and failed systemd services. Web, mail, FTP, Samba and audit logins feed the brute-force, spraying and success-after-failures rules.
 - `--summary` and the analytics popup have a **Servers & services** section (web, DNS, DHCP, mail, file shares, fail2ban, RADIUS), and the summary header now shows the time span for every kind of log.

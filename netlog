@@ -41,7 +41,7 @@ try:
 except ImportError:
     HAS_GEOIP = False
 
-VERSION = '1.5.0'
+VERSION = '1.6.0'
 
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # bytes — above this, use mmap index
 
