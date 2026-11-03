@@ -23,13 +23,13 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 
 **1.4.0**
 - The statistics popup (`x`) became a full **analytics** report: ranked findings (critical → low) for brute force, password spraying, distributed login attacks, success after brute force, port/host scans, risky services exposed to the internet, internal hosts using risky services, spam bots, error spikes, noisy or silent devices and clock mismatches.
-- 23 text detectors (now 24) work on any log line: DHCP exhaustion, ARP spoofing, rogue APs, IP conflicts, storms, loops, crashes, memory/disk/table exhaustion, hardware, VPN, certificate, NTP and more (see [Findings](#findings)).
+- 23 text detectors work on any log line: DHCP exhaustion, ARP spoofing, rogue APs, IP conflicts, storms, loops, crashes, memory/disk/table exhaustion, hardware, VPN, certificate, NTP and more (see [Findings](#findings)).
 - New Linux / BSD format: OpenSSH `sshd`, `sudo` and PAM login failures and successes.
 - The firewall statistics add top allowed ports, top talkers and protocols. Plain syslog gets top sending hosts and programs, and port counting no longer picks up MAC or timestamp fragments.
 - `--summary` now starts with the same Findings list.
 
 **1.3.0**
-- 28 vendor log formats (now 42) are detected and normalised (`netlog --formats`); see [Supported log formats](#supported-log-formats).
+- 28 vendor log formats are detected and normalised (`netlog --formats`); see [Supported log formats](#supported-log-formats).
 - Network and security findings: interface flapping, err-disabled ports, loops, routing neighbors, login attacks, scans, VPN, failover, hardware.
 - `--flap-threshold`/`--flap-window`, `--brute-threshold`/`--brute-window` and `--scan-ports`/`--scan-hosts`/`--scan-window` options.
 - TUI fixes and additions:
@@ -137,6 +137,8 @@ netlog -f "pattern" <file>                  Follow, only showing lines matching 
 netlog -f --alert PATTERN <file>            Follow with alert bell on pattern match
 cat file.log | netlog                       Piped/ANSI mode
 netlog --summary <file> [file2 ...]         Health summary of structured events
+netlog --summary /var/log/apache2/access.log  Web server analytics (any supported server log)
+journalctl -o short --since today | netlog --summary   Analytics for today's system journal
 netlog --client <MAC|user> <file> ...       Timeline for one client or user
 netlog --summary --brute-threshold 10 ...   Tune a detection rule (see Diagnostic rules)
 netlog --summary --top 25 <file>            More rows per section and per kind of finding
@@ -258,6 +260,8 @@ Press `x` to open the analytics popup for the current view, so after filtering (
 - Top destination / service ports (named port fields, or a port right after an IP; source ports and timestamps aren't counted)
 - Syslog severity words
 
+For server logs the report includes the **Servers & services** section (web, DNS, DHCP, mail, file shares, fail2ban, RADIUS), so you can, for example, filter a web log to one client with `f` and press `x` to see its status codes, URLs and any attacks.
+
 Scroll with `↑`/`↓`, `PgUp`/`PgDn`, `g`/`G`; pan with `←`/`→`; close with `q` or `Esc`. A progress bar shows on larger views (`Esc` cancels; a 300,000-line view takes about 30 s), and the result is cached until the view changes.
 
 ---
@@ -338,6 +342,16 @@ netlog --summary /var/log/wlc.log*
 netlog --client alice /var/log/wlc.log            # username: alice, alice@corp.org and CORP\alice all match
 netlog --client F4F5.D8DE.7350 /var/log/wlc.log   # MAC in any notation
 ssh ctrl1 'cat /var/log/wlc.log' | netlog --summary
+```
+
+The same applies to network devices and Linux servers in the formats below, which need no `key="value"` fields. Logs from different devices and servers can be mixed in one run:
+
+```bash
+netlog --summary /var/log/apache2/access.log* /var/log/apache2/error.log
+netlog --summary /var/log/mail.log /var/log/fail2ban.log
+netlog --summary /var/log/syslog /var/log/auth.log /var/log/audit/audit.log
+netlog --summary -g 10.146. /var/log/syslog     # analytics for one subnet only
+netlog --client aa:bb:cc:dd:ee:ff /var/log/syslog # a device's DHCP and other lines
 ```
 
 ### Supported log formats
@@ -487,7 +501,7 @@ Findings:
   May 01 08:03:30  ! clientJoin             AP-Gym-2 [Gym] · ssid WCSDaccess · rssi -81  ⚠ low RSSI -81 dBm
 ```
 
-When you look up a MAC, other log lines mentioning it (DHCP, RADIUS, etc.) are shown too, dimmed. A username with several devices gets one section per device.
+When you look up a MAC, other log lines mentioning it (DHCP, RADIUS, etc.) are shown too, dimmed. A MAC that only appears in such lines (for example a DHCP log with no wireless events) gets a section with just those lines. A username with several devices gets one section per device; events naming the user without a MAC (SSH, Samba, mail or web logins, …) are listed in their own section.
 
 ### Live grouping (piped and follow modes)
 
@@ -544,8 +558,9 @@ A `unittest` suite (stdlib only, no test framework dependency) covers the pure l
 
 - Viewer: highlighting/segment priority, dedup, column stripping, search and match navigation, the filter and `-g` syntax, line wrapping
 - CLI argument parsing, including every threshold option
-- Vendor format detection
+- Log format detection: every example line of every format (the same ones `netlog --formats` shows)
 - Structured analysis: field parsing, timestamps, failure loops, diagnostic rules, network and security findings, the analytics alerts and text detectors, report and timeline output, live loop grouping
+- Server logs: web attack signatures, web, DNS, DHCP, mail, Samba, fail2ban, RADIUS and systemd findings, Samba multi-line timestamps, aggregation of high-volume events and the Servers & services section
 
 ```bash
 python3 -m unittest discover -s tests -v
