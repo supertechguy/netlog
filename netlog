@@ -20,6 +20,8 @@ import os
 import tempfile
 import argparse
 import bisect
+import shutil
+import unicodedata
 import collections
 import csv
 import datetime
@@ -441,6 +443,98 @@ def geo_lookup(ip_str):
 def _a(text, code):
     return f'\033[{code}m{text}\033[0m'
 
+
+_ANSI_TOKEN = re.compile(r'(\x1b\[[0-9;]*[A-Za-z])|(\t)|([^\S\t]+)|([^\s\x1b]+)', re.S)
+
+
+def _char_width(ch):
+    if unicodedata.combining(ch):
+        return 0
+    return 2 if unicodedata.east_asian_width(ch) in ('W', 'F') else 1
+
+
+def fit_ansi(text, width, wrap=True, indent=2 + 4):
+    """Fit ANSI-colored output to a terminal `width`. With wrap, long lines
+    continue on following rows indented by `indent` columns (the 2-column
+    event glyph plus WRAP_INDENT); without, they are cut at the edge. Colors
+    are carried over onto continuation rows. Handles multi-line text."""
+    if width < indent + 10:
+        return text
+    return '\n'.join(_fit_ansi_line(l, width, wrap, indent) for l in text.split('\n'))
+
+
+def _fit_ansi_line(line, width, wrap, indent):
+    if len(line) <= width and '\t' not in line:
+        return line                  # visible width can't exceed the length
+    out, col, active = [], 0, ''
+    full = width - indent
+
+    def newline():
+        nonlocal col
+        out.append('\x1b[0m\n' + ' ' * indent + active if active else '\n' + ' ' * indent)
+        col = indent
+
+    for m in _ANSI_TOKEN.finditer(line):
+        seq, tab, space, word = m.groups()
+        if seq:
+            out.append(seq)
+            if seq.endswith('m'):
+                active = '' if seq in ('\x1b[0m', '\x1b[m') else active + seq
+            continue
+        if tab or space:
+            n = 8 - col % 8 if tab else len(space)
+            if col + n > width:
+                if not wrap:
+                    out.append(' ' * (width - col))
+                    break
+                newline()                      # spaces at a break are dropped
+            else:
+                out.append(' ' * n)
+                col += n
+            continue
+        w = sum(_char_width(ch) for ch in word)
+        if col + w <= width:
+            out.append(word)
+            col += w
+            continue
+        if not wrap:
+            for ch in word:
+                cw = _char_width(ch)
+                if col + cw > width:
+                    break
+                out.append(ch)
+                col += cw
+            break
+        if w <= full and col > indent:
+            newline()
+            out.append(word)
+            col += w
+            continue
+        for ch in word:                        # longer than a row: split it
+            cw = _char_width(ch)
+            if col + cw > width:
+                newline()
+            out.append(ch)
+            col += cw
+    if active:
+        out.append('\x1b[0m')
+    return ''.join(out)
+
+
+class _Output:
+    """Writes rendered lines to stdout, wrapping or cutting them to the
+    terminal width when stdout is a terminal (left untouched otherwise)."""
+
+    def __init__(self, prefs):
+        self.prefs = prefs
+        self.tty   = sys.stdout.isatty()
+
+    def __call__(self, text, flush=False):
+        if self.tty:
+            text = fit_ansi(text, shutil.get_terminal_size().columns,
+                            bool(self.prefs.get('wrap', True)))
+        print(text, flush=flush)
+
 def _collect_segments(line, vendors, mac_map, ctr, search_term=None, search_is_regex=False):
     """
     Returns sorted list of (src_start, src_end, display_text, ansi_code, pair_num, bold).
@@ -692,22 +786,60 @@ class LargeFile:
 
 class LargeFileView:
     """Adapts a LargeFile to the (text, count) tuple interface used by
-    _render and collect_stats, reading only requested lines from disk."""
+    _render and collect_stats, reading only requested lines from disk.
+    With `idx` (an array of line numbers) it shows only those lines."""
 
-    def __init__(self, lf):
-        self._lf = lf
+    def __init__(self, lf, idx=None):
+        self._lf  = lf
+        self._idx = idx
 
     def __len__(self):
-        return len(self._lf)
+        return len(self._lf) if self._idx is None else len(self._idx)
 
     def __getitem__(self, key):
+        if self._idx is None:
+            if isinstance(key, slice):
+                return [(t, 1) for t in self._lf[key]]
+            return (self._lf[key], 1)
         if isinstance(key, slice):
-            return [(t, 1) for t in self._lf[key]]
-        return (self._lf[key], 1)
+            return [(self._lf[i], 1) for i in self._idx[key]]
+        return (self._lf[self._idx[key]], 1)
 
     def __iter__(self):
-        for text in self._lf:
-            yield (text, 1)
+        if self._idx is None:
+            for text in self._lf:
+                yield (text, 1)
+        else:
+            for i in self._idx:
+                yield (self._lf[i], 1)
+
+
+def make_line_filter(spec):
+    """Predicate for a TUI filter. Plain text is case-insensitive and
+    `a|b|c` matches any of the terms; `r:REGEX` is a regex; a leading `!`
+    keeps the lines that do NOT match. Raises ValueError / re.error."""
+    neg = spec.startswith('!')
+    if neg:
+        spec = spec[1:]
+    if spec.startswith('r:'):
+        pat = re.compile(spec[2:], re.I)
+        def test(line):
+            return pat.search(line) is not None
+    else:
+        terms = [t.strip().lower() for t in spec.split('|') if t.strip()]
+        if not terms:
+            raise ValueError('nothing to match')
+        if len(terms) == 1:
+            t0 = terms[0]
+            def test(line):
+                return t0 in line.lower()
+        else:
+            def test(line):
+                low = line.lower()
+                return any(t in low for t in terms)
+    if neg:
+        return lambda line: not test(line)
+    return test
 
 
 # ── Statistics ────────────────────────────────────────────────────────────────
@@ -775,101 +907,126 @@ def _init_colors():
 
 # ── Curses line drawing ───────────────────────────────────────────────────────
 
-def _draw_line(win, y, text, count, vendors, mac_map, ctr,
-               search_term, search_is_regex, width, show_ln, linenum, dedup_on, hidden_cols=0,
-               current=False):
-    # Detect event type from original text BEFORE column stripping so the
-    # glyph still reflects the event even when the keyword column is hidden.
-    ev      = _event_type(text)
-    glyph   = ev[0] if ev else '  '
-    ev_attr = (curses.color_pair(ev[2]) | curses.A_BOLD) if (ev and ev[3]) else \
-              (curses.color_pair(ev[2]) if ev else 0)
-    try:
-        win.addstr(y, 0, glyph, ev_attr)
-    except curses.error:
-        return
-    x = 2  # glyph is always 2 display columns
+WRAP_INDENT = 4     # extra indent of wrapped continuation rows
+_WORDS_RE   = re.compile(r'\s+|\S+')
 
+
+def _line_cells(text, count, vendors, mac_map, ctr, search_term, search_is_regex,
+                show_ln, linenum, dedup_on, hidden_cols=0, current=False):
+    """One view line as (prefix, chunks) of (text, curses attr): prefix is
+    the fixed lead (event glyph, or the line number), chunks the content."""
+    if show_ln:
+        prefix = [(f'{linenum+1:6} ', curses.A_DIM)]
+    else:
+        # Event type comes from the original text BEFORE column stripping so
+        # the glyph still reflects the event when the keyword column is hidden.
+        ev = _event_type(text)
+        if ev:
+            attr = curses.color_pair(ev[2]) | (curses.A_BOLD if ev[3] else 0)
+            prefix = [(ev[0], attr)]
+        else:
+            prefix = [('  ', 0)]
     if hidden_cols:
         text = _strip_cols(text, hidden_cols)
 
-    if show_ln:
-        prefix = f'{linenum+1:6} '
-        try:
-            win.addstr(y, 0, prefix[:width - 1], curses.A_DIM)
-            x = len(prefix)
-        except curses.error:
-            return
-
-    segs = _collect_segments(text, vendors, mac_map, ctr, search_term, search_is_regex)
-    prev = 0
-    for src_s, src_e, disp, _ansi, pair, bold, geo in segs:
+    chunks = []
+    prev   = 0
+    for src_s, src_e, disp, _ansi, pair, bold, geo in \
+            _collect_segments(text, vendors, mac_map, ctr, search_term, search_is_regex):
         if current and pair == _P_SRCH:
             pair = _P_SRCH_CUR
-        cattr = curses.color_pair(pair) | (curses.A_BOLD if bold else 0)
-        chunk = text[prev:src_s]
-        if chunk and x < width - 1:
-            try:
-                cut = chunk[:width - 1 - x]
-                win.addstr(y, x, cut)
-                x += len(cut)
-            except curses.error:
-                return
-        if x < width - 1:
-            try:
-                cut = disp[:width - 1 - x]
-                win.addstr(y, x, cut, cattr)
-                x += len(cut)
-            except curses.error:
-                return
-        if geo and x < width - 1:
-            try:
-                geo_text = f' ({geo})'
-                cut = geo_text[:width - 1 - x]
-                win.addstr(y, x, cut, curses.color_pair(_P_GEO))
-                x += len(cut)
-            except curses.error:
-                return
+        if src_s > prev:
+            chunks.append((text[prev:src_s], 0))
+        chunks.append((disp, curses.color_pair(pair) | (curses.A_BOLD if bold else 0)))
+        if geo:
+            chunks.append((f' ({geo})', curses.color_pair(_P_GEO)))
         prev = src_e
+    if prev < len(text):
+        chunks.append((text[prev:], 0))
+    if dedup_on and count > 1:
+        chunks.append((f' [×{count}]', curses.color_pair(_P_DEDUP) | curses.A_BOLD))
+    return prefix, chunks
 
-    tail = text[prev:]
-    if tail and x < width - 1:
-        try:
-            win.addstr(y, x, tail[:width - 1 - x])
-            x += min(len(tail), width - 1 - x)
-        except curses.error:
-            pass
 
-    if dedup_on and count > 1 and x < width - 1:
-        badge = f' [×{count}]'
-        try:
-            win.addstr(y, x, badge[:width - 1 - x],
-                       curses.color_pair(_P_DEDUP) | curses.A_BOLD)
-        except curses.error:
-            pass
+def _layout(prefix, chunks, width, wrap=False, hoff=0, max_rows=None):
+    """Place one line's cells on screen rows. Returns ([(row, x, text, attr)],
+    rows used). Without wrap the content is cut at the screen edge after
+    skipping `hoff` columns; with wrap it continues on following rows,
+    indented WRAP_INDENT past where the content starts."""
+    limit = width - 1
+    out, x = [], 0
+    for t, a in prefix:
+        t = t[:max(0, limit - x)]
+        if t:
+            out.append((0, x, t, a))
+            x += len(t)
+    cont = x + WRAP_INDENT
+    if not wrap or limit - cont < 8:          # too narrow to wrap usefully
+        skip = 0 if wrap else hoff
+        for t, a in chunks:
+            if skip:
+                if len(t) <= skip:
+                    skip -= len(t)
+                    continue
+                t, skip = t[skip:], 0
+            room = limit - x
+            if room <= 0:
+                break
+            t = t[:room]
+            out.append((0, x, t, a))
+            x += len(t)
+        return out, 1
+    # Word wrap: a word that doesn't fit moves to the next row unless it is
+    # longer than a whole row, in which case it is split.
+    row, full = 0, limit - cont
+    for t, a in chunks:
+        for word in _WORDS_RE.findall(t):
+            while word:
+                room = limit - x
+                if len(word) <= room:
+                    out.append((row, x, word, a))
+                    x += len(word)
+                    break
+                if word.isspace():
+                    word = ''                  # spaces at a break are dropped
+                elif len(word) <= full and x > cont:
+                    pass                       # whole word onto the next row
+                else:
+                    out.append((row, x, word[:room], a))
+                    word = word[room:]
+                row += 1
+                if max_rows is not None and row >= max_rows:
+                    return out, row
+                x = cont
+    return out, row + 1
+
 
 # ── Curses status bar ─────────────────────────────────────────────────────────
 
 def _draw_status(win, height, width, term, is_regex, filt, offset, total,
-                 dedup_on, show_ln, alert_pat, large_file=False, hidden_cols=0, msg=''):
+                 dedup_on, show_ln, alert_pat, large_file=False, hidden_cols=0, msg='',
+                 shown=None, wrap=False, hoff=0):
     mode  = "REGEX" if is_regex else "TEXT"
     parts = [f"[Search: {term or 'None'} ({mode})]"]
     if msg:         parts.append(f"[{msg}]")
     if large_file:  parts.append("[LARGE FILE]")
     if hidden_cols: parts.append(f"[COLS HIDDEN: {hidden_cols}]")
-    if filt:        parts.append(f"Filter: {filt}")
+    if filt:        parts.append(f"[Filter: {filt}]")
     if dedup_on:    parts.append("DEDUP")
     if show_ln:     parts.append("#")
+    if wrap:        parts.append("WRAP")
+    elif hoff:      parts.append(f"→col {hoff + 1}")
     if alert_pat:   parts.append(f"ALERT:{alert_pat}")
-    end   = min(offset + height - 2, total)
-    line1 = "  ".join(parts) + f"  {offset+1}-{end}/{total}"
+    end   = min(offset + (shown if shown is not None else height - 2), total)
+    line1 = "  ".join(parts) + f"  {min(offset + 1, total)}-{end}/{total}"
+    pan   = "" if wrap else "  ←→=pan"
     if large_file:
-        line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  "
-                 "/=text  r=regex  n/p=match  h/u=hide-col  x=stats  c=clear  q=quit")
+        line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  /=text  r=regex  n/p=match  "
+                 f"f=filter  l=wrap{pan}  h/u=hide-col  x=stats  c=clear  q=quit")
     else:
-        line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  "
-                 "/=text  r=regex  n/p=match  f=filter  "
-                 "d=dedup  #=linenum  h/u=hide-col  x=stats  e=export  c=clear  q=quit")
+        line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  /=text  r=regex  n/p=match  "
+                 f"f=filter  l=wrap{pan}  d=dedup  #=linenum  h/u=hide-col  x=stats  "
+                 "e=export  c=clear  q=quit")
     try:
         win.addstr(height - 2, 0, line1[:width - 1], curses.color_pair(_P_STAT))
         win.clrtoeol()
@@ -880,17 +1037,45 @@ def _draw_status(win, height, width, term, is_regex, filt, offset, total,
 
 # ── Curses full render ────────────────────────────────────────────────────────
 
-def _render(win, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, dedup_on,
-            hidden_cols=0, cur=None):
+def _render(win, view, offset, cells, wrap=False, hoff=0):
+    """Draw view lines from `offset`; `cells(i)` gives line i's (prefix,
+    chunks). Returns how many lines fit completely on screen."""
     height, width = win.getmaxyx()
+    rows = height - 2
     win.erase()
-    for i in range(height - 2):
-        idx = offset + i
-        if idx >= len(view):
+    y, idx, shown = 0, offset, 0
+    while y < rows and idx < len(view):
+        prefix, chunks = cells(idx)
+        placed, used = _layout(prefix, chunks, width, wrap, hoff, rows - y)
+        for r, x, t, a in placed:
+            if y + r < rows:
+                try:
+                    win.addstr(y + r, x, t, a)
+                except curses.error:
+                    pass
+        if y + used <= rows:
+            shown += 1
+        y   += used
+        idx += 1
+    return shown
+
+
+def _fit_back(end, rows, cells, width, wrap):
+    """First line index such that lines [start, end) fill at most `rows`
+    screen rows (at least one line)."""
+    if not wrap:
+        return max(0, end - rows)
+    used, i = 0, end
+    while i > 0:
+        _, n = _layout(*cells(i - 1), width, True)
+        if used + n > rows and i < end:
             break
-        text, count = view[idx]
-        _draw_line(win, i, text, count, vendors, mac_map, ctr,
-                   term, is_regex, width, show_ln, idx, dedup_on, hidden_cols, idx == cur)
+        used += n
+        i    -= 1
+        if used >= rows:
+            break
+    return i
+
 
 # ── Stats popup ───────────────────────────────────────────────────────────────
 
@@ -961,6 +1146,7 @@ def _draw_stats(stdscr, view, vendors):
 # ── Input helper ──────────────────────────────────────────────────────────────
 
 def _read_line(stdscr, prompt):
+    """Read a line of input on the status row; None if cancelled with Esc."""
     height, width = stdscr.getmaxyx()
     curses.curs_set(1)
     buf, cx = [], len(prompt)
@@ -973,8 +1159,8 @@ def _read_line(stdscr, prompt):
         if ch in (10, 13, curses.KEY_ENTER):
             break
         if ch == 27:                       # Esc cancels
-            buf = []
-            break
+            curses.curs_set(0)
+            return None
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             if buf:
                 buf.pop(); cx -= 1
@@ -995,18 +1181,24 @@ def _read_line(stdscr, prompt):
 
 # ── Interactive TUI ───────────────────────────────────────────────────────────
 
-def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, file_base=None):
+def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, file_base=None,
+         prefs=None):
     _init_colors()
     curses.curs_set(0)
     stdscr.keypad(True)
     if hasattr(curses, 'set_escdelay'):
         curses.set_escdelay(25)            # Esc cancels prompts without a 1 s lag
 
+    prefs       = prefs if prefs is not None else {}
     large_file  = isinstance(lines, LargeFile)
     filtered    = lines if large_file else lines[:]
+    filt_idx    = None      # large files: array of matching line numbers
     dedup_on    = False
     show_ln     = False
+    wrap        = bool(prefs.get('wrap', True))
+    hoff        = 0         # horizontal scroll when not wrapping
     offset      = 0
+    shown       = 1         # lines that fit on the last drawn screen
     term        = None
     is_regex    = False
     matches     = []
@@ -1017,19 +1209,49 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
 
     def get_view():
         if large_file:
-            return LargeFileView(lines)
+            return LargeFileView(lines, filt_idx)
         return dedup_lines(filtered) if dedup_on else as_view(filtered)
+
+    def cells(i):
+        text, count = view[i]
+        return _line_cells(text, count, vendors, mac_map, ctr, term, is_regex,
+                           show_ln, i, dedup_on, hidden_cols, i == cur)
+
+    def status_msg(text):
+        h, w = stdscr.getmaxyx()
+        try:
+            stdscr.addstr(h - 2, 0, text[:w - 1], curses.color_pair(_P_STAT))
+            stdscr.clrtoeol(); stdscr.refresh()
+        except curses.error:
+            pass
+
+    def filter_large(pred):
+        """Matching line numbers of the large file, or None if cancelled."""
+        idx, n = array.array('Q'), len(lines)
+        stdscr.nodelay(True)
+        try:
+            for i in range(n):
+                if pred(lines[i]):
+                    idx.append(i)
+                if i % 20000 == 0:
+                    status_msg(f"Filtering… {i * 100 // max(1, n)}%  "
+                               f"({len(idx):,} matches, Esc to cancel)")
+                    if stdscr.getch() == 27:
+                        return None
+        finally:
+            stdscr.nodelay(False)
+        return idx
 
     view = get_view()
 
     while True:
         height, width = stdscr.getmaxyx()
-        page = max(1, height - 2)
+        rows = max(1, height - 2)
 
-        _render(stdscr, view, offset, vendors, mac_map, ctr, term, is_regex, show_ln, dedup_on,
-                hidden_cols, cur)
+        shown = _render(stdscr, view, offset, cells, wrap, hoff)
         _draw_status(stdscr, height, width, term, is_regex, filt, offset, len(view),
-                     dedup_on, show_ln, alert_pat, large_file, hidden_cols, msg)
+                     dedup_on, show_ln, alert_pat, large_file, hidden_cols, msg,
+                     shown, wrap, hoff)
         stdscr.refresh()
         msg = ''
 
@@ -1037,12 +1259,7 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
             """Move to the next match from `start`; returns the status message."""
             nonlocal cur, offset
             if large_file:
-                h, w = stdscr.getmaxyx()
-                try:
-                    stdscr.addstr(h - 2, 0, "Searching…"[:w - 1], curses.color_pair(_P_STAT))
-                    stdscr.clrtoeol(); stdscr.refresh()
-                except curses.error:
-                    pass
+                status_msg("Searching…")
             idx, wrapped = next_match(view, term, is_regex, start, step,
                                       None if large_file else matches)
             if idx is None:
@@ -1051,8 +1268,7 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
             cur    = idx
             offset = max(0, idx - 2)
             where  = (f"match {bisect.bisect_left(matches, idx) + 1}/{len(matches)}"
-                      if not large_file
-                      else f"match at line {idx + 1}")
+                      if not large_file else f"match at line {idx + 1}")
             if wrapped and not new_search:
                 where += ", wrapped to " + ("top" if step > 0 else "bottom")
             return where
@@ -1066,13 +1282,28 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
         elif ch in (curses.KEY_DOWN, ord('s'), ord('S')):
             offset += 1
         elif ch == curses.KEY_PPAGE:
-            offset -= page
+            offset = _fit_back(offset, rows, cells, width, wrap)
         elif ch in (curses.KEY_NPAGE, ord(' ')):
-            offset += page
+            offset += max(1, shown)
         elif ch == ord('g'):
             offset = 0
         elif ch == ord('G'):
-            offset = max(0, len(view) - page)
+            offset = len(view)
+
+        elif ch == ord('l'):
+            wrap = not wrap
+            hoff = 0
+            prefs['wrap'] = wrap
+            msg = "Wrapping long lines" if wrap else "Not wrapping: ←/→ to scroll sideways"
+
+        elif ch in (curses.KEY_LEFT, curses.KEY_RIGHT, curses.KEY_HOME):
+            if wrap:
+                msg = "Lines are wrapped: press l to turn wrapping off and scroll sideways"
+            elif ch == curses.KEY_HOME:
+                hoff = 0
+            else:
+                step = max(8, (width - 10) // 2)
+                hoff = max(0, hoff + (step if ch == curses.KEY_RIGHT else -step))
 
         elif ch in (ord('/'), ord('r')):
             regex = ch == ord('r')
@@ -1096,43 +1327,55 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
             else:
                 # Continue from the current match if it's still on screen,
                 # otherwise from the screen position (like less).
-                if cur is not None and offset <= cur < offset + page:
+                if cur is not None and offset <= cur < offset + max(1, shown):
                     start = cur + step
                 else:
                     start = offset if step > 0 else offset - 1
                 msg = goto(start, step)
 
         elif ch == ord('f'):
-            if large_file:
-                h, w = stdscr.getmaxyx()
-                stdscr.addstr(h - 2, 0, "Filter not available in large file mode  (press any key)"[:w-1],
-                              curses.color_pair(_P_STAT))
-                stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
+            t = _read_line(stdscr, "Filter (a|b = any of, !x = exclude, r:regex, "
+                                   "empty = remove filter): ")
+            changed = False
+            if t is None:
+                pass
+            elif not t:
+                if filt:
+                    filtered, filt_idx, filt = (lines if large_file else lines[:]), None, None
+                    msg, changed = "Filter removed", True
+                else:
+                    msg = "No filter to remove"
             else:
-                t = _read_line(stdscr, "Filter (prefix r: for regex): ")
-                if t:
-                    filt = t
-                    if t.startswith('r:'):
-                        pat = t[2:]
-                        try:
-                            filtered = [l for l in lines if re.search(pat, l, re.I)]
-                        except re.error:
-                            filtered = lines[:]
-                            filt = None
+                try:
+                    pred = make_line_filter(t)
+                except (ValueError, re.error) as e:
+                    msg = f"Invalid filter: {e}"
+                    pred = None
+                if pred is not None:
+                    if large_file:
+                        hits = filter_large(pred)
                     else:
-                        tl = t.lower()
-                        filtered = [l for l in lines if tl in l.lower()]
-                    view    = get_view()
-                    offset  = 0
-                    cur     = None
-                    matches = find_matches(view, term, is_regex) if term else []
+                        hits = [l for l in lines if pred(l)]
+                    if hits is None:
+                        msg = "Filter cancelled"
+                    elif not hits:
+                        msg = f"No lines match {t!r}: filter not applied"
+                    else:
+                        if large_file:
+                            filt_idx = hits
+                        else:
+                            filtered = hits
+                        filt, changed = t, True
+                        msg = f"{len(hits):,} of {len(lines):,} lines match"
+            if changed:
+                view    = get_view()
+                offset  = 0
+                cur     = None
+                matches = find_matches(view, term, is_regex) if term and not large_file else []
 
         elif ch == ord('d'):
             if large_file:
-                h, w = stdscr.getmaxyx()
-                stdscr.addstr(h - 2, 0, "Dedup not available in large file mode  (press any key)"[:w-1],
-                              curses.color_pair(_P_STAT))
-                stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
+                msg = "Dedup not available in large file mode"
             else:
                 dedup_on = not dedup_on
                 view    = get_view()
@@ -1149,20 +1392,14 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
 
         elif ch == ord('e'):
             if large_file:
-                h, w = stdscr.getmaxyx()
-                stdscr.addstr(h - 2, 0, "Export not available in large file mode  (press any key)"[:w-1],
-                              curses.color_pair(_P_STAT))
-                stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
+                msg = "Export not available in large file mode"
             else:
                 export = 'logview_filtered_export.txt'
                 try:
                     Path(export).write_text('\n'.join(t for t, _ in view))
-                    msg = f"Exported {len(view)} lines to {export}  (press any key)"
+                    msg = f"Exported {len(view)} lines to {export}"
                 except OSError as e:
-                    msg = f"Export failed: {e}  (press any key)"
-                h, w = stdscr.getmaxyx()
-                stdscr.addstr(h - 2, 0, msg[:w-1], curses.color_pair(_P_STAT))
-                stdscr.clrtoeol(); stdscr.refresh(); stdscr.getch()
+                    msg = f"Export failed: {e}"
 
         elif ch == ord('h'):
             hidden_cols += 1
@@ -1171,22 +1408,19 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
             hidden_cols = max(0, hidden_cols - 1)
 
         elif ch == ord('c'):
-            if large_file:
-                term = filt = cur = None
-                is_regex = False
-                matches  = []
-                offset   = 0
-            else:
-                filtered = lines[:]
-                filt = term = cur = None
-                is_regex = dedup_on = False
-                matches = []; offset = 0
-                view = get_view()
+            filtered = lines if large_file else lines[:]
+            filt_idx = filt = term = cur = None
+            is_regex = dedup_on = False
+            matches  = []
+            offset   = hoff = 0
+            view     = get_view()
+            msg      = "Search and filter cleared"
 
         elif ch == ord('q'):
             break
 
-        offset = max(0, min(offset, max(0, len(view) - page)))
+        last   = _fit_back(len(view), rows, cells, width, wrap) if len(view) else 0
+        offset = max(0, min(offset, last))
 
     if col_hidden is not None and file_base:
         col_hidden[file_base] = hidden_cols
@@ -1194,12 +1428,13 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
 
 # ── Run modes ─────────────────────────────────────────────────────────────────
 
-def piped_mode(vendors, mac_map, ctr):
+def piped_mode(vendors, mac_map, ctr, prefs=None):
     corr = LiveCorrelator(mac_map, ctr)
+    emit = _Output(prefs if prefs is not None else {})
     try:
         for line in sys.stdin:
             line = line.rstrip('\n')
-            print(render_live(line, line, corr, vendors, mac_map, ctr))
+            emit(render_live(line, line, corr, vendors, mac_map, ctr))
     finally:
         save_color_map(COLOR_FILE, mac_map, ctr[0])
 
@@ -1254,9 +1489,11 @@ def _read_new_lines(log_file, state):
 
 
 def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
-              col_hidden=None, file_base=None, egrep_pat=None):
+              col_hidden=None, file_base=None, egrep_pat=None, prefs=None):
     hidden_cols = (col_hidden or {}).get(file_base or '', 0)
     corr        = LiveCorrelator(mac_map, ctr)
+    prefs       = prefs if prefs is not None else {}
+    emit        = _Output(prefs)
 
     egrep_re = None
     if egrep_pat:
@@ -1273,7 +1510,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
             all_lines = [l for l in all_lines if egrep_re.search(l)]
         for line in all_lines[-tail_lines_count:]:
             out = _strip_cols(line, hidden_cols) if hidden_cols else line
-            print(render_live(line, out, corr, vendors, mac_map, ctr))
+            emit(render_live(line, out, corr, vendors, mac_map, ctr))
         save_color_map(COLOR_FILE, mac_map, ctr[0])
         return   # can't follow a compressed file
 
@@ -1282,7 +1519,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
         tail_lines = [l for l in tail_lines if egrep_re.search(l)]
     for line in tail_lines:
         out = _strip_cols(line, hidden_cols) if hidden_cols else line
-        print(render_live(line, out, corr, vendors, mac_map, ctr))
+        emit(render_live(line, out, corr, vendors, mac_map, ctr))
 
     st          = log_file.stat()
     state       = {'size': st.st_size, 'ino': st.st_ino}
@@ -1312,7 +1549,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                     if alert_re and alert_re.search(line):
                         sys.stdout.write('\a')
                         colored = _prefix_last_line(colored, _a('▶ ', '1;31'))
-                    print(colored, flush=True)
+                    emit(colored, flush=True)
                 time.sleep(0.2)
         except KeyboardInterrupt:
             pass
@@ -1320,7 +1557,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
             save_color_map(COLOR_FILE, mac_map, ctr[0])
         return
 
-    # Raw-input mode: Space=pause, h=hide col, u=unhide col, q=quit
+    # Raw-input mode: Space=pause, h=hide col, u=unhide col, l=wrap, q=quit
     old = termios.tcgetattr(sys.stdin)
     new = termios.tcgetattr(sys.stdin)
     new[3] &= ~(termios.ICANON | termios.ECHO)
@@ -1343,6 +1580,12 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                 elif ch in ('u', 'U'):
                     hidden_cols = max(0, hidden_cols - 1)
                     label = f'COLS HIDDEN: {hidden_cols}' if hidden_cols else 'All cols shown'
+                    sys.stdout.write(f'\r\033[0;33m[{label}]\033[0m\r\n')
+                    sys.stdout.flush()
+                elif ch in ('l', 'L'):
+                    prefs['wrap'] = not prefs.get('wrap', True)
+                    label = 'Wrapping long lines' if prefs['wrap'] else \
+                            'Not wrapping: long lines cut at the screen edge'
                     sys.stdout.write(f'\r\033[0;33m[{label}]\033[0m\r\n')
                     sys.stdout.flush()
                 elif ch in ('q', 'Q', '\x03', '\x04'):
@@ -1369,7 +1612,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                 if alert_re and alert_re.search(line):
                     sys.stdout.write('\a')
                     colored = _prefix_last_line(colored, _a('▶ ', '1;31'))
-                print(colored, flush=True)
+                emit(colored, flush=True)
 
     except KeyboardInterrupt:
         pass
@@ -1396,7 +1639,8 @@ def _decompress_gz(src):
     return Path(tf.name)
 
 
-def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, file_base=None):
+def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, file_base=None,
+                     prefs=None):
     # Decompress any .gz files to temp files first
     temps   = []   # temp paths to delete on exit
     actual  = []   # (real_path, display_path) pairs
@@ -1415,7 +1659,8 @@ def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=No
         if len(real_files) == 1 and total_size > LARGE_FILE_THRESHOLD:
             lf = LargeFile(real_files[0])
             try:
-                curses.wrapper(_tui, lf, vendors, mac_map, ctr, alert_pat, col_hidden, file_base)
+                curses.wrapper(_tui, lf, vendors, mac_map, ctr, alert_pat, col_hidden, file_base,
+                               prefs)
             finally:
                 lf.close()
         else:
@@ -1424,7 +1669,8 @@ def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=No
                 if len(actual) > 1:
                     all_lines.append(f'{"─"*4} {disp} {"─"*4}')
                 all_lines.extend(real.read_text(errors='replace').splitlines())
-            curses.wrapper(_tui, all_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base)
+            curses.wrapper(_tui, all_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base,
+                           prefs)
     finally:
         for tmp in temps:
             try:
@@ -5033,6 +5279,12 @@ def build_arg_parser():
                     help='Bell + highlight new lines matching this regex in follow mode')
     p.add_argument('--setup-geoip', dest='setup_geoip', action='store_true',
                     help='Configure (or reconfigure) MaxMind GeoIP credentials, then exit')
+    w = p.add_mutually_exclusive_group()
+    w.add_argument('--wrap', dest='wrap', action='store_true', default=None,
+                   help='Wrap long lines, indenting the continuation rows (default; '
+                        'press l in the viewer or follow mode to toggle, and it is remembered)')
+    w.add_argument('--no-wrap', dest='wrap', action='store_false',
+                   help='Cut long lines at the screen edge instead (←/→ scroll in the viewer)')
     a = p.add_argument_group(
         'analysis', 'For wireless, switch, router, firewall and NAC logs from the vendors listed '
                     'by --formats (Cisco, Aruba/HPE, Juniper, Ruckus, Fortinet, Palo Alto, '
@@ -5131,8 +5383,7 @@ def parse_args(argv=None):
 def main():
     global _GEO_READER, RULES
     opts = parse_cli()
-    follow, tail_lines, log_files = opts.follow, opts.tail_lines, opts.log_files
-    alert_pat, egrep_pat, setup_geoip = opts.alert_pat, opts.egrep_pat, opts.setup_geoip
+    log_files, setup_geoip = opts.log_files, opts.setup_geoip
     RULES = Rules(loop_threshold=opts.loop_threshold, loop_window=opts.loop_window,
                   legacy_ssid=opts.legacy_ssid, low_rssi=opts.low_rssi, top=opts.top,
                   flap_threshold=opts.flap_threshold, flap_window=opts.flap_window,
@@ -5169,8 +5420,22 @@ def main():
         print("GeoIP: install 'maxminddb' for IP location lookup  (pip install maxminddb)",
               file=sys.stderr)
 
+    prefs = {'wrap': opts.wrap if opts.wrap is not None else cfg.get('wrap', True)}
+    start = dict(prefs)
+    try:
+        _run_view_mode(opts, prefs, vendors, mac_map, ctr, col_hidden)
+    finally:
+        if prefs != start:                     # toggled with l: remember it
+            cfg = load_config()
+            cfg.update(prefs)
+            save_config(cfg)
+
+
+def _run_view_mode(opts, prefs, vendors, mac_map, ctr, col_hidden):
+    follow, tail_lines, log_files = opts.follow, opts.tail_lines, opts.log_files
+    alert_pat, egrep_pat = opts.alert_pat, opts.egrep_pat
     if not sys.stdin.isatty():
-        piped_mode(vendors, mac_map, ctr)
+        piped_mode(vendors, mac_map, ctr, prefs)
     elif follow:
         if not log_files:
             sys.exit('Usage: netlog -f [-n N] [--alert PATTERN] ["egrep_pattern"] <file>')
@@ -5178,13 +5443,15 @@ def main():
         if not lf.exists():
             sys.exit(f"File not found: {lf}")
         file_base = _file_base(lf)
-        tail_mode(lf, tail_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base, egrep_pat)
+        tail_mode(lf, tail_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base, egrep_pat,
+                  prefs)
     elif log_files:
         missing = [f for f in log_files if not f.exists()]
         if missing:
             sys.exit(f"File not found: {missing[0]}")
         file_base = _file_base(log_files[0])
-        interactive_mode(log_files, vendors, mac_map, ctr, alert_pat, col_hidden, file_base)
+        interactive_mode(log_files, vendors, mac_map, ctr, alert_pat, col_hidden, file_base,
+                         prefs)
     else:
         print('Usage: netlog [-f] [-n N] [--alert PATTERN] ["egrep_pattern"] <file> [file2 ...]',
               file=sys.stderr)

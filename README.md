@@ -98,6 +98,7 @@ cat file.log | netlog                       Piped/ANSI mode
 netlog --summary <file> [file2 ...]         Health summary of structured events
 netlog --client <MAC|user> <file> ...       Timeline for one client or user
 netlog --formats                            List recognised vendor log formats
+netlog --no-wrap <file>                     Cut long lines instead of wrapping (--wrap to force on)
 netlog --setup-geoip                        Configure (or reconfigure) MaxMind GeoIP
 netlog --version                            Print version and exit
 netlog --help                               Full option reference
@@ -126,7 +127,9 @@ netlog /var/log/firewall.log.10.gz
 | `r` | Search (regex) |
 | `n` `p` | Next / previous match, wrapping round the ends (also in large-file mode) |
 | `Esc` | Cancel a search or filter prompt |
-| `f` | Filter lines (plain or `r:regex`) |
+| `f` | Filter lines (see below); empty input removes the filter. Works in large-file mode too |
+| `l` | Toggle wrapping of long lines (remembered between runs) |
+| `←` `→` `Home` | Scroll sideways when not wrapping |
 | `d` | Toggle consecutive-duplicate dedup |
 | `#` | Toggle line numbers |
 | `h` `u` | Hide / unhide leftmost column |
@@ -134,6 +137,10 @@ netlog /var/log/firewall.log.10.gz
 | `e` | Export current view to file |
 | `c` | Clear all filters and search |
 | `q` | Quit |
+
+Filter syntax: plain text is case-insensitive; `deny|drop` keeps lines containing any of the terms; `!text` keeps lines that do *not* match (`!kernel|dhcp` hides both); `r:REGEX` is a case-insensitive regex (`!r:REGEX` to exclude). The status bar shows how many lines matched; if none do, the filter isn't applied.
+
+Wrapped lines continue on the following rows indented four columns past the start of the text, breaking between words where possible. With wrapping off, long lines are cut at the screen edge and `←`/`→` scroll sideways; the event glyph stays in place.
 
 Matches are highlighted in yellow (even inside IPs, MACs and other colored tokens), the current match in cyan, and the status bar shows `match 3/17` or `No matches`.
 
@@ -411,6 +418,7 @@ netlog -f --alert "DENY" /var/log/firewall.log
 - Displays the last 10 lines (configurable with `-n N`) then streams new lines as they arrive
 - An optional egrep-style filter pattern (extended regex, in quotes) placed **before the filename** limits output to matching lines only — both the initial tail and the live stream are filtered; a `[filter: ...]` header is printed at startup
 - `Space` pauses/resumes the stream
+- `l` toggles wrapping of long lines: wrapped rows are indented, or with wrapping off lines are cut at the screen edge
 - `q` quits
 - `--alert PATTERN` triggers a terminal bell and highlights matching lines with `▶` when the pattern matches a new line
 - `.gz` files are decompressed and displayed, then exit (compressed files cannot be followed)
@@ -426,7 +434,7 @@ journalctl -f | netlog
 ssh host 'tail -f /var/log/auth.log' | netlog
 ```
 
-All ANSI highlighting — including event glyphs — is applied to stdout. Color map is updated and saved on exit.
+All ANSI highlighting — including event glyphs — is applied to stdout. When stdout is a terminal, long lines are wrapped with indented continuation rows (or cut with `--no-wrap`); output redirected to a file or another program is left unwrapped. Color map is updated and saved on exit.
 
 ---
 

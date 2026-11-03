@@ -614,6 +614,109 @@ class LiveTrackerTest(unittest.TestCase):
         self.assertTrue(any('INTERFACE FLAPPING' in b for b in banners), banners)
 
 
+
+class LineFilterTest(unittest.TestCase):
+    LINES = ['deny tcp 22', 'DROP udp 53', 'accept tcp 443', 'kernel: foo']
+
+    def _keep(self, spec):
+        f = netlog.make_line_filter(spec)
+        return [l for l in self.LINES if f(l)]
+
+    def test_plain_is_case_insensitive(self):
+        self.assertEqual(self._keep('drop'), ['DROP udp 53'])
+
+    def test_alternatives(self):
+        self.assertEqual(self._keep('deny|drop'), ['deny tcp 22', 'DROP udp 53'])
+        self.assertEqual(self._keep('deny | drop'), ['deny tcp 22', 'DROP udp 53'])
+
+    def test_exclude(self):
+        self.assertEqual(self._keep('!kernel'), self.LINES[:3])
+        self.assertEqual(self._keep('!deny|drop'), ['accept tcp 443', 'kernel: foo'])
+
+    def test_regex(self):
+        self.assertEqual(self._keep(r'r:^\w+ tcp'), ['deny tcp 22', 'accept tcp 443'])
+        self.assertEqual(self._keep(r'!r:tcp'), ['DROP udp 53', 'kernel: foo'])
+
+    def test_bad_specs_raise(self):
+        with self.assertRaises(netlog.re.error):
+            netlog.make_line_filter('r:(')
+        with self.assertRaises(ValueError):
+            netlog.make_line_filter('|')
+
+
+class WrapLayoutTest(unittest.TestCase):
+    PREFIX = [('✗ ', 0)]
+
+    def _rows(self, chunks, width, wrap=True, hoff=0, max_rows=None):
+        placed, used = netlog._layout(self.PREFIX, chunks, width, wrap, hoff, max_rows)
+        rows = [''] * used
+        for r, x, t, _a in placed:
+            rows[r] = rows[r].ljust(x) + t
+        return rows
+
+    def test_short_line_is_one_row(self):
+        self.assertEqual(self._rows([('hello world', 0)], 40), ['✗ hello world'])
+
+    def test_wrap_indents_continuation_rows_at_word_boundaries(self):
+        rows = self._rows([('alpha beta gamma delta epsilon zeta', 0)], 21)
+        self.assertEqual(rows[0].rstrip(), '✗ alpha beta gamma')
+        indent = ' ' * (2 + netlog.WRAP_INDENT)
+        for r in rows[1:]:
+            self.assertTrue(r.startswith(indent) and r[len(indent)] != ' ', r)
+        self.assertEqual(' '.join(r.strip(' ✗') for r in rows),
+                         'alpha beta gamma delta epsilon zeta')
+
+    def test_long_word_is_split(self):
+        rows = self._rows([('x' * 50, 0)], 21)
+        self.assertEqual(''.join(r.strip(' ✗') for r in rows), 'x' * 50)
+        self.assertTrue(all(len(r) <= 20 for r in rows))
+
+    def test_no_wrap_cuts_and_pans(self):
+        self.assertEqual(self._rows([('0123456789abcdefghij', 0)], 11, wrap=False),
+                         ['✗ 01234567'])
+        self.assertEqual(self._rows([('0123', 0), ('456789abcdefghij', 1)], 11,
+                                    wrap=False, hoff=6), ['✗ 6789abcd'])
+
+    def test_max_rows_limits_output(self):
+        self.assertEqual(len(self._rows([('word ' * 40, 0)], 21, max_rows=2)), 2)
+
+
+class FitAnsiTest(unittest.TestCase):
+    @staticmethod
+    def _plain(s):
+        return netlog.re.sub(r'\x1b\[[0-9;]*m', '', s)
+
+    def test_short_lines_untouched(self):
+        self.assertEqual(netlog.fit_ansi('\x1b[1;31m✗ \x1b[0mshort', 80), '\x1b[1;31m✗ \x1b[0mshort')
+
+    def test_wrap_with_indent_and_colors(self):
+        line = '✗ ' + 'word ' * 6 + '\x1b[0;32m10.0.0.1\x1b[0m end'
+        out  = netlog.fit_ansi(line, 24)
+        rows = self._plain(out).split('\n')
+        self.assertTrue(all(len(r) <= 24 for r in rows), rows)
+        self.assertTrue(all(r.startswith(' ' * 6) for r in rows[1:]), rows)
+        self.assertIn('10.0.0.1', self._plain(out).replace('\n', ''))
+
+    def test_color_carried_onto_continuation(self):
+        out = netlog.fit_ansi('ab \x1b[0;32m' + 'g' * 30 + '\x1b[0m', 24)
+        first, second = out.split('\n')
+        self.assertTrue(first.endswith('\x1b[0m'))
+        self.assertIn('\x1b[0;32m', second)
+
+    def test_no_wrap_cuts(self):
+        out = netlog.fit_ansi('✗ ' + 'x' * 100, 30, wrap=False)
+        self.assertEqual(len(self._plain(out)), 30)
+        self.assertNotIn('\n', out)
+
+
+class LargeFileViewTest(unittest.TestCase):
+    def test_index_view(self):
+        v = netlog.LargeFileView(['a', 'b', 'c', 'd'], netlog.array.array('Q', [1, 3]))
+        self.assertEqual(len(v), 2)
+        self.assertEqual(v[1], ('d', 1))
+        self.assertEqual(list(v), [('b', 1), ('d', 1)])
+        self.assertEqual(netlog.next_match(v, 'D', False, 0), (1, False))
+
 class AnalysisCliTest(unittest.TestCase):
     def test_analysis_options(self):
         ns = netlog.parse_cli(['--summary', '--client', 'alice', '--loop-window', '5m',
@@ -639,6 +742,13 @@ class AnalysisCliTest(unittest.TestCase):
                     'scan_ports', 'scan_hosts', 'scan_window'):
             with self.subTest(opt=opt):
                 self.assertEqual(getattr(ns, opt), getattr(r, opt))
+
+    def test_wrap_flags(self):
+        self.assertIsNone(netlog.parse_cli(['x.log']).wrap)
+        self.assertTrue(netlog.parse_cli(['--wrap', 'x.log']).wrap)
+        self.assertFalse(netlog.parse_cli(['--no-wrap', 'x.log']).wrap)
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            netlog.parse_cli(['--wrap', '--no-wrap', 'x.log'])
 
     def test_formats_flag(self):
         self.assertTrue(netlog.parse_cli(['--formats']).formats)
