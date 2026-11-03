@@ -69,7 +69,7 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 ### Run in place
 
 ```bash
-git clone <repo>
+gh repo clone supertechguy/netlog   # or: git clone https://github.com/supertechguy/netlog.git
 cd netlog
 chmod +x netlog
 ./netlog <file>
@@ -78,7 +78,7 @@ chmod +x netlog
 ### Install so it runs from anywhere
 
 ```bash
-git clone <repo>
+gh repo clone supertechguy/netlog   # or: git clone https://github.com/supertechguy/netlog.git
 cd netlog
 ./install.sh              # asks: user install or system install
 ./install.sh --user       # installs to ~/.local/bin/netlog (just you, no sudo)
