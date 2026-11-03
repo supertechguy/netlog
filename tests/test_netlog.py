@@ -406,7 +406,8 @@ class FormatTest(unittest.TestCase):
     def test_summary_sections(self):
         text = netlog.format_summary(_report(self.LINES), {}, color=False)
         for heading in ('Failures by event type', 'Top failing clients', 'Top failing users',
-                        'Access points by failure rate', 'Failure loops', 'Identity inconsistencies'):
+                        'Access points by failure rate', 'Findings', 'Wireless failure loop',
+                        'Identity inconsistency'):
             self.assertIn(heading, text)
         self.assertNotIn('\033[', text)
 
@@ -592,6 +593,126 @@ class NetworkFindingsTest(unittest.TestCase):
                         'AUTHENTICATION & ADMINISTRATION', 'Devices'):
             self.assertIn(heading, text)
 
+
+
+def _hms(sec):
+    h, r = divmod(int(sec), 3600)
+    m, s = divmod(r, 60)
+    return f'May  1 {h:02d}:{m:02d}:{s:02d}'
+
+
+def _ufw(src, dst, dpt, action='ALLOW', t=8 * 3600):
+    return (f'{_hms(t)} fw1 kernel: [UFW {action}] IN=eth0 OUT=eth1 SRC={src} DST={dst} '
+            f'LEN=60 PROTO=TCP SPT=51515 DPT={dpt}')
+
+
+class AlertsTest(unittest.TestCase):
+    def setUp(self):
+        netlog.parse_event.cache_clear()
+
+    @staticmethod
+    def _alerts(lines, **rules):
+        return netlog.collect_alerts(_report(lines, **rules))
+
+    def _titles(self, lines, **rules):
+        return {(a.title, a.subject): a for a in self._alerts(lines, **rules)}
+
+    def test_password_spraying_and_distributed_attack(self):
+        lines = [f'{_hms(9 * 3600 + i)} srv1 sshd[1]: Failed password for invalid user {u} '
+                 f'from 198.51.100.50 port 5000 ssh2'
+                 for i, u in enumerate(['a', 'b', 'c', 'd', 'e', 'f'])]
+        lines += [f'{_hms(9 * 3600 + 100 + i * 60)} srv1 sshd[1]: Failed password for root '
+                  f'from 203.0.113.{i} port 5000 ssh2' for i in range(5)]
+        got = self._titles(lines)
+        self.assertIn(('Password spraying', '198.51.100.50'), got)
+        self.assertIn(('Distributed login attack', 'account root'), got)
+
+    def test_sshd_success_after_brute_force_is_critical(self):
+        lines = [f'{_hms(9 * 3600 + i)} srv1 sshd[1]: Failed password for root from '
+                 f'198.51.100.9 port 5000 ssh2' for i in range(6)]
+        lines.append(f'{_hms(9 * 3600 + 20)} srv1 sshd[1]: Accepted password for root from '
+                     f'198.51.100.9 port 5000 ssh2')
+        a = self._titles(lines)[('Login succeeded after brute force', '198.51.100.9')]
+        self.assertEqual(netlog.LEVELS[a.level], 'critical')
+
+    def test_firewall_exposure(self):
+        lines  = [_ufw(f'185.220.101.{i}', '10.0.0.20', 3389) for i in range(3)]
+        lines += [_ufw('10.0.0.66', f'45.33.{i}.7', 445, 'BLOCK') for i in range(4)]
+        lines += [_ufw('10.0.0.77', f'64.{i}.10.25', 25) for i in range(12)]
+        lines += [_ufw('203.0.113.5', '10.0.0.20', 3389)]     # documentation range: public
+        got = self._titles(lines)
+        a = got[('Risky service allowed from internet', '10.0.0.20:3389 (RDP)')]
+        self.assertEqual(a.level, 0)
+        self.assertIn('4 internet sources', a.detail)
+        self.assertIn(('Internal host using risky service on internet', '10.0.0.66'), got)
+        self.assertIn(('Possible spam bot', '10.0.0.77'), got)
+
+    def test_ip_scope(self):
+        self.assertEqual(netlog.ip_scope('10.1.2.3'), 'private')
+        self.assertEqual(netlog.ip_scope('100.64.0.1'), 'private')
+        self.assertEqual(netlog.ip_scope('203.0.113.5'), 'public')
+        self.assertEqual(netlog.ip_scope('8.8.8.8'), 'public')
+        self.assertEqual(netlog.ip_scope('fe80::1'), 'private')
+        self.assertIsNone(netlog.ip_scope('not-an-ip'))
+
+    def test_text_detectors(self):
+        cases = {
+            'dhcpd[4]: DHCPDISCOVER from aa:bb:cc:00:11:22 via eth1: no free leases': 'dhcp',
+            'kernel: nf_conntrack: table full, dropping packet': 'table',
+            'kernel: Out of memory: Killed process 42 (java)': 'memory',
+            'kernel: arp: 10.0.0.1 moved from aa:bb:cc:dd:ee:01 to 11:22:33:44:55:66': 'arp',
+            'wlc: Rogue AP detected on channel 6': 'rogue',
+            'nginx[3]: segfault at 0 ip 00007f error 4': 'crash',
+            'postgres[1]: could not write: No space left on device': 'disk',
+            'nginx[3]: SSL_do_handshake() failed: certificate has expired': 'cert',
+            'ntpd[3]: no servers can be used, system clock unsynchronized': 'ntp',
+            'charon: IKE_SA t1 negotiation failed: no proposal chosen': 'vpntext',
+            'kernel: IPv4: martian source 10.0.0.1 from 1.2.3.4': 'spoof',
+            'sw1: Broadcast storm detected on port 3': 'storm',
+            'systemd[1]: Started Session 4 of user root.': None,
+            'dnsmasq[7]: query[A] example.com from 10.0.0.5': None,
+        }
+        for text, want in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(netlog.text_issue(text), want)
+
+    def test_text_issue_becomes_alert(self):
+        got = self._titles([f'{_hms(8 * 3600)} gw kernel: nf_conntrack: table full, dropping packet'])
+        self.assertIn(('Session / conntrack table full', 'gw'), got)
+
+    def test_error_spike(self):
+        lines = [f'{_hms(8 * 3600 + i * 60)} sw1 %SYS-6-LOGGINGHOST_STARTSTOP: Logging to host'
+                 f' 10.0.0.1 started' for i in range(120)]
+        lines += [f'{_hms(9 * 3600 + i * 5)} sw1 %LINK-3-UPDOWN: Interface Gi1/0/{i % 40 + 1},'
+                  f' changed state to down' for i in range(60)]
+        lines.sort(key=lambda l: l[:15])
+        spikes = [a for a in self._alerts(lines) if a.title == 'Spike in errors / warnings']
+        self.assertEqual(len(spikes), 1)
+        self.assertIn('09:00:00', spikes[0].subject)
+
+    def test_device_stopped_logging_and_clock_mismatch(self):
+        lines = []
+        for i in range(0, 4 * 3600, 60):
+            lines.append(f'{_hms(8 * 3600 + i)} sw1 %SYS-6-LOGGINGHOST_STARTSTOP: Logging started')
+            if i < 3600:
+                lines.append(f'{_hms(8 * 3600 + i)} sw2 %SYS-6-LOGGINGHOST_STARTSTOP: Logging started')
+        lines += [f'date=2020-05-01 time=08:{i:02d}:00 devname="FGT9" logid="0000000013" '
+                  f'type="traffic" subtype="forward" level="notice" srcip=10.0.0.5 dstip=10.0.0.6 '
+                  f'dstport=80 proto=6 action="accept"' for i in range(25)]
+        got = self._titles(lines)
+        self.assertIn(('Device stopped logging', 'sw2'), got)
+        self.assertNotIn(('Device stopped logging', 'sw1'), got)
+        self.assertIn(('Device clock / timestamp mismatch', 'FGT9'), got)
+
+    def test_critical_syslog_message(self):
+        got = self._titles(['<10>May  1 08:00:00 gw foo: something terrible happened'])
+        self.assertTrue(any(t == 'Critical message' for t, _ in got), got)
+
+    def test_quiet_log_has_no_findings(self):
+        lines = [_ufw(f'10.0.0.{i}', '1.1.1.1', 53) for i in range(30)]
+        self.assertEqual(self._alerts(lines), [])
+        text = netlog.format_summary(_report(lines), {}, color=False)
+        self.assertIn('No problems detected', text)
 
 class LiveTrackerTest(unittest.TestCase):
     def setUp(self):

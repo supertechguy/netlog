@@ -1,6 +1,6 @@
 # netlog
 
-A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. It recognises the log formats of 27 vendor platforms (Cisco, Juniper, Aruba, Ruckus, Fortinet, Palo Alto, UniFi, Meraki, MikroTik, pfSense and more) across wireless, switching, routing and firewalls, plus any `key="value"` log. It correlates events per client, user, AP, interface and source IP to find failure loops, flapping links, login attacks, port scans and other problems, and produces health summaries and per-client timelines. No external dependencies beyond the Python standard library.
+A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. It recognises the log formats of 28 vendor platforms (Cisco, Juniper, Aruba, Ruckus, Fortinet, Palo Alto, UniFi, Meraki, MikroTik, pfSense and more) across wireless, switching, routing and firewalls, plus any `key="value"` log. It correlates events per client, user, AP, interface and source IP to find failure loops, flapping links, login attacks, port scans and other problems, and produces health summaries and per-client timelines. No external dependencies beyond the Python standard library.
 
 ---
 
@@ -16,11 +16,12 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 - **Follow mode** — `tail -f`-style real-time monitoring with optional egrep filter and audio/visual alerts
 - **Piped input** — `cat file.log | netlog` works; all highlighting applies
 - **Structured log analysis** — parses `key="value"` fields (`clientMac=`, `userName=`, `apName=`, `apLocation=`, `ssid=`, `rssi=`, …), classifies events as error / warning / success, and tracks each client's session lifecycle
-- **Health summary (`--summary`)** — top failing clients and users, AP and location failure rates against the overall baseline, failure counts by event type, and an anomaly list
+- **Health summary (`--summary`)** — a ranked list of findings (critical → low), then per-domain statistics: wireless clients/APs/locations, switching and routing, firewall traffic, authentication and infrastructure
+- **Security and error analytics** — brute force, password spraying, success after failures, port/host scans, risky services exposed to the internet, internal hosts reaching risky services, error spikes, noisy or silent devices, and 23 text detectors (DHCP exhaustion, ARP spoofing, rogue APs, IP conflicts, storms, crashes, memory/disk exhaustion, conntrack full, certificate, VPN and NTP failures, …) that work on any log line
 - **Client timeline (`--client`)** — a clean chronological narrative for one MAC or username, with its session path and findings
 - **Failure-loop detection** — flags clients with N+ failures inside a rolling window, and groups those lines visually (banner + colored side bar) in the timeline, piped and follow modes
 - **Diagnostic rules** — legacy SSID use, inconsistent username formats on one device, rapid roaming, low RSSI, and AP/location failure hotspots
-- **Vendor format detection** — 27 wireless, switch, router, firewall and NAC log formats are detected per line and normalised to common fields and event kinds (`netlog --formats` lists them)
+- **Vendor format detection** — 28 wireless, switch, router, firewall and NAC log formats are detected per line and normalised to common fields and event kinds (`netlog --formats` lists them)
 - **Network and security findings** — interface flapping, err-disabled ports, MAC flapping and loops, routing neighbor loss, login brute force (and success after failures), port and host scans, VPN, failover, hardware and service events
 
 ---
@@ -133,7 +134,7 @@ netlog /var/log/firewall.log.10.gz
 | `d` | Toggle consecutive-duplicate dedup |
 | `#` | Toggle line numbers |
 | `h` `u` | Hide / unhide leftmost column |
-| `x` | Show statistics popup |
+| `x` | Analytics popup: ranked findings and statistics for the current view |
 | `e` | Export current view to file |
 | `c` | Clear all filters and search |
 | `q` | Quit |
@@ -192,15 +193,16 @@ The event-type glyph is always detected from the full original line, so the indi
 
 ---
 
-## Statistics
+## Analytics
 
-Press `x` to open the statistics popup. On large files a progress bar shows the scan progress. The popup reports:
+Press `x` to open the analytics popup for the current view, so after filtering (`f`) it covers only the filtered lines. It's the same report as `--summary` (see [Findings](#findings)), followed by counts that are useful for any log:
 
-- Top IPv4 addresses (by occurrence)
-- Top IPv6 addresses
-- Top MAC addresses with vendor name
-- Top ports with well-known service names
-- Severity level counts (EMERG through DEBUG)
+- Top sending hosts and programs / message tags
+- Top IPv4, IPv6 and MAC addresses (with vendor)
+- Top destination / service ports (named port fields, or a port right after an IP; source ports and timestamps aren't counted)
+- Syslog severity words
+
+Scroll with `↑`/`↓`, `PgUp`/`PgDn`, `g`/`G`; pan with `←`/`→`; close with `q` or `Esc`. A progress bar shows on larger views (`Esc` cancels; a 300,000-line view takes about 30 s), and the result is cached until the view changes.
 
 ---
 
@@ -305,6 +307,7 @@ Each line is checked against the vendor formats below (most specific first, with
 | HPE Comware / Huawei | FlexNetwork (H3C), VRP | switch, router | `MODULE/SEV/MNEMONIC:` | lower |
 | Netgate / Deciso | pfSense / OPNsense | firewall | `filterlog:` CSV | well known |
 | Linux | iptables / nftables / UFW, UniFi & EdgeOS gateways | firewall | `IN= OUT= SRC= DST= PROTO=` | well known |
+| Linux / BSD | OpenSSH sshd, sudo, PAM | server | `sshd: Failed password … from IP`, `Accepted …`, `sudo: … incorrect password attempts` | well known |
 | Ubiquiti | UniFi AP station tracker | wifi | `stahtd … STA-TRACKER` JSON | documented |
 | hostapd | UniFi, OpenWrt and other Linux APs | wifi | `hostapd: <iface>: STA <mac> …` | well known |
 | MikroTik | RouterOS | router, firewall, wifi | comma topics with a level (`system,error,critical`) | lower |
@@ -369,7 +372,20 @@ A report with a header (counts, time span, sources by format, severity totals, a
 - **Authentication & administration** — login failures by source and account, successful logins after failures, config changes
 - **Infrastructure** — AP up/down, reboots, failover, hardware, PoE and service events
 
-It ends with the anomaly list across all sections. `--top N` sets the rows per section. Firewall allow/deny lines are aggregated rather than stored, so large firewall logs use little memory.
+It starts with the ranked **Findings** list (below). `--top N` sets the rows per section and per kind of finding. Firewall allow/deny lines are aggregated rather than stored, so large firewall logs use little memory.
+
+### Findings
+
+Every detector's results, most serious first, up to `--top` rows per kind (`… and N more` for the rest):
+
+| Level | Findings |
+|-------|----------|
+| Critical | Successful login from a source after a brute-force run · risky service (RDP, SMB, Telnet, databases, VNC, WinRM, SNMP, …) allowed in from an internet address · emergency/alert syslog messages · malware / intrusion text |
+| High | Login attack (brute force) · password spraying (one source, 5+ accounts) · distributed login attack (one account, 5+ sources) · port scan / host sweep from an internal host · internal host reaching risky services on the internet · spike in errors/warnings (5-minute bucket ≥ 20 and ≥ 5× the median) · interface flapping · err-disabled port · layer-2 loop / MAC flap · routing neighbor down · threat signatures · VPN tunnel / server / AP down · hardware faults · critical syslog messages · DoS/flood, ARP spoofing, IP conflict, rogue AP/DHCP, wireless attack, DHCP pool exhausted, broadcast storm, conntrack/session table full, memory exhaustion, crash/panic, disk full, AAA/RADIUS unreachable |
+| Medium | Port scan / host sweep from the internet · possible spam bot (SMTP to 10+ mail servers) · device with a high error rate (≥ 30%) · high overall error rate (≥ 25%) · device stopped logging · spanning-tree instability · interface errors · port-security violations · failover · reboots · wireless failure loops · AP / location failure hotspots · VPN/IPsec, high CPU, certificate/TLS, spoofed/martian packets |
+| Low | Legacy SSID · identity inconsistency · rapid roaming · low signal · PoE faults · device clock / timestamp mismatch · NTP problems |
+
+Internal means RFC 1918, CGNAT (100.64/10), loopback, link-local and IPv6 ULA addresses; anything else is treated as the internet. The text detectors run on lines that no format classified, so a recognised event isn't reported twice; they look for a few keywords first, so they add little time.
 
 ### `--client`
 

@@ -41,7 +41,7 @@ try:
 except ImportError:
     HAS_GEOIP = False
 
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # bytes — above this, use mmap index
 
@@ -870,6 +870,110 @@ def collect_stats(view, vendors, progress_cb=None):
             progress_cb(i, total)
     return ip4, ip6, macs, ports, sevs
 
+class StatsCancelled(Exception):
+    pass
+
+
+# Destination/service ports for statistics: named fields (source-port
+# fields are left out) or a port straight after an IPv4 address.
+_STAT_PORT_RE = re.compile(
+    r'\b(?:dst_?port|dest_?port|d_?port|dpt|port)\s*[=: ]\s*"?(\d{1,5})\b'
+    r'|[:/](\d{1,5})(?![\d.])', re.I)
+
+# Program/tag after the syslog host: "dnsmasq[123]:", "kernel:", "%LINK-3-UPDOWN:".
+_PROG_RE = re.compile(r'\s*%?([A-Za-z][\w./-]{0,39}?)(?:\[\d+\])?:(?:\s|$)')
+
+
+def build_stats(view, vendors, progress_cb=None, color=True, label=''):
+    """Statistics for a TUI view as a list of (ANSI-colored) text lines.
+
+    One pass feeds the structured analyzer, whose summary adapts to the log
+    types found (wireless, switching/routing, firewall, authentication,
+    infrastructure), and also counts raw tokens: sending hosts, programs,
+    IPs, MACs, ports and syslog severity words, which are useful for any log.
+    `progress_cb(done, total)` may raise StatsCancelled."""
+    an    = Analyzer(keep_raw=False)
+    ip4, ip6, macs, ports, sevs = Counter(), Counter(), Counter(), Counter(), Counter()
+    hosts, progs = Counter(), Counter()
+    total = len(view)
+    for i, (text, count) in enumerate(view):
+        for _ in range(count):
+            an.feed(text)
+        m = _HDR_RE.match(text)
+        if m:
+            host = m.group(2)
+            if host.endswith(':'):             # no host: "Mar 29 20:41:26 bsd: ..."
+                tag = re.sub(r'\[\d+\]$', '', host[:-1]).lstrip('%')
+                if tag:
+                    progs[tag] += count
+            elif not host.startswith(('%', '[', '<')):
+                hosts[host] += count
+                pm = _PROG_RE.match(text, m.end() - 1)
+                if pm:
+                    progs[pm.group(1)] += count
+        taken, ip_ends = [], set()
+        for mm in MAC_RE.finditer(text):
+            norm = mm.group().upper().replace(':', '').replace('-', '')
+            macs[f'{mm.group()} ({vendors.get(norm[:6], "Unknown")})'] += count
+            taken.append(mm.span())
+        for mm in IP4_RE.finditer(text):
+            ip4[mm.group()] += count
+            ip_ends.add(mm.end())
+        if '::' in text or text.count(':') >= 7:      # cheap IPv6 pre-check
+            for mm in IP6_RE.finditer(text):
+                ip6[mm.group()] += count
+                taken.append(mm.span())
+        for mm in _STAT_PORT_RE.finditer(text):
+            if mm.group(1) is not None:
+                num = int(mm.group(1))           # dstport=, DPT=, "port 22", ...
+            elif mm.start() in ip_ends:
+                num = int(mm.group(2))           # 10.0.0.1:443 or 10.0.0.1/22
+                if num >= 32768:
+                    continue                     # ephemeral: almost always a source port
+            else:
+                continue                         # bare :NN (times, MAC pieces)
+            if any(a < mm.end() and mm.start() < b for a, b in taken):
+                continue
+            if 1 <= num <= 65535:
+                svc = WELL_KNOWN_PORTS.get(num, '')
+                ports[f'{num} ({svc})' if svc else str(num)] += count
+        for mm in SEV_RE.finditer(text):
+            sevs[mm.group().upper()] += count
+        if progress_cb and i % 500 == 0:
+            progress_cb(i, total)
+
+    rep  = Report(an)
+    st   = _Style(color)
+    top  = rep.rules.top
+    out  = []
+    if rep.parsed:
+        out += format_summary(rep, vendors, color, label).split('\n')
+    else:
+        out += [st(f'netlog analytics{" — " + label if label else ""}', '1;36'),
+                st('═' * 60, '2;37'),
+                f'Lines: {total:,}   (no vendor or key=value events recognised; '
+                '`netlog --formats` lists the supported formats)']
+
+    def section(title, counter, n=top):
+        if not counter:
+            return
+        out.extend(['', st(title, '1;37'), st('─' * len(title), '2;37')])
+        rows = [[k, f'{c:,}'] for k, c in counter.most_common(n)]
+        out.extend(_table(rows, st, 'lr'))
+
+    if len(hosts) > 1 or (hosts and not rep.parsed):
+        section('Top sending hosts', hosts)
+    if progs:
+        section('Top programs / message tags', progs)
+    out += ['', st('▌ADDRESSES & PORTS (all lines)', '1;36')]
+    section('Top IPv4 addresses', ip4)
+    section('Top IPv6 addresses', ip6, min(top, 6))
+    section('Top MAC addresses', macs)
+    section('Top destination / service ports', ports)
+    section('Syslog severity words', sevs, 8)
+    return out
+
+
 # ── Curses setup ──────────────────────────────────────────────────────────────
 
 def _init_colors():
@@ -1022,10 +1126,10 @@ def _draw_status(win, height, width, term, is_regex, filt, offset, total,
     pan   = "" if wrap else "  ←→=pan"
     if large_file:
         line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  /=text  r=regex  n/p=match  "
-                 f"f=filter  l=wrap{pan}  h/u=hide-col  x=stats  c=clear  q=quit")
+                 f"f=filter  l=wrap{pan}  h/u=hide-col  x=analytics  c=clear  q=quit")
     else:
         line2 = ("↑↓/WS=scroll  PgUp/Dn/Space=page  g/G=top/bot  /=text  r=regex  n/p=match  "
-                 f"f=filter  l=wrap{pan}  d=dedup  #=linenum  h/u=hide-col  x=stats  "
+                 f"f=filter  l=wrap{pan}  d=dedup  #=linenum  h/u=hide-col  x=analytics  "
                  "e=export  c=clear  q=quit")
     try:
         win.addstr(height - 2, 0, line1[:width - 1], curses.color_pair(_P_STAT))
@@ -1079,69 +1183,134 @@ def _fit_back(end, rows, cells, width, wrap):
 
 # ── Stats popup ───────────────────────────────────────────────────────────────
 
-def _draw_stats(stdscr, view, vendors):
-    height, width = stdscr.getmaxyx()
-    total = len(view)
+_SGR_FG = {'30': 0, '31': _P_EV_DENY, '32': _P_EV_ALLOW, '33': _P_EV_ERROR,
+           '34': _P_IP4, '35': _P_MAC + 2, '36': _P_EV_START, '37': _P_EV_END}
 
-    if total > 200:
-        bw   = min(50, width - 4)
-        bh   = 5
-        by_  = (height - bh) // 2
-        bx_  = (width  - bw) // 2
-        bwin = curses.newwin(bh, bw, by_, bx_)
+
+def _ansi_to_cells(text):
+    """Split an ANSI-colored string into [(text, curses attr)]."""
+    cells, attr = [], 0
+    pos = 0
+    for m in re.finditer(r'\x1b\[([0-9;]*)m', text):
+        if m.start() > pos:
+            cells.append((text[pos:m.start()], attr))
+        pos  = m.end()
+        attr = 0 if m.group(1) in ('', '0') else attr
+        for code in m.group(1).split(';'):
+            if code == '1':
+                attr |= curses.A_BOLD
+            elif code == '2':
+                attr |= curses.A_DIM
+            elif code in _SGR_FG and _SGR_FG[code]:
+                attr = (attr & ~curses.A_COLOR) | curses.color_pair(_SGR_FG[code])
+            elif code.startswith('4') and len(code) == 2 and code != '49':
+                attr = (attr & ~curses.A_COLOR) | curses.color_pair(_P_SEV)
+    if pos < len(text):
+        cells.append((text[pos:], attr))
+    return cells
+
+
+def _draw_stats(stdscr, view, vendors, cache=None, label=''):
+    """Scrollable statistics popup for the current view. `cache` (a dict)
+    keeps the last result so reopening the popup is instant."""
+    height, width = stdscr.getmaxyx()
+    key = (id(view), len(view), label)
+    if cache is not None and cache.get('key') == key:
+        lines = cache['lines']
+    else:
+        total = len(view)
+        bw  = min(56, width - 4)
+        bwin = curses.newwin(6, bw, (height - 6) // 2, (width - bw) // 2)
         bar_w = bw - 4
+        stdscr.nodelay(True)
 
         def _progress(done, tot):
             pct  = done / tot if tot else 1.0
             fill = int(pct * bar_w)
             bwin.erase()
             bwin.box()
-            bwin.addstr(0, 2, " Computing Statistics ", curses.A_BOLD)
-            bwin.addstr(2, 2, f"[{'#' * fill}{' ' * (bar_w - fill)}]")
-            bwin.addstr(3, 2, f"{int(pct * 100):3d}%  {done:,} / {tot:,} lines")
-            bwin.refresh()
-
-        _progress(0, total)
-        ip4, ip6, macs, ports, sevs = collect_stats(view, vendors, _progress)
-        del bwin
-    else:
-        ip4, ip6, macs, ports, sevs = collect_stats(view, vendors)
-
-    height, width = stdscr.getmaxyx()
-    pw  = min(72, width - 4)
-    ph  = min(38, height - 4)
-    win = curses.newwin(ph, pw, (height - ph) // 2, (width - pw) // 2)
-    win.box()
-    win.addstr(0, 2, " Statistics — press any key to close ",
-               curses.color_pair(_P_STAT) | curses.A_BOLD)
-
-    row = 1
-    def section(title, counter, limit=6):
-        nonlocal row
-        if row >= ph - 2:
-            return
-        try:
-            win.addstr(row, 1, title, curses.color_pair(_P_STAT) | curses.A_BOLD)
-        except curses.error:
-            pass
-        row += 1
-        for key, cnt in counter.most_common(limit):
-            if row >= ph - 2:
-                return
             try:
-                win.addstr(row, 2, f'{cnt:6}  {key}'[:pw - 3])
+                bwin.addstr(0, 2, " Analysing ", curses.A_BOLD)
+                bwin.addstr(2, 2, f"[{'#' * fill}{' ' * (bar_w - fill)}]")
+                bwin.addstr(3, 2, f"{int(pct * 100):3d}%  {done:,} / {tot:,} lines"[:bar_w])
+                bwin.addstr(4, 2, "Esc to cancel"[:bar_w], curses.A_DIM)
             except curses.error:
                 pass
-            row += 1
+            bwin.refresh()
+            if stdscr.getch() == 27:
+                raise StatsCancelled()
 
-    section("Top IPv4 Addresses", ip4)
-    section("Top IPv6 Addresses", ip6)
-    section("Top MAC Addresses",  macs)
-    section("Top Ports",          ports)
-    section("Severity Counts",    sevs, limit=8)
+        try:
+            if total > 2000:
+                _progress(0, total)
+            lines = build_stats(view, vendors, _progress if total > 2000 else None,
+                                color=True, label=label)
+        except StatsCancelled:
+            return
+        finally:
+            stdscr.nodelay(False)
+            del bwin
+        if cache is not None:
+            cache['key'], cache['lines'] = key, lines
 
-    win.refresh()
-    stdscr.getch()
+    rows  = [_ansi_to_cells(l) for l in lines]
+    top, left = 0, 0
+    while True:
+        height, width = stdscr.getmaxyx()
+        pw, ph = max(20, width - 4), max(6, height - 2)
+        win = curses.newwin(ph, pw, (height - ph) // 2, (width - pw) // 2)
+        win.erase()
+        win.box()
+        inner = ph - 2
+        top   = max(0, min(top, len(rows) - inner))
+        title = (f" Analytics — {top + 1}-{min(top + inner, len(rows))}/{len(rows)}  "
+                 "↑↓ PgUp/PgDn g/G scroll · ←→ pan · q/Esc close ")
+        try:
+            win.addstr(0, 2, title[:pw - 4], curses.color_pair(_P_STAT) | curses.A_BOLD)
+        except curses.error:
+            pass
+        for r in range(inner):
+            if top + r >= len(rows):
+                break
+            x, skip = 2, left
+            for t, a in rows[top + r]:
+                if skip:
+                    if len(t) <= skip:
+                        skip -= len(t)
+                        continue
+                    t, skip = t[skip:], 0
+                room = pw - 2 - x
+                if room <= 0:
+                    break
+                try:
+                    win.addstr(1 + r, x, t[:room], a)
+                except curses.error:
+                    pass
+                x += len(t[:room])
+        win.refresh()
+        ch = stdscr.getch()
+        if ch in (ord('q'), ord('Q'), 27, ord('x'), 10, 13):
+            break
+        elif ch in (curses.KEY_DOWN, ord('s'), ord('j')):
+            top += 1
+        elif ch in (curses.KEY_UP, ord('w'), ord('k')):
+            top -= 1
+        elif ch in (curses.KEY_NPAGE, ord(' ')):
+            top += inner - 1
+        elif ch == curses.KEY_PPAGE:
+            top -= inner - 1
+        elif ch == ord('g'):
+            top = 0
+        elif ch == ord('G'):
+            top = len(rows)
+        elif ch == curses.KEY_RIGHT:
+            left += 20
+        elif ch == curses.KEY_LEFT:
+            left = max(0, left - 20)
+        elif ch == curses.KEY_HOME:
+            left = 0
+        del win
+
 
 # ── Input helper ──────────────────────────────────────────────────────────────
 
@@ -1206,6 +1375,7 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
     msg         = ''        # one-shot status message
     filt        = None
     hidden_cols = (col_hidden or {}).get(file_base or '', 0)
+    stats_cache = {}
 
     def get_view():
         if large_file:
@@ -1388,7 +1558,8 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
                 show_ln = not show_ln
 
         elif ch == ord('x'):
-            _draw_stats(stdscr, view, vendors)
+            what = f"{len(view):,} lines" + (f", filter {filt!r}" if filt else "")
+            _draw_stats(stdscr, view, vendors, stats_cache, what)
 
         elif ch == ord('e'):
             if large_file:
@@ -2979,6 +3150,49 @@ def _p_hostapd(line):
     return {'name': name, 'kind': kind, 'client_mac': norm_mac(mac), 'iface': vap, 'msg': msg}
 
 
+# Linux / BSD OpenSSH, sudo and PAM authentication messages.
+_IP_ANY = r'(\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]*:[0-9a-fA-F:]+)'
+_SSHD_FAIL_RE = re.compile(
+    r'(?:Failed (?:password|publickey|keyboard-interactive(?:/pam)?|none) for (?:invalid user )?(\S+)'
+    r'|Invalid user (\S*)'
+    r'|maximum authentication attempts exceeded for (?:invalid user )?(\S+)'
+    r') from ' + _IP_ANY)
+_SSHD_OK_RE   = re.compile(r'Accepted (\S+) for (\S+) from ' + _IP_ANY)
+_SUDO_FAIL_RE = re.compile(r'\bsudo(?:\[\d+\])?:\s+(\S+) : (?:\d+ incorrect password attempts?'
+                           r'|.*authentication failure)')
+_PAM_FAIL_RE  = re.compile(r'pam_unix\(([\w-]+)(?::auth)?\): authentication failure;'
+                           r'(?:.*?\brhost=(\S*))?(?:.*?\buser=(\S+))?')
+
+
+def _p_linux_auth(line):
+    m = _SSHD_FAIL_RE.search(line)
+    if m and 'sshd' in line:
+        user = m.group(1) or m.group(2) or m.group(3) or ''
+        name = 'sshd invalid user' if 'nvalid user' in line else 'sshd login failure'
+        d = {'name': name, 'kind': 'login_fail', 'src_ip': m.group(4), 'msg': line[m.start():]}
+        if user:
+            d['user'] = user
+        return d
+    m = _SSHD_OK_RE.search(line)
+    if m and 'sshd' in line:
+        return {'name': f'sshd login ({m.group(1)})', 'kind': 'login', 'user': m.group(2),
+                'src_ip': m.group(3), 'msg': line[m.start():]}
+    m = _SUDO_FAIL_RE.search(line)
+    if m:
+        return {'name': 'sudo authentication failure', 'kind': 'login_fail',
+                'user': m.group(1), 'msg': line[m.start():]}
+    m = _PAM_FAIL_RE.search(line)
+    if m and not m.group(1).startswith('sshd'):     # sshd logs its own "Failed password"
+        d = {'name': f'{m.group(1)} authentication failure', 'kind': 'login_fail',
+             'msg': line[m.start():]}
+        if m.group(2):
+            d['src_ip'] = m.group(2)
+        if m.group(3):
+            d['user'] = m.group(3)
+        return d
+    return None
+
+
 # UniFi AP station tracker:  stahtd[123]: [STA-TRACKER].stahtd_dump_event(): {"mac":..}
 def _p_unifi_stahtd(line):
     i = line.find('[STA-TRACKER]')
@@ -3389,7 +3603,7 @@ def _p_os10(line):
 
 
 _SHORT_NAMES = {
-    'ruckus_sz': 'Ruckus SmartZone', 'ruckus_zd': 'Ruckus ZD/Unleashed', 'aruba_os': 'ArubaOS',
+    'linux_auth': 'Linux sshd/auth', 'ruckus_sz': 'Ruckus SmartZone', 'ruckus_zd': 'Ruckus ZD/Unleashed', 'aruba_os': 'ArubaOS',
     'aruba_cx': 'AOS-CX', 'aruba_aoss': 'AOS-S', 'cisco_asa': 'Cisco ASA/FTD',
     'cisco': 'Cisco IOS-style', 'comware': 'Comware/Huawei', 'junos': 'Junos',
     'fortinet': 'FortiGate', 'paloalto': 'PAN-OS', 'meraki': 'Meraki', 'cef': 'CEF',
@@ -3577,6 +3791,17 @@ FORMATS = [
         ('Mar  1 12:00:02 ap1 hostapd: wlan0: STA aa:bb:cc:dd:ee:ff WPA: EAPOL-Key timeout',
          'failure', {}),
     ]),
+    LogFormat('linux_auth', 'Linux / BSD', 'OpenSSH sshd, sudo, PAM', 'server',
+              ('sshd', 'sudo', 'pam_unix'), _p_linux_auth, [
+        ('Mar  1 12:00:00 srv1 sshd[812]: Failed password for invalid user oracle from '
+         '198.51.100.7 port 50122 ssh2', 'login_fail',
+         {'user': 'oracle', 'src_ip': '198.51.100.7', 'host': 'srv1'}),
+        ('Mar  1 12:00:09 srv1 sshd[815]: Accepted publickey for admin from 10.0.0.9 port '
+         '50544 ssh2: ED25519 SHA256:abc', 'login', {'user': 'admin', 'src_ip': '10.0.0.9'}),
+        ('Mar  1 12:00:10 srv1 sudo: alice : 3 incorrect password attempts ; TTY=pts/0 ; '
+         'PWD=/home/alice ; USER=root ; COMMAND=/bin/bash', 'login_fail', {'user': 'alice'}),
+    ], 'Linux auth.log / secure: sshd failures and logins, sudo and PAM failures. Feeds the '
+       'login-attack, password-spraying and success-after-failures rules.'),
     LogFormat('filterlog', 'Netgate / Deciso', 'pfSense / OPNsense filterlog', 'firewall',
               ('filterlog',), _p_filterlog, [
         ('Mar  1 12:00:00 fw filterlog[123]: 5,,,1000000103,igb0,match,block,in,4,0x0,,64,'
@@ -3656,7 +3881,7 @@ FORMATS = [
 _ORDER = ['ruckus_sz', 'cef', 'leef', 'fortinet', 'paloalto', 'cisco_asa', 'os10', 'cisco',
           'sophos', 'sonicwall', 'checkpoint', 'ise', 'freeradius', 'meraki', 'aruba_os',
           'aruba_cx', 'junos', 'comware', 'filterlog', 'netfilter', 'unifi_sta', 'hostapd',
-          'mikrotik', 'exos', 'icx', 'ruckus_zd', 'aruba_aoss']
+          'linux_auth', 'mikrotik', 'exos', 'icx', 'ruckus_zd', 'aruba_aoss']
 FORMATS.sort(key=lambda f: _ORDER.index(f.id))
 FORMAT_BY_ID = {f.id: f for f in FORMATS}
 _GENERIC = LogFormat('kv', 'Generic', 'key=value', 'any', None, None, [])
@@ -3966,6 +4191,142 @@ class LogEvent:
             else (self.name or '(event)')
 
 
+# Problems recognisable from message text alone, checked on lines that no
+# format classified (including unrecognised lines). (id, level, title, regex)
+# Levels: 0 critical, 1 high, 2 medium, 3 low.
+_TEXT_ISSUES = [
+    ('malware',  0, 'Malware / intrusion',
+     r'\b(?:virus|malware|trojan|botnet|ransomware|spyware|worm detected|command[- ]and[- ]control'
+     r'|c&c server|intrusion (?:detected|attempt))\b'),
+    ('dos',      1, 'DoS / flood attack',
+     r'\bsyn[- ]?flood|\b(?:udp|icmp|ping|arp) flood|\bd?dos (?:attack|detected)|flood (?:attack|detected)'),
+    ('arp',      1, 'ARP spoofing / inspection',
+     r'\barp (?:spoof|poison)|arp inspection|\bdai\b.*(?:drop|deny|invalid)|arp.* moved from|'
+     r'arp (?:attack|storm)'),
+    ('spoof',    2, 'Spoofed / martian packets',
+     r'martian (?:source|destination)|\bip spoof|spoofed (?:packet|source|address)|land attack'),
+    ('ipconf',   1, 'IP address conflict',
+     r'duplicate (?:ip )?address|\bip (?:address )?conflict|address conflict|dup_addr|duplicate ip\b'),
+    ('rogue',    1, 'Rogue AP / DHCP server',
+     r'\brogue\b|unauthori[sz]ed (?:ap|access point|dhcp)'),
+    ('wifiatk',  1, 'Wireless attack',
+     r'deauth(?:entication)? (?:flood|attack|storm)|disassoc(?:iation)? (?:flood|attack)|evil twin'
+     r'|\bwids\b|\bwips\b|ap (?:spoof|impersonat)'),
+    ('dhcp',     1, 'DHCP pool exhausted',
+     r'no free leases|(?:address |dhcp )?pool (?:is )?(?:exhausted|depleted|full)'
+     r'|no (?:more )?(?:free |available )?addresses (?:available|in pool)'),
+    ('storm',    1, 'Broadcast / multicast storm',
+     r'\b(?:broadcast|multicast|unicast) storm|storm[-_ ]control'),
+    ('l2loop',   1, 'Layer-2 loop',
+     r'loop (?:detected|guard)|loopback detected|mac (?:address )?flap|is flapping between port'),
+    ('table',    1, 'Session / conntrack table full',
+     r'table full|conntrack.*(?:full|dropping)|session table (?:full|exhausted)'
+     r'|too many (?:open files|sessions|connections)'),
+    ('memory',   1, 'Memory exhaustion',
+     r'out of memory|\boom[- _]?kill|memory (?:allocation )?(?:failure|failed|exhausted)|low memory'
+     r'|cannot allocate memory|malloc(?:\(\))? fail'),
+    ('crash',    1, 'Crash / panic',
+     r'segfault|segmentation fault|core dump|kernel panic|\bpanic\b|\bcrash(?:ed|info)?\b'
+     r'|traceback \(most recent|watchdog (?:timeout|reset|expired|reboot)|unexpected (?:reboot|restart)'),
+    ('disk',     1, 'Disk full / storage error',
+     r'no space left|(?:disk|filesystem|partition) (?:is )?(?:full|almost full)|read-only file system'
+     r'|\bi/o error\b|disk (?:failure|error)'),
+    ('hwtext',   1, 'Hardware / environment',
+     r'fan (?:fail|fault|stopped|speed low)|power supply.*(?:fail|fault|removed|down|lost)'
+     r'|\bpsu\b.*(?:fail|fault)|over-?temperature|temperature (?:critical|high|exceed|alarm)|overheat'
+     r'|voltage (?:out of range|fault|low)'),
+    ('aaa',      1, 'AAA / RADIUS / directory unreachable',
+     r'radius.*(?:not responding|dead|unreachable|timed? ?out)|aaa.*(?:server|dead|down|unreachable)'
+     r'|ldap.*(?:unreachable|timed? ?out|can\'t contact)|tacacs.*(?:dead|unreachable|timed? ?out)'),
+    ('vpntext',  2, 'VPN / IPsec problem',
+     r'\bipsec\b.*(?:fail|down|timeout|mismatch|dpd)|\bike(?:v[12])?(?:_sa|\b).*(?:fail|timeout|mismatch|no proposal)'
+     r'|tunnel (?:is )?(?:down|failed)|phase ?[12].*(?:fail|timeout)'),
+    ('cpu',      2, 'High CPU',
+     r'\bcpu\b.*(?:high|exceed|over threshold|above threshold|utili[sz]ation.*(?:9\d|100)%)|high cpu|cpuhog'),
+    ('cert',     2, 'Certificate / TLS failure',
+     r'certificate (?:has )?expired|expired certificate|cert(?:ificate)? (?:verify|verification|validation)'
+     r' fail|(?:ssl|tls) handshake fail|certificate (?:is )?not yet valid|unknown ca\b'),
+    ('linkerr',  2, 'Interface errors',
+     r'duplex mismatch|\bcrc errors?\b|input errors|\bfcs errors?\b|excessive collisions'),
+    ('stptext',  2, 'Spanning-tree topology change',
+     r'topology change|\btcn\b|new root bridge|root (?:port|bridge) (?:changed|change)'),
+    ('authtext', 2, 'Authentication failures',
+     r'authentication fail|login fail|invalid password|bad password|incorrect password'
+     r'|access denied for user|failed login'),
+    ('ntp',      3, 'Clock / NTP problem',
+     r'\bntp\b.*(?:unreachable|unsynch|not synch|lost sync|no server|failed)|clock (?:unsynchroni|not synchroni)'
+     r'|time (?:jump|drift|skew)|clock step'),
+]
+TEXT_ISSUE_INFO = {i: (lvl, title) for i, lvl, title, _rx in _TEXT_ISSUES}
+# Literal keywords (lowercase) that must appear before a detector's regex
+# is tried: most lines contain none, so they cost a few substring checks.
+_TEXT_ISSUE_KEYS = {
+    'malware': ('virus', 'malware', 'trojan', 'botnet', 'ransomware', 'spyware', 'worm',
+                'command', 'c&c', 'intrusion'),
+    'dos': ('flood', 'dos '), 'arp': ('arp', 'dai'), 'ipconf': ('duplicate', 'conflict', 'dup_addr'),
+    'rogue': ('rogue', 'unauthori'), 'spoof': ('martian', 'spoof', 'land attack'),
+    'wifiatk': ('deauth', 'disassoc', 'evil twin', 'wids', 'wips', 'spoof', 'impersonat'),
+    'dhcp': ('lease', 'pool', 'addresses'), 'storm': ('storm',), 'l2loop': ('loop', 'flap'),
+    'table': ('table full', 'conntrack', 'session table', 'too many'),
+    'memory': ('memory', 'oom', 'malloc'),
+    'crash': ('segfault', 'segmentation', 'core dump', 'panic', 'crash', 'traceback',
+              'watchdog', 'unexpected'),
+    'disk': ('no space', 'full', 'read-only', 'i/o error', 'disk'),
+    'hwtext': ('fan ', 'power supply', 'psu', 'temperature', 'overheat', 'voltage'),
+    'aaa': ('radius', 'aaa', 'ldap', 'tacacs'), 'vpntext': ('ipsec', 'ike', 'tunnel', 'phase'),
+    'cpu': ('cpu',), 'cert': ('certificate', 'cert', 'handshake', 'unknown ca'),
+    'linkerr': ('duplex', 'crc', 'input errors', 'fcs', 'collision'),
+    'stptext': ('topology', 'tcn', 'root '),
+    'authtext': ('authentication fail', 'login fail', 'password', 'access denied', 'failed login'),
+    'ntp': ('ntp', 'clock', 'time '),
+}
+_TEXT_ISSUE_CHECKS = [(i, _TEXT_ISSUE_KEYS[i], re.compile(rx, re.I)) for i, _l, _t, rx in _TEXT_ISSUES]
+
+
+def text_issue(line):
+    """Id of the first _TEXT_ISSUES detector matching `line`, or None."""
+    low = line.lower()
+    for i, keys, rx in _TEXT_ISSUE_CHECKS:
+        for k in keys:
+            if k in low:
+                if rx.search(line):
+                    return i
+                break
+    return None
+
+# Services that should not be reachable from the internet, and that an
+# internal host rarely needs to reach on the internet.
+RISKY_PORTS = {21: 'FTP', 23: 'Telnet', 69: 'TFTP', 135: 'MS-RPC', 137: 'NetBIOS',
+               138: 'NetBIOS', 139: 'NetBIOS', 161: 'SNMP', 445: 'SMB', 1433: 'MSSQL',
+               1521: 'Oracle', 2375: 'Docker API', 3306: 'MySQL', 3389: 'RDP',
+               5432: 'PostgreSQL', 5900: 'VNC', 5985: 'WinRM', 5986: 'WinRM', 6379: 'Redis',
+               9200: 'Elasticsearch', 11211: 'memcached', 27017: 'MongoDB'}
+OUTBOUND_RISKY = {23, 135, 137, 138, 139, 445, 1433, 3389, 5900}
+
+
+@functools.lru_cache(maxsize=65536)
+def ip_scope(addr):
+    """'public', 'private' (RFC 1918, ULA, link-local, loopback, CGNAT) or None."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return None
+    if ip.is_multicast or ip.is_unspecified:
+        return None
+    if any(ip in net for net in _PRIVATE_NETS[ip.version]):
+        return 'private'
+    return 'public'
+
+
+# Internal address space: RFC 1918, CGNAT, loopback, link-local, ULA. (Python's
+# is_private also counts the documentation ranges, which aren't internal.)
+_PRIVATE_NETS = {
+    4: [ipaddress.ip_network(n) for n in ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16',
+                                          '100.64.0.0/10', '127.0.0.0/8', '169.254.0.0/16')],
+    6: [ipaddress.ip_network(n) for n in ('fc00::/7', 'fe80::/10', '::1/128')],
+}
+
+
 class DeviceStats:
     """Per sending device (syslog host)."""
     def __init__(self, host):
@@ -3974,6 +4335,8 @@ class DeviceStats:
         self.events   = 0
         self.severity = Counter()
         self.issues   = Counter()
+        self.first    = None
+        self.last     = None
 
 
 class _DenySource:
@@ -4002,20 +4365,74 @@ class FirewallStats:
         self.ports   = Counter()      # (port, proto) → denies
         self.rule    = Counter()
         self.dsts    = Counter()
+        self.allow_ports = Counter()  # (port, proto) → allowed connections
+        self.allow_src   = Counter()  # source → allowed connections ("top talkers")
+        self.protos      = Counter()  # protocol → all firewall events
+
+        self.exposed     = {}         # (dst, port) → [allowed count, public sources set]
+        self.outbound    = {}         # (src, port) → [count, public destinations set]
+
+    _KEYS_CAP = 50000  # distinct keys kept per allow counter
+
+    def _risk(self, kind, f, dpt):
+        """Track risky services allowed in from the internet, and internal
+        hosts reaching risky ports (or many mail servers) on the internet."""
+        try:
+            port = int(dpt)
+        except (TypeError, ValueError):
+            return
+        if port not in RISKY_PORTS and port != 25:
+            return
+        src, dst = f.get('src_ip'), f.get('dst_ip')
+        if not src or not dst:
+            return
+        s_scope, d_scope = ip_scope(src), ip_scope(dst)
+        if kind == 'allow' and s_scope == 'public' and d_scope == 'private' and port in RISKY_PORTS:
+            st = self.exposed.get((dst, port))
+            if st is None:
+                if len(self.exposed) >= self._KEYS_CAP:
+                    return
+                st = self.exposed[(dst, port)] = [0, set()]
+            st[0] += 1
+            if len(st[1]) < 512:
+                st[1].add(src)
+        elif s_scope == 'private' and d_scope == 'public' and \
+                (port in OUTBOUND_RISKY or port == 25):
+            st = self.outbound.get((src, port))
+            if st is None:
+                if len(self.outbound) >= self._KEYS_CAP:
+                    return
+                st = self.outbound[(src, port)] = [0, set()]
+            st[0] += 1
+            if len(st[1]) < 512:
+                st[1].add(dst)
 
     def add(self, p):
         kind = p.kind
+        f    = p.fields
+        proto = (f.get('proto') or '').lower()
+        if proto:
+            self.protos[proto] += 1
         if kind != 'deny':
             if kind == 'allow':
                 self.allow += 1
+                dpt, src = f.get('dst_port'), f.get('src_ip')
+                if dpt:
+                    self._risk('allow', f, dpt)
+                if dpt and ((dpt, proto) in self.allow_ports
+                            or len(self.allow_ports) < self._KEYS_CAP):
+                    self.allow_ports[(dpt, proto)] += 1
+                if src and (src in self.allow_src or len(self.allow_src) < self._KEYS_CAP):
+                    self.allow_src[src] += 1
             else:
                 self.session += 1
             return
         self.deny += 1
-        f    = p.fields
         src  = f.get('src_ip') or '?'
         dpt  = f.get('dst_port')
         dst  = f.get('dst_ip')
+        if dpt:
+            self._risk('deny', f, dpt)
         if dpt:
             self.ports[(dpt, (f.get('proto') or '').lower())] += 1
         if f.get('rule'):
@@ -4063,6 +4480,37 @@ class Analyzer:
         self.issues       = Counter()      # (severity, label) for errors and warnings
         self.devices      = {}
         self.fw           = FirewallStats(self.rules)
+        self.text_issues  = {}             # (id, host) → [count, first_ts, last_ts, sample]
+        self.err_buckets  = Counter()      # 5-minute bucket → error + warning events
+        self.ev_buckets   = Counter()      # 5-minute bucket → all events
+        self.critical     = {}             # (host, name) → [count, syslog sev, last_ts, sample]
+
+    def _text_issue(self, line, host, ts, issue=None):
+        issue = issue or text_issue(line)
+        if issue is None:
+            return
+        key = (issue, host or '(no host)')
+        st  = self.text_issues.get(key)
+        if st is None:
+            if len(self.text_issues) >= 20000:
+                return
+            st = self.text_issues[key] = [0, ts, ts, line.strip()[:200]]
+        st[0] += 1
+        if ts is not None:
+            st[1] = ts if st[1] is None else min(st[1], ts)
+            st[2] = ts if st[2] is None else max(st[2], ts)
+
+    def _critical(self, host, name, sev, ts, line):
+        key = (host or '(no host)', name[:80])
+        st  = self.critical.get(key)
+        if st is None:
+            if len(self.critical) >= 5000:
+                return
+            st = self.critical[key] = [0, sev, ts, line.strip()[:200]]
+        st[0] += 1
+        st[1] = min(st[1], sev)
+        if ts is not None:
+            st[2] = ts
 
     def feed(self, line):
         self.lines += 1
@@ -4070,6 +4518,13 @@ class Analyzer:
         if p is None:
             if line.strip():
                 self.unparsed += 1
+                sev, host = syslog_header(line)
+                issue = text_issue(line)
+                ts = parse_timestamp(line) if issue or (sev is not None and sev <= 2) else None
+                if issue:
+                    self._text_issue(line, host, ts, issue)
+                elif sev is not None and sev <= 2:
+                    self._critical(host, _msg_part(line)[:60], sev, ts, line)
             if self.context_macs and MAC_RE.search(line):
                 for m in MAC_RE.finditer(line):
                     if norm_mac(m.group()) in self.context_macs:
@@ -4093,6 +4548,21 @@ class Analyzer:
         if sev in ('error', 'warning'):
             self.issues[(sev, label)] += 1
             dev.issues[label] += 1
+        ts = p.ts
+        if ts is not None:
+            if dev.first is None or ts < dev.first:
+                dev.first = ts
+            if dev.last is None or ts > dev.last:
+                dev.last = ts
+            b = int(ts // 300)
+            self.ev_buckets[b] += 1
+            if sev in ('error', 'warning'):
+                self.err_buckets[b] += 1
+        if p.kind is None:
+            self._text_issue(line, f.get('host'), ts)
+        if p.kind is None and p.vsev is not None and p.vsev <= 2:
+            # Classified events are reported by their own rules.
+            self._critical(host, p.name or '(event)', p.vsev, ts, line)
 
         has_entity = any(k in f for k in _ENTITY_FIELDS)
         if p.kind in ('deny', 'allow', 'session'):
@@ -4266,6 +4736,10 @@ class Report:
         self.devices       = analyzer.devices
         self.issues        = analyzer.issues
         self.fw            = analyzer.fw
+        self.text_issues   = analyzer.text_issues
+        self.err_buckets   = analyzer.err_buckets
+        self.ev_buckets    = analyzer.ev_buckets
+        self.critical      = analyzer.critical
         self.parsed        = sum(analyzer.formats.values())
         self.fail_by_event = Counter(e.label for e in self.events if e.kind == 'failure')
         times = [e.ts for e in self.events if e.ts is not None]
@@ -4739,6 +5213,15 @@ def _summary_firewall(out, rep, s, H, rules, top):
     if fw.rule:
         out += H('Top deny rules / policies')
         out += _table([[r, str(n)] for r, n in fw.rule.most_common(top)], s, 'lr')
+    if fw.allow_ports:
+        out += H('Top allowed destination ports')
+        out += _table([[_svc(port, proto), str(n)]
+                       for (port, proto), n in fw.allow_ports.most_common(top)], s, 'lr')
+    if fw.allow_src:
+        out += H('Top talkers (allowed connections by source)')
+        out += _table([[src, str(n)] for src, n in fw.allow_src.most_common(top)], s, 'lr')
+    if len(fw.protos) > 1:
+        out.append('  Protocols: ' + ', '.join(f'{pr} {n:,}' for pr, n in fw.protos.most_common(6)))
     if rep.threats:
         out += H('Threats (IPS / AV / attack signatures)')
         out += _table([[(sig[:70], '1;31'), str(n)] for sig, n in rep.threats.most_common(top)],
@@ -4783,6 +5266,252 @@ def _summary_infra(out, rep, s, H, rules, top):
     out += _table(rows, s, 'llrll')
 
 
+# ── Findings: every detector, ranked ─────────────────────────────────────────
+
+LEVELS      = ('critical', 'high', 'medium', 'low')
+_LEVEL_CODE = ('1;37;41', '1;31', '1;33', '2;37')
+
+# (level, title) for the network/security findings Report produces.
+_FINDING_INFO = {
+    'flap': (1, 'Interface flapping'), 'errdisable': (1, 'Err-disabled port'),
+    'loop': (1, 'Layer-2 loop / MAC flap'), 'violation': (2, 'Port security / snooping violation'),
+    'routing': (1, 'Routing neighbor down'), 'brute': (1, 'Login attack (brute force)'),
+    'threat': (1, 'Threat signature'), 'vpn': (1, 'VPN tunnel down'),
+    'service': (1, 'Server / service unreachable'), 'ap': (1, 'Access point down'),
+    'failover': (2, 'Failover / redundancy change'), 'hw': (1, 'Hardware / environment'),
+    'reboot': (2, 'Reboot / restart'),
+}
+
+
+class Alert:
+    __slots__ = ('level', 'title', 'subject', 'detail', 'weight')
+
+    def __init__(self, level, title, subject, detail, weight=1):
+        self.level, self.title, self.subject = level, title, subject
+        self.detail, self.weight = detail, weight
+
+    def __repr__(self):
+        return f'Alert({LEVELS[self.level]}, {self.title!r}, {self.subject!r}, {self.detail!r})'
+
+
+def collect_alerts(rep, vendors=None):
+    """Every problem the detectors found, as Alerts sorted most serious first."""
+    vendors, rules = vendors or {}, rep.rules
+    A = []
+
+    def add(level, title, subject, detail, weight=1):
+        A.append(Alert(level, title, str(subject), detail, weight))
+
+    # Network / security findings from Report.
+    for cat, _sev, subj, text in rep.findings:
+        level, title = _FINDING_INFO.get(cat, (2, cat))
+        if cat == 'brute' and text.startswith('successful login'):
+            level, title = 0, 'Login succeeded after brute force'
+        elif cat == 'routing' and 'recovered' in text:
+            level = 2
+        elif cat == 'scan':
+            title = 'Host sweep' if 'host sweep' in text else 'Port scan'
+            internal = ip_scope(subj) == 'private'
+            level = 1 if internal else 2
+            if internal:
+                title += ' from internal host'
+            text = text.replace('possible port scan: ', '').replace('possible host sweep: ', '')
+        add(level, title, subj, text)
+
+    # Authentication: password spraying and distributed attacks.
+    by_src, by_user = {}, {}
+    for ev in rep.events:
+        if ev.kind != 'login_fail':
+            continue
+        f, user = ev.fields, ev.fields.get('user')
+        src = f.get('src_ip')
+        if src and user:
+            by_src.setdefault(src, Counter())[user] += 1
+        if user and src:
+            by_user.setdefault(user, set()).add(src)
+    spray_min = max(5, rules.brute_threshold)
+    for src, users in by_src.items():
+        if len(users) >= spray_min:
+            eg = ', '.join(u for u, _ in users.most_common(4))
+            add(1, 'Password spraying', src,
+                f'login failures against {len(users)} different accounts (e.g. {eg})', len(users))
+    for user, srcs in by_user.items():
+        if len(srcs) >= 5:
+            add(1, 'Distributed login attack', f'account {user}',
+                f'login failures from {len(srcs)} different source addresses', len(srcs))
+
+    # Firewall exposure.
+    fw = rep.fw
+    for (dst, port), (n, srcs) in fw.exposed.items():
+        add(0, 'Risky service allowed from internet', f'{dst}:{port} ({RISKY_PORTS[port]})',
+            f'{n:,} allowed connection{"s" * (n != 1)} from {len(srcs)}'
+            f'{"+" if len(srcs) >= 512 else ""} internet source{"s" * (len(srcs) != 1)}', n)
+    for (src, port), (n, dsts) in fw.outbound.items():
+        if port == 25:
+            if len(dsts) >= 10:
+                add(2, 'Possible spam bot', src,
+                    f'SMTP to {len(dsts)} different internet mail servers ({n:,} connections)', n)
+        elif n >= 3:
+            add(1, 'Internal host using risky service on internet', src,
+                f'{n:,} connections to {RISKY_PORTS.get(port, port)}/{port} on {len(dsts)} '
+                f'internet host{"s" * (len(dsts) != 1)} (worm / malware / data leak?)', n)
+
+    # Error volume: spikes over time, noisy devices, silent devices.
+    if len(rep.ev_buckets) >= 6:
+        # Baseline: the median over 5-minute buckets that have any events (so
+        # gaps, or logs from devices with different clocks, don't drag it to 0).
+        buckets = sorted(rep.ev_buckets)
+        counts  = sorted(rep.err_buckets.get(b, 0) for b in buckets)
+        base    = counts[len(counts) // 2]
+        limit   = max(20, 5 * base)
+        run, spikes = [], []
+        for b in buckets + [None]:
+            n = rep.err_buckets.get(b, 0) if b is not None else 0
+            if b is not None and n >= limit and (not run or b == run[-1][0] + 1):
+                run.append((b, n))
+                continue
+            if run:
+                spikes.append(run)
+            run = [(b, n)] if b is not None and n >= limit else []
+        spikes = [r for r in spikes if len(r) <= max(1, len(buckets) // 4)]
+        for run in sorted(spikes, key=lambda r: -sum(n for _, n in r))[:5]:
+            total = sum(n for _, n in run)
+            start, end = run[0][0] * 300, (run[-1][0] + 1) * 300
+            add(1, 'Spike in errors / warnings', f'{_fmt_ts(start)} → {_fmt_ts(end)}',
+                f'{total:,} errors and warnings in {_fmt_dur(end - start)} '
+                f'(usual {base} per 5m)', total)
+    sv = rep.severity
+    total_ev = sum(sv.values())
+    if total_ev >= 100 and sv['error'] / total_ev >= 0.25:
+        add(2, 'High overall error rate', 'all devices',
+            f'{sv["error"]:,} of {total_ev:,} events ({sv["error"] / total_ev:.0%}) are errors',
+            sv['error'])
+    # "End of log" is the latest last-seen time among devices whose clocks
+    # agree with the majority, so one device with a wrong clock or year
+    # doesn't make every other device look silent.
+    lasts = sorted(d.last for d in rep.devices.values() if d.last is not None and d.events >= 20)
+    end   = None
+    if lasts:
+        mid = lasts[len(lasts) // 2]
+        end = max(t for t in lasts if abs(t - mid) <= 7 * 86400)
+    firsts = [d.first for d in rep.devices.values() if d.first is not None and
+              end is not None and abs(d.first - end) <= 7 * 86400]
+    span = (end - min(firsts)) if firsts else 0
+    for d in rep.devices.values():
+        if d.host == '(no host)':
+            continue
+        err = d.severity['error']
+        if d.events >= 20 and err / d.events >= 0.3:
+            top_issue = d.issues.most_common(1)[0][0] if d.issues else ''
+            add(2, 'Device with high error rate', d.host,
+                f'{err:,} errors in {d.events:,} events ({err / d.events:.0%})'
+                + (f', mostly {top_issue}' if top_issue else ''), err)
+        if end is None or d.last is None or d.events < 20:
+            continue
+        gap = end - d.last
+        if abs(gap) > 7 * 86400 or (d.first is not None and abs(d.first - end) > 7 * 86400
+                                     and abs(gap) > 7 * 86400):
+            add(3, 'Device clock / timestamp mismatch', d.host,
+                f'timestamps are {_fmt_dur(abs(gap))} {"behind" if gap > 0 else "ahead of"} the '
+                'other devices — check NTP, time zone, or a missing year in its syslog format')
+        elif span >= 7200 and gap > max(1800, 0.2 * span):
+            add(2, 'Device stopped logging', d.host,
+                f'last message {_fmt_ts(d.last)}, {_fmt_dur(gap)} before the other devices '
+                f'stopped ({d.events:,} events before that)')
+
+    # Critical / alert / emergency syslog messages.
+    for (host, name), (n, sev, last_ts, sample) in rep.critical.items():
+        add(0 if sev <= 1 else 1, 'Emergency / alert message' if sev <= 1 else 'Critical message',
+            host, f'{n}× {name}' + (f', last {_fmt_ts(last_ts)}' if last_ts else ''), n)
+
+    # Switch layer-2 counters not already reported as findings.
+    stp = Counter()
+    for (kind, host, where), n in rep.l2.items():
+        if kind == 'stp':
+            stp[host] += n
+        elif kind == 'port_error':
+            add(2, 'Interface errors', f'{host} {where}'.strip(),
+                f'{n}× {rep.l2_msg[(kind, host, where)][:90]}', n)
+        elif kind == 'poe':
+            add(3, 'PoE fault', f'{host} {where}'.strip(),
+                f'{n}× {rep.l2_msg[(kind, host, where)][:90]}', n)
+    for host, n in stp.items():
+        if n >= 5:
+            add(2, 'Spanning-tree instability', host, f'{n} topology change / STP events', n)
+
+    # Text detectors (any log line).
+    for (tid, host), (n, first, last, sample) in rep.text_issues.items():
+        level, title = TEXT_ISSUE_INFO[tid]
+        if tid == 'authtext':
+            level = 2 if n >= 2 * rules.brute_threshold else 3
+        elif tid == 'stptext':
+            level = 2 if n >= 5 else 3
+        when = f', last {_fmt_ts(last)}' if last else ''
+        add(level, title, host, f'{n:,}×{when} — {_msg_part(sample)[:100]}', n)
+
+    # Wireless.
+    for lp in rep.loops:
+        cs   = rep.clients[lp.client]
+        span = _fmt_dur(lp.end - lp.start) if lp.timed else '?'
+        aps  = ', '.join(a for a, _ in lp.aps.most_common(2)) or 'unknown AP'
+        rec  = (f'recovered after {_fmt_dur(lp.recovery.eff - lp.start)}' if lp.recovery
+                else 'no recovery seen')
+        add(2, 'Wireless failure loop', _client_label(cs, vendors),
+            f'{lp.count} × {lp.names.most_common(1)[0][0]} in {span} @ {aps} — {rec}', lp.count)
+    for table, title in ((rep.aps, 'AP failure hotspot'), (rep.locations, 'Location failure hotspot')):
+        base = rep.ap_baseline if table is rep.aps else rep.loc_baseline
+        for ss in table.values():
+            if getattr(ss, 'flagged', False):
+                add(2, title, ss.key, f'{ss.rate:.0%} of attempts fail ({ss.failures} failures) '
+                    f'vs {base:.0%} overall', ss.failures)
+    titles = {'legacy': 'Legacy SSID in use', 'identity': 'Identity inconsistency',
+              'roam': 'Rapid roaming', 'rssi': 'Low signal'}
+    for cs in rep.clients.values():
+        for cat, text in cs.findings:
+            if cat in titles:
+                add(3, titles[cat], _client_label(cs, vendors), text)
+
+    order = {}
+    for a in A:
+        order.setdefault((a.level, a.title), 0)
+        order[(a.level, a.title)] += a.weight
+    A.sort(key=lambda a: (a.level, -order[(a.level, a.title)], a.title, -a.weight, a.subject))
+    return A
+
+
+def _msg_part(line):
+    """The message part of a raw log line (after the syslog header)."""
+    m = _HDR_RE.match(line)
+    return line[m.end():].strip() if m else line.strip()
+
+
+def _summary_findings(out, rep, vendors, s, H, top):
+    """The ranked findings list: up to `top` rows per kind of problem."""
+    alerts = collect_alerts(rep, vendors)
+    out += H('Findings')
+    if not alerts:
+        out.append(s('  No problems detected.', ANSI_EV_ALLOW))
+        return
+    counts = Counter(a.level for a in alerts)
+    out.append('  ' + '   '.join(s(f'{counts[i]} {LEVELS[i]}', _LEVEL_CODE[i] if counts[i] else None)
+                                 for i in range(4)))
+    out.append('')
+    groups = {}
+    for a in alerts:                       # already ordered most serious first
+        groups.setdefault((a.level, a.title), []).append(a)
+    rows, breaks = [], []                  # breaks: (row index after group, hidden count, title)
+    for (level, title), items in groups.items():
+        for a in items[:top]:
+            subj = a.subject if len(a.subject) <= 44 else a.subject[:43] + '…'
+            rows.append([(LEVELS[level].upper(), _LEVEL_CODE[level]), title, subj, a.detail])
+        if len(items) > top:
+            breaks.append((len(rows), len(items) - top, title))
+    lines = _table(rows, s, 'llll')
+    for at, hidden, title in reversed(breaks):
+        lines.insert(at, s(f'  {"":8}  … and {hidden} more: {title}', '2;37'))
+    out += lines
+
+
 def format_summary(rep, vendors, color=False, sources=''):
     s, rules, top = _Style(color), rep.rules, rep.rules.top
     H   = lambda t: ['', s(t, '1;37'), s('─' * len(t), '2;37')]
@@ -4814,6 +5543,8 @@ def format_summary(rep, vendors, color=False, sources=''):
         s(f'! {sv["warning"]:,} warnings', ANSI_EV_ERROR),
         s(f'✓ {sv["success"]:,} success', ANSI_EV_ALLOW),
         f'· {sv["info"]:,} info']))
+
+    _summary_findings(out, rep, vendors, s, H, top)
 
     devs = [d for d in rep.devices.values() if d.host != '(no host)']
     if len(devs) > 1 or (devs and len(rep.formats) > 1):
@@ -4857,74 +5588,6 @@ def format_summary(rep, vendors, color=False, sources=''):
         out += _banner('Infrastructure', s)
         _summary_infra(out, rep, s, H, rules, top)
 
-    # Anomalies
-    out += H('Anomalies')
-    any_anom = False
-
-    if rep.loops:
-        any_anom = True
-        out.append(s(f'  Failure loops ({rules.loop_threshold}+ failures within '
-                     f'{_fmt_dur(rules.loop_window)}): {len(rep.loops)}', '1;31'))
-        for lp in rep.loops[:top]:
-            cs   = rep.clients[lp.client]
-            span = _fmt_dur(lp.end - lp.start) if lp.timed else '?'
-            aps  = ', '.join(a for a, _ in lp.aps.most_common(3)) or 'unknown AP'
-            rec  = (s(f'recovered via {lp.recovery.name} after '
-                      f'{_fmt_dur(lp.recovery.eff - lp.start)}', ANSI_EV_ALLOW)
-                    if lp.recovery else s('no recovery seen', '1;31'))
-            out.append(f'    {_client_label(cs, vendors)}: {lp.count} × '
-                       f'{lp.names.most_common(1)[0][0]} in {span} @ {aps} — {rec}')
-            out.append(s(f'      {_fmt_ts(lp.start if lp.timed else None)} → '
-                         f'{_fmt_ts(lp.end if lp.timed else None)}', '2;37'))
-        if len(rep.loops) > top:
-            out.append(f'    … and {len(rep.loops) - top} more')
-
-    for cat, title in (('legacy',   f'Legacy SSID usage (matches /{rules.legacy_ssid}/)'),
-                       ('identity', 'Identity inconsistencies'),
-                       ('roam',     f'Rapid roaming ({rules.roam_threshold}+ roams within '
-                                    f'{_fmt_dur(rules.roam_window)})'),
-                       ('rssi',     f'Low signal (RSSI below {rules.low_rssi} dBm)')):
-        hits = [(cs, text) for cs in rep.clients.values()
-                for c, text in cs.findings if c == cat]
-        if not hits:
-            continue
-        any_anom = True
-        hits.sort(key=lambda h: h[0].mac)
-        out.append(s(f'  {title}: {len(hits)}', '1;33'))
-        for cs, text in hits[:top]:
-            out.append(f'    {_client_label(cs, vendors)}: {text}')
-        if len(hits) > top:
-            out.append(f'    … and {len(hits) - top} more')
-
-    titles = {
-        'flap':       f'Interface flapping ({rules.flap_threshold}+ downs within '
-                      f'{_fmt_dur(rules.flap_window)})',
-        'errdisable': 'Err-disabled ports', 'loop': 'Layer-2 loops / MAC flapping / BPDU guard',
-        'violation':  'Port security / DHCP snooping / duplicate address',
-        'routing':    'Routing neighbor instability',
-        'brute':      f'Login attacks ({rules.brute_threshold}+ failures within '
-                      f'{_fmt_dur(rules.brute_window)})',
-        'scan':       f'Scans ({rules.scan_ports}+ ports or {rules.scan_hosts}+ hosts denied '
-                      f'within {_fmt_dur(rules.scan_window)})',
-        'threat':     'Threat signatures', 'vpn': 'VPN tunnels down',
-        'service':    'Servers / services unreachable (RADIUS, AAA, ...)',
-        'ap':         'Access points down', 'failover': 'Failover / redundancy changes',
-        'hw':         'Hardware / environment', 'reboot': 'Reboots',
-    }
-    for cat, title in titles.items():
-        hits = [(subj, text, sev) for c, sev, subj, text in rep.findings if c == cat]
-        if not hits:
-            continue
-        any_anom = True
-        worst = 'error' if any(h[2] == 'error' for h in hits) else 'warning'
-        out.append(s(f'  {title}: {len(hits)}', _SEV_CODE[worst]))
-        for subj, text, _sev in hits[:top]:
-            out.append(f'    {subj}: {text}')
-        if len(hits) > top:
-            out.append(f'    … and {len(hits) - top} more')
-
-    if not any_anom:
-        out.append(s('  None detected.', ANSI_EV_ALLOW))
     return '\n'.join(out)
 
 
