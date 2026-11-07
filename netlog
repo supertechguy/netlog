@@ -43,7 +43,7 @@ try:
 except ImportError:
     HAS_GEOIP = False
 
-VERSION = '1.8.0'
+VERSION = '1.8.1'
 
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # bytes — above this, use mmap index
 
@@ -7737,6 +7737,7 @@ def build_arg_parser():
             '  cat file.log | netlog                    Piped/ANSI mode\n'
             '  netlog -g 10.146. schools.log            Load only lines containing 10.146.\n'
             '  netlog -U /var/log/fw.log                Show UTC timestamps in local time\n'
+            '  cat syslog.2.gz | netlog --summary       Compressed input works (files too)\n'
             '  netlog --summary /var/log/wlc.log        Health summary report\n'
             '  netlog --client alice /var/log/wlc.log   Timeline for one user or MAC\n'
             '  netlog --setup-geoip                     Configure MaxMind GeoIP'
@@ -7831,7 +7832,9 @@ def build_arg_parser():
                     help='List the vendor log formats netlog recognises, with examples, and exit')
     p.add_argument('--version', action='version', version=f'netlog {VERSION}')
     p.add_argument('args', nargs='*', metavar='FILE',
-                    help='Log file(s) to view; shell globs are supported. In follow mode, '
+                    help='Log file(s) to view; shell globs are supported. Gzip-compressed '
+                         'files (detected by content, with or without a .gz name) and gzip '
+                         'piped into stdin are decompressed automatically. In follow mode, '
                          'if two or more FILE arguments are given, the first is treated as '
                          'an egrep-style filter pattern instead of a filename.')
     return p

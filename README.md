@@ -10,6 +10,9 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 
 ## What's new
 
+**1.8.1**
+- `--help` documents gzip input and has `-U` and piped-gzip examples; README corrections.
+
 **1.8.0**
 - Compressed logs are decompressed automatically in every mode, including piped input (`cat syslog.2.gz | netlog`). They are detected by content, so rotated files without a `.gz` name (`syslog.2`) work too. A truncated or corrupt archive (e.g. one still being compressed by logrotate) shows a warning and the lines that could be read, instead of a traceback.
 - `-U` now always reads the clock time as UTC, even when the timestamp has an offset attached. This fixes Ruckus (and other) logs relayed through a syslog server that stamped its own zone onto UTC times. The zone label shows both standard and daylight time (`MST/MDT`).
@@ -140,6 +143,7 @@ deleted, and the data folder is removed only if it's then empty.
 netlog <file> [file2 ...]                   Interactive TUI viewer
 netlog -g PATTERN <file> ...                Load only lines matching PATTERN (any mode)
 netlog -U <file> ...                        Show UTC timestamps in local time (any mode)
+cat file.log.gz | netlog                    Compressed logs work anywhere, files or piped
 netlog -f <file>                            Follow mode (like tail -f)
 netlog -f -n 50 <file>                      Follow, showing last 50 lines first
 netlog -f "pattern" <file>                  Follow, only showing lines matching pattern
@@ -165,9 +169,9 @@ Multiple files and shell globs are supported:
 ```bash
 netlog /var/log/syslog /var/log/kern.log
 netlog /var/log/firewall.log*
-netlog /var/log/firewall.log.10.gz
-zcat -f /var/log/syslog* | netlog --summary   # or just pipe the .gz in:
-cat /var/log/syslog.2.gz | netlog
+netlog /var/log/firewall.log.10.gz          # compressed files open directly
+netlog --summary /var/log/syslog*           # plain and rotated .gz files together
+cat /var/log/syslog.2.gz | netlog           # gzip piped into stdin works too
 ```
 
 Gzip-compressed logs are decompressed automatically in every mode (viewer, follow, piped, `--summary`, `--client`), whether they are files or piped into stdin. netlog checks the file's contents, not its name, so a rotated `syslog.2` that is really gzip data also works. If an archive is truncated or corrupt, netlog prints a warning and uses the lines it could read.
@@ -373,7 +377,7 @@ Wireless controllers and many other appliances log an event name followed by `ke
 May  1 08:01:00 ctrl1 wlc: clientJoinFailure apName="AP-Gym-2" apMac="aa:bb:cc:00:00:02" apLocation="Gym" clientMac="f4:f5:d8:de:73:50" userName="alice" ssid="WCSDaccess-old" reason="802.1X timeout"
 ```
 
-netlog parses these automatically: in every mode for the glyphs, and in `--summary` / `--client` for full analysis. Both modes read the given files (`.gz` included) or stdin:
+netlog parses these automatically: in every mode for the glyphs, and in `--summary` / `--client` for full analysis. Both modes read the given files or stdin, gzip-compressed or not:
 
 ```bash
 netlog --summary /var/log/wlc.log*
