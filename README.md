@@ -10,6 +10,10 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 
 ## What's new
 
+**1.8.0**
+- Compressed logs are decompressed automatically in every mode, including piped input (`cat syslog.2.gz | netlog`). They are detected by content, so rotated files without a `.gz` name (`syslog.2`) work too. A truncated or corrupt archive (e.g. one still being compressed by logrotate) shows a warning and the lines that could be read, instead of a traceback.
+- `-U` now always reads the clock time as UTC, even when the timestamp has an offset attached. This fixes Ruckus (and other) logs relayed through a syslog server that stamped its own zone onto UTC times. The zone label shows both standard and daylight time (`MST/MDT`).
+
 **1.7.0**
 - `-U` / `--utc-to-local` rewrites UTC log timestamps into this machine's local timezone, in every mode. Every timestamp layout netlog recognises is converted in place and keeps its layout (see [Show UTC logs in local time](#show-utc-logs-in-local-time--u----utc-to-local)).
 
@@ -53,7 +57,7 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 - **UTC → local time (`-U`)** — rewrites every recognised timestamp from UTC into the machine's timezone, keeping each log's own timestamp layout
 - **Line wrapping** — long lines wrap at word boundaries with indented continuation rows, or are cut and panned sideways (`l`, `--wrap`/`--no-wrap`)
 - **Large file support** — files over 50 MB are accessed via `mmap` + a byte-offset index so only the visible screen is ever in RAM
-- **Automatic `.gz` decompression** — open compressed logs directly; follow mode handles them gracefully too
+- **Automatic gzip decompression** — open or pipe in compressed logs directly, in every mode; they are detected by content, not by a `.gz` name, and truncated archives show what could be read
 - **Follow mode** — `tail -f`-style real-time monitoring with optional egrep or `-g` filter and audio/visual alerts
 - **Piped input** — `cat file.log | netlog` works; all highlighting applies
 - **Structured log analysis** — parses `key="value"` fields (`clientMac=`, `userName=`, `apName=`, `apLocation=`, `ssid=`, `rssi=`, …), classifies events as error / warning / success, and tracks each client's session lifecycle
@@ -162,7 +166,11 @@ Multiple files and shell globs are supported:
 netlog /var/log/syslog /var/log/kern.log
 netlog /var/log/firewall.log*
 netlog /var/log/firewall.log.10.gz
+zcat -f /var/log/syslog* | netlog --summary   # or just pipe the .gz in:
+cat /var/log/syslog.2.gz | netlog
 ```
+
+Gzip-compressed logs are decompressed automatically in every mode (viewer, follow, piped, `--summary`, `--client`), whether they are files or piped into stdin. netlog checks the file's contents, not its name, so a rotated `syslog.2` that is really gzip data also works. If an archive is truncated or corrupt, netlog prints a warning and uses the lines it could read.
 
 ### Load only the lines you need (`-g` / `--grep`)
 
@@ -201,7 +209,7 @@ Every timestamp in a line is converted, not only the first. Each keeps its layou
 | RFC 2822 | `Fri, 01 Mar 2024 12:00:00 UTC` | Samba auth, mail |
 | `date=` / `time=` fields | `date=2024-03-01 time=12:00:00` | Fortinet, Sophos |
 
-A timestamp with an explicit offset (`+02:00`, `+0000`, `Z`, a trailing `UTC`/`GMT`) is converted from that offset. The converted value gets the local offset or zone name, so the analytics still see the correct moment. Syslog dates have no year, so netlog uses the most recent year that doesn't put the line more than a day in the future. Numeric epochs (Squid, Meraki, auditd `msg=audit(…)`) are absolute and left as they are. The viewer status bar, the follow-mode header and the `--summary` header show the zone, e.g. `times in CST (UTC-06:00)`. `-g` patterns match the converted text.
+The clock time is always read as UTC, even when the timestamp has an offset attached (`-06:00`, `+0000`). Syslog servers such as rsyslog often stamp their own zone onto a device's zoneless UTC time. Ruckus SmartZone lines relayed this way read `01:52:36-06:00` while their own epoch fields (`disconnectTime=`) say 01:52:36 UTC. Use `-U` only for logs whose times are UTC. The converted value gets the local offset or zone name, so the analytics still see the correct moment. Syslog dates have no year, so netlog uses the most recent year that doesn't put the line more than a day in the future. Numeric epochs (Squid, Meraki, auditd `msg=audit(…)`) are absolute and left as they are. The viewer status bar, the follow-mode header and the `--summary` header show the zone, with both standard and daylight time where they differ, e.g. `times in MST/MDT (UTC-07:00/-06:00)`. Each timestamp uses the offset in force on its own date. `-g` patterns match the converted text.
 
 ---
 
@@ -564,7 +572,7 @@ netlog -f -g 10.146. -g '!dhcp' /var/log/syslog
 - `l` toggles wrapping of long lines: wrapped rows are indented, or with wrapping off lines are cut at the screen edge
 - `q` quits
 - `--alert PATTERN` triggers a terminal bell and highlights matching lines with `▶` when the pattern matches a new line
-- `.gz` files are decompressed and displayed, then exit (compressed files cannot be followed)
+- Gzip files (with or without a `.gz` name) are decompressed and displayed, then exit (compressed files cannot be followed)
 - Log rotation is handled automatically: if the file is truncated or replaced (the usual `logrotate` pattern), netlog detects it and resumes streaming from the start of the new file, printing a `[Log rotated — resuming from new file]` notice
 
 ---
@@ -588,6 +596,7 @@ A `unittest` suite (stdlib only, no test framework dependency) covers the pure l
 
 - Viewer: highlighting/segment priority, dedup, column stripping, search and match navigation, the filter and `-g` syntax, line wrapping
 - CLI argument parsing, including every threshold option
+- Gzip input: detection by content, files without a `.gz` name, piped gzip, truncated archives
 - UTC → local conversion (`-U`): every timestamp layout, date rollover, lines left alone, and every format example still parsing after conversion
 - Log format detection: every example line of every format (the same ones `netlog --formats` shows)
 - Structured analysis: field parsing, timestamps, failure loops, diagnostic rules, network and security findings, the analytics alerts and text detectors, report and timeline output, live loop grouping

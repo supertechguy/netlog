@@ -16,6 +16,8 @@ import urllib.parse
 import array
 import mmap
 import gzip
+import io
+import zlib
 import os
 import tempfile
 import argparse
@@ -41,7 +43,7 @@ try:
 except ImportError:
     HAS_GEOIP = False
 
-VERSION = '1.7.0'
+VERSION = '1.8.0'
 
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # bytes — above this, use mmap index
 
@@ -301,7 +303,6 @@ _GEO_CACHE  = {}
 
 
 def _geoip_fetch(account_id, license_key):
-    import io
     base_url = "https://download.maxmind.com/geoip/databases/GeoLite2-City/download?suffix=tar.gz"
     sha_url  = base_url + ".sha256"
     mgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
@@ -1619,7 +1620,7 @@ def piped_mode(vendors, mac_map, ctr, prefs=None, keep=None, xform=None):
     corr = LiveCorrelator(mac_map, ctr)
     emit = _Output(prefs if prefs is not None else {})
     try:
-        for line in sys.stdin:
+        for line in safe_lines(open_stdin(), 'stdin'):
             line = line.rstrip('\n')
             if xform:
                 line = xform(line)
@@ -1703,9 +1704,9 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
     def wanted(line):
         return (egrep_re is None or egrep_re.search(line)) and (keep is None or keep(line))
 
-    if log_file.name.endswith('.gz'):
-        with gzip.open(log_file, 'rt', errors='replace') as gz:
-            all_lines = gz.read().splitlines()
+    if is_gzip(log_file):
+        with open_log(log_file) as gz:
+            all_lines = [l.rstrip('\r\n') for l in safe_lines(gz, log_file)]
         all_lines = [l for l in map(conv, all_lines) if wanted(l)]
         for line in all_lines[-tail_lines_count:]:
             out = _strip_cols(line, hidden_cols) if hidden_cols else line
@@ -1821,14 +1822,68 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
         save_color_map(COLOR_FILE, mac_map, ctr[0], col_hidden)
 
 
+_GZIP_MAGIC = b'\x1f\x8b'
+_GZ_ERRORS  = (EOFError, gzip.BadGzipFile, zlib.error)
+
+
+def is_gzip(path):
+    """True if the file is gzip-compressed, judged by its magic bytes, so
+    rotated logs without a .gz name (syslog.2, a renamed download) count."""
+    try:
+        with open(path, 'rb') as f:
+            return f.read(2) == _GZIP_MAGIC
+    except OSError:
+        return False
+
+
+def _gz_warning(name, err):
+    print(f'netlog: {name}: compressed data is truncated or corrupt ({err}); '
+          f'using what could be read', file=sys.stderr, flush=True)
+
+
+def open_log(path):
+    """Open a log file as text, decompressing it if it is gzip data."""
+    if is_gzip(path):
+        return gzip.open(path, 'rt', encoding='utf-8', errors='replace')
+    return open(path, errors='replace')
+
+
+def open_stdin():
+    """sys.stdin as text, decompressed if gzip data is piped in
+    (cat syslog.2.gz | netlog)."""
+    buf = getattr(sys.stdin, 'buffer', None)
+    if buf is not None and hasattr(buf, 'peek'):
+        try:
+            if buf.peek(2)[:2] == _GZIP_MAGIC:
+                return io.TextIOWrapper(gzip.GzipFile(fileobj=buf), encoding='utf-8',
+                                        errors='replace')
+        except (OSError, ValueError):
+            pass
+    return sys.stdin
+
+
+def safe_lines(fh, name):
+    """Lines of fh; a truncated or corrupt gzip stream ends with a warning
+    instead of a traceback (common while a rotated log is still being
+    compressed)."""
+    try:
+        yield from fh
+    except _GZ_ERRORS as e:
+        _gz_warning(name, e)
+
+
 def _decompress_gz(src):
-    """Decompress a .gz file to a NamedTemporaryFile; caller must delete it."""
+    """Decompress a gzip file to a NamedTemporaryFile; caller must delete it."""
     print(f"Decompressing {src.name}...", file=sys.stderr)
     tf = tempfile.NamedTemporaryFile(delete=False, suffix='.log')
     try:
         with gzip.open(src, 'rb') as gz:
             while True:
-                chunk = gz.read(8 * 1024 * 1024)
+                try:
+                    chunk = gz.read(8 * 1024 * 1024)
+                except _GZ_ERRORS as e:
+                    _gz_warning(src, e)
+                    break
                 if not chunk:
                     break
                 tf.write(chunk)
@@ -1873,7 +1928,7 @@ def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=No
     temps   = []   # temp paths to delete on exit
     actual  = []   # (real_path, display_path) pairs
     for f in files:
-        if f.name.endswith('.gz'):
+        if is_gzip(f):
             tmp = _decompress_gz(f)
             temps.append(tmp)
             actual.append((tmp, f))
@@ -2085,8 +2140,11 @@ def _bsd_epoch(text):
 # Rewrites every recognised timestamp in a line from UTC to this machine's
 # local timezone (TZ / /etc/localtime, DST-aware per timestamp), keeping each
 # timestamp's own layout: padding, separators, fractional seconds and offset
-# style. Timestamps that carry an explicit offset (ISO 8601 '+02:00', web
-# access '+0000', a trailing 'UTC') are converted from that offset instead.
+# style. The clock time is always taken as UTC, even when the timestamp
+# carries an offset: syslog servers commonly stamp their own zone onto a
+# device's zoneless UTC time (Ruckus via rsyslog: '01:52:36-06:00' whose
+# epoch fields say 01:52:36 UTC), and -U is the user saying "these are UTC".
+# The rewritten timestamp gets the local offset, so it stays a true instant.
 # Numeric epochs (Squid, Meraki, auditd) are absolute and left as they are.
 
 _MON_ALT = 'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec'
@@ -2128,15 +2186,11 @@ _LOCALIZE_CACHE = {}
 _HMS_ANCHOR    = re.compile(r'(?<![0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:)\d\d:\d\d:\d\d(?!:[0-9A-Fa-f]{2}:)')
 
 
-def _local_dt(y, mo, d, h, mi, s, off='', tzinfo=None):
-    """Local-time datetime for wall-clock parts at UTC (or at offset `off`
-    like '+0100' / '-05:00')."""
-    if off and off not in ('Z', 'UTC', 'GMT', 'UT'):
-        digits = off[1:].replace(':', '')
-        delta  = datetime.timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
-        tzinfo = datetime.timezone(delta if off[0] == '+' else -delta)
+def _local_dt(y, mo, d, h, mi, s, off=''):
+    """Local-time datetime for wall-clock parts read as UTC. Any stated
+    offset `off` is deliberately ignored (see above)."""
     return datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(s),
-                             tzinfo=tzinfo or _UTC).astimezone()
+                             tzinfo=_UTC).astimezone()
 
 
 def _off_like(dt, orig):
@@ -2248,10 +2302,17 @@ def utc_to_local(line):
 
 
 def local_tz_label():
-    """'EST (UTC-05:00)' for the machine's current timezone."""
-    t = datetime.datetime.now().astimezone()
-    z = t.strftime('%z')
-    return f'{t.tzname()} (UTC{z[:3]}:{z[3:]})'
+    """'MST/MDT (UTC-07:00/-06:00)' for the machine's timezone, or
+    'UTC (UTC+00:00)' without DST. Each timestamp uses the offset in force
+    on its own date, so both are shown."""
+    year = datetime.datetime.now().year
+    seen = {}
+    for mon in (1, 7):                       # winter and summer, either hemisphere
+        t = datetime.datetime(year, mon, 1, 12, tzinfo=_UTC).astimezone()
+        z = t.strftime('%z')
+        seen.setdefault(f'{z[:3]}:{z[3:]}', t.tzname())
+    offs = sorted(seen, key=lambda o: int(o[:3]) * 60 + (int(o[4:]) if o[0] == '+' else -int(o[4:])))
+    return f'{"/".join(seen[o] for o in offs)} (UTC{"/".join(offs)})'
 
 
 _HAS_ALPHA  = re.compile(r'[A-Za-z]')
@@ -7619,15 +7680,15 @@ def render_live(line, display, corr, vendors, mac_map, ctr):
 
 
 def iter_log_lines(files):
-    """Lines from the given files (.gz transparently), or stdin if none."""
+    """Lines from the given files, or stdin if none; gzip data (by content,
+    not name) is decompressed transparently."""
     if not files:
-        for line in sys.stdin:
+        for line in safe_lines(open_stdin(), 'stdin'):
             yield line.rstrip('\r\n')
         return
     for f in files:
-        opener = gzip.open if f.name.endswith('.gz') else open
-        with opener(f, 'rt', errors='replace') as fh:
-            for line in fh:
+        with open_log(f) as fh:
+            for line in safe_lines(fh, f):
                 yield line.rstrip('\r\n')
 
 
@@ -7692,8 +7753,9 @@ def build_arg_parser():
                     help='Treat log timestamps as UTC and show them in this machine\'s local '
                          'timezone (TZ), in every mode. Every recognised layout is rewritten in '
                          'place (syslog, ISO 8601, ctime, web access, BIND, nginx, Palo Alto, '
-                         'Fortinet date=/time=, ...); ones with an explicit offset are converted '
-                         'from that offset. Numeric epochs are left alone.')
+                         'Fortinet date=/time=, ...). The clock time is read as UTC even if '
+                         'an offset is attached (syslog servers often stamp their own zone on '
+                         'UTC device times). Numeric epochs are left alone.')
     p.add_argument('--setup-geoip', dest='setup_geoip', action='store_true',
                     help='Configure (or reconfigure) MaxMind GeoIP credentials, then exit')
     w = p.add_mutually_exclusive_group()

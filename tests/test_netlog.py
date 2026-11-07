@@ -1143,7 +1143,9 @@ class UtcToLocalTest(unittest.TestCase):
             ('Mar  1 12:00:00 gw kernel: x',          'Mar  1 07:00:00 gw kernel: x'),
             ('Jul 12 12:00:00 gw x',                  'Jul 12 08:00:00 gw x'),       # EDT
             ('2024-03-01T12:00:00Z gw',               '2024-03-01T07:00:00-05:00 gw'),
-            ('2024-03-01T12:00:00.5+02:00',           '2024-03-01T05:00:00.5-05:00'),
+            # A stated offset is ignored: the clock time is read as UTC.
+            ('2024-03-01T12:00:00.5+02:00',           '2024-03-01T07:00:00.5-05:00'),
+            ('2026-10-31T01:52:36-06:00 Core: @@204', '2026-10-30T21:52:36-04:00 Core: @@204'),
             ('2024-03-01 12:00:00,123 fail2ban',      '2024-03-01 07:00:00,123 fail2ban'),
             ('x 2024-03-01 12:00:00.000 +00:00 y',    'x 2024-03-01 07:00:00.000 -05:00 y'),
             ('2024/03/01 12:00:00 [error]',           '2024/03/01 07:00:00 [error]'),
@@ -1196,6 +1198,63 @@ class UtcToLocalTest(unittest.TestCase):
     def test_cli_flag(self):
         self.assertIs(netlog.parse_cli(['-U', 'x.log']).xform, netlog.utc_to_local)
         self.assertIsNone(netlog.parse_cli(['x.log']).xform)
+
+
+class GzipInputTest(unittest.TestCase):
+    """Gzip data is found by its magic bytes, whatever the file is called."""
+
+    LINES = ['Mar  1 12:00:00 gw kernel: a', 'Mar  1 12:00:01 gw kernel: b']
+
+    def setUp(self):
+        import gzip, tempfile
+        self.dir = Path(tempfile.mkdtemp())
+        self.data = gzip.compress(('\n'.join(self.LINES) + '\n').encode())
+        self.gz, self.noext, self.plain = (self.dir / n for n in ('a.log.gz', 'syslog.2', 'p.log'))
+        self.gz.write_bytes(self.data)
+        self.noext.write_bytes(self.data)
+        self.plain.write_text('\n'.join(self.LINES) + '\n')
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.dir)
+
+    def test_is_gzip(self):
+        self.assertTrue(netlog.is_gzip(self.gz))
+        self.assertTrue(netlog.is_gzip(self.noext))
+        self.assertFalse(netlog.is_gzip(self.plain))
+        self.assertFalse(netlog.is_gzip(self.dir / 'missing'))
+
+    def test_iter_log_lines_any_name(self):
+        lines = list(netlog.iter_log_lines([self.gz, self.noext, self.plain]))
+        self.assertEqual(lines, self.LINES * 3)
+
+    def test_decompress_without_gz_name(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            tmp = netlog._decompress_gz(self.noext)
+        try:
+            self.assertEqual(tmp.read_text().splitlines(), self.LINES)
+        finally:
+            tmp.unlink()
+
+    def test_truncated_keeps_what_was_read(self):
+        import gzip
+        big = gzip.compress(''.join(f'line {i} {i * 7919 % 10007}\n'
+                                    for i in range(20000)).encode())
+        cut = self.dir / 'cut.gz'
+        cut.write_bytes(big[:len(big) // 2])
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            lines = list(netlog.iter_log_lines([cut]))
+        self.assertGreater(len(lines), 100)
+        self.assertEqual(lines[0], 'line 0 0')
+        self.assertIn('truncated or corrupt', err.getvalue())
+
+    def test_stdin_gzip_and_plain(self):
+        for raw in (self.data, ('\n'.join(self.LINES) + '\n').encode()):
+            stdin = io.TextIOWrapper(io.BufferedReader(io.BytesIO(raw)))
+            with self.subTest(gz=raw[:2] == b'\x1f\x8b'), \
+                    unittest.mock.patch.object(netlog.sys, 'stdin', stdin):
+                self.assertEqual(list(netlog.iter_log_lines([])), self.LINES)
 
 
 if __name__ == '__main__':
