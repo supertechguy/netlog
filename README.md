@@ -4,11 +4,14 @@
 
 # netlog
 
-A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. It recognises 42 log formats: network gear from Cisco, Juniper, Aruba, Ruckus, Fortinet, Palo Alto, UniFi, Meraki, MikroTik, pfSense and more (wireless, switching, routing, firewalls), and Linux servers (Apache, nginx, Squid, BIND, dnsmasq, ISC dhcpd, Samba, Postfix, Dovecot, FTP, FreeRADIUS, fail2ban, systemd, auditd, sshd), plus any `key="value"` log. It correlates events per client, user, AP, interface and source IP to find failure loops, flapping links, login attacks, port scans and other problems. It produces a ranked security and error analytics report, health summaries and per-client timelines. You can filter logs down to the lines you care about as they load (`-g`). No external dependencies beyond the Python standard library.
+A terminal network log viewer and analyzer written in Python. Designed for sysadmins and network engineers who live in the shell — it adds smart color highlighting, vendor identification, GeoIP lookup, and a full interactive TUI on top of any log file. It recognises 42 log formats: network gear from Cisco, Juniper, Aruba, Ruckus, Fortinet, Palo Alto, UniFi, Meraki, MikroTik, pfSense and more (wireless, switching, routing, firewalls), and Linux servers (Apache, nginx, Squid, BIND, dnsmasq, ISC dhcpd, Samba, Postfix, Dovecot, FTP, FreeRADIUS, fail2ban, systemd, auditd, sshd), plus any `key="value"` log. It correlates events per client, user, AP, interface and source IP to find failure loops, flapping links, login attacks, port scans and other problems. It produces a ranked security and error analytics report, health summaries and per-client timelines. You can filter logs down to the lines you care about as they load (`-g`), and show UTC timestamps in your local timezone (`-U`). No external dependencies beyond the Python standard library.
 
 ---
 
 ## What's new
+
+**1.7.0**
+- `-U` / `--utc-to-local` rewrites UTC log timestamps into this machine's local timezone, in every mode. Every timestamp layout netlog recognises is converted in place and keeps its layout (see [Show UTC logs in local time](#show-utc-logs-in-local-time--u----utc-to-local)).
 
 **1.6.0**
 - Linux server and service logs: Apache and nginx access and error logs (with mod_security), Squid, BIND, dnsmasq, ISC dhcpd, Samba, Postfix, Dovecot, vsftpd / ProFTPD / Pure-FTPd, fail2ban, systemd and auditd. FreeRADIUS now also reports unknown clients, shared-secret mismatches and dead home servers.
@@ -47,6 +50,7 @@ A terminal network log viewer and analyzer written in Python. Designed for sysad
 - **GeoIP lookup** — optionally annotates IP addresses with city/country using MaxMind GeoLite2
 - **Interactive TUI** — full-screen curses viewer with search, filter, dedup, analytics, column hiding, line wrapping and export
 - **Load-time filter (`-g`)** — load only the lines matching one or more patterns, in the viewer, analytics, summaries, follow mode and piped mode
+- **UTC → local time (`-U`)** — rewrites every recognised timestamp from UTC into the machine's timezone, keeping each log's own timestamp layout
 - **Line wrapping** — long lines wrap at word boundaries with indented continuation rows, or are cut and panned sideways (`l`, `--wrap`/`--no-wrap`)
 - **Large file support** — files over 50 MB are accessed via `mmap` + a byte-offset index so only the visible screen is ever in RAM
 - **Automatic `.gz` decompression** — open compressed logs directly; follow mode handles them gracefully too
@@ -131,6 +135,7 @@ deleted, and the data folder is removed only if it's then empty.
 ```
 netlog <file> [file2 ...]                   Interactive TUI viewer
 netlog -g PATTERN <file> ...                Load only lines matching PATTERN (any mode)
+netlog -U <file> ...                        Show UTC timestamps in local time (any mode)
 netlog -f <file>                            Follow mode (like tail -f)
 netlog -f -n 50 <file>                      Follow, showing last 50 lines first
 netlog -f "pattern" <file>                  Follow, only showing lines matching pattern
@@ -172,6 +177,31 @@ netlog --summary -g 10.146. schools.log        # analytics on just those lines
 ```
 
 The syntax is the same as the `f` filter in the viewer: plain text is a case-insensitive substring (a `.` is a literal dot, unlike in `grep`), `a|b` matches either, a leading `!` excludes, and `r:REGEX` is a case-insensitive regex. Plain text matches anywhere, so `10.146.2.7` also matches `10.146.2.70`; use `r:\b…\b` for an exact address. Before the viewer opens, matching lines are copied to a temporary file (deleted on exit). Big results still use large-file mode. The status bar shows `[N of M lines loaded]` and `[Grep: …]`. You can still use `f` to narrow the view further. If nothing matches, netlog says so and exits.
+
+### Show UTC logs in local time (`-U` / `--utc-to-local`)
+
+Many devices and servers log in UTC. `-U` treats their timestamps as UTC and rewrites them in this machine's local timezone (from `TZ` or `/etc/localtime`). Each timestamp gets its own daylight-saving offset. It works in the viewer, follow mode, piped mode, `--summary` and `--client`:
+
+```bash
+netlog -U /var/log/firewall.log                # viewer, times in local time
+netlog -U -f /var/log/syslog                   # follow mode
+TZ=America/Chicago netlog -U --summary fw.log  # analytics in a chosen zone
+```
+
+Every timestamp in a line is converted, not only the first. Each keeps its layout (padding, separators, fractional seconds and offset style), and the date, weekday and year change when the conversion crosses midnight. The layouts it recognises are:
+
+| Layout | Example | Used by |
+|---|---|---|
+| BSD syslog | `Mar  1 12:00:00`, `*Mar 1 12:00:00.123 UTC` | syslog, most network gear, Cisco |
+| ctime | `Fri Mar  1 12:00:00 2024`, `[Fri Mar 01 12:00:00.123 2024]` | FreeRADIUS, vsftpd, Apache error, Comware |
+| ISO 8601 | `2024-03-01T12:00:00Z`, `2024-03-01 12:00:00,123` | RFC 5424 syslog, Check Point, fail2ban, ISE, SonicWall |
+| Slash date | `2024/03/01 12:00:00` | nginx error, Palo Alto, Samba |
+| Web access (CLF) | `01/Mar/2024:12:00:00 +0000` | Apache / nginx access logs |
+| BIND | `01-Mar-2024 12:00:00.123` | BIND query/general logs |
+| RFC 2822 | `Fri, 01 Mar 2024 12:00:00 UTC` | Samba auth, mail |
+| `date=` / `time=` fields | `date=2024-03-01 time=12:00:00` | Fortinet, Sophos |
+
+A timestamp with an explicit offset (`+02:00`, `+0000`, `Z`, a trailing `UTC`/`GMT`) is converted from that offset. The converted value gets the local offset or zone name, so the analytics still see the correct moment. Syslog dates have no year, so netlog uses the most recent year that doesn't put the line more than a day in the future. Numeric epochs (Squid, Meraki, auditd `msg=audit(…)`) are absolute and left as they are. The viewer status bar, the follow-mode header and the `--summary` header show the zone, e.g. `times in CST (UTC-06:00)`. `-g` patterns match the converted text.
 
 ---
 
@@ -558,6 +588,7 @@ A `unittest` suite (stdlib only, no test framework dependency) covers the pure l
 
 - Viewer: highlighting/segment priority, dedup, column stripping, search and match navigation, the filter and `-g` syntax, line wrapping
 - CLI argument parsing, including every threshold option
+- UTC → local conversion (`-U`): every timestamp layout, date rollover, lines left alone, and every format example still parsing after conversion
 - Log format detection: every example line of every format (the same ones `netlog --formats` shows)
 - Structured analysis: field parsing, timestamps, failure loops, diagnostic rules, network and security findings, the analytics alerts and text detectors, report and timeline output, live loop grouping
 - Server logs: web attack signatures, web, DNS, DHCP, mail, Samba, fail2ban, RADIUS and systemd findings, Samba multi-line timestamps, aggregation of high-volume events and the Servers & services section

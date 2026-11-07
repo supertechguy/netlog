@@ -1114,5 +1114,89 @@ class AnalysisCliTest(unittest.TestCase):
                 netlog.parse_cli(argv)
 
 
+class UtcToLocalTest(unittest.TestCase):
+    """-U rewrites UTC timestamps into the local zone, keeping each layout."""
+
+    def setUp(self):
+        import os, time
+        self._tz = os.environ.get('TZ')
+        os.environ['TZ'] = 'America/New_York'      # EST -05:00 / EDT -04:00
+        time.tzset()
+        netlog._LOCALIZE_CACHE.clear()
+
+    def tearDown(self):
+        import os, time
+        if self._tz is None:
+            os.environ.pop('TZ', None)
+        else:
+            os.environ['TZ'] = self._tz
+        time.tzset()
+        netlog._LOCALIZE_CACHE.clear()
+
+    def check(self, cases):
+        for src, want in cases:
+            with self.subTest(src=src):
+                self.assertEqual(netlog.utc_to_local(src), want)
+
+    def test_layouts(self):
+        self.check([
+            ('Mar  1 12:00:00 gw kernel: x',          'Mar  1 07:00:00 gw kernel: x'),
+            ('Jul 12 12:00:00 gw x',                  'Jul 12 08:00:00 gw x'),       # EDT
+            ('2024-03-01T12:00:00Z gw',               '2024-03-01T07:00:00-05:00 gw'),
+            ('2024-03-01T12:00:00.5+02:00',           '2024-03-01T05:00:00.5-05:00'),
+            ('2024-03-01 12:00:00,123 fail2ban',      '2024-03-01 07:00:00,123 fail2ban'),
+            ('x 2024-03-01 12:00:00.000 +00:00 y',    'x 2024-03-01 07:00:00.000 -05:00 y'),
+            ('2024/03/01 12:00:00 [error]',           '2024/03/01 07:00:00 [error]'),
+            ('[01/Mar/2024:12:00:00 +0000] "GET',     '[01/Mar/2024:07:00:00 -0500] "GET'),
+            ('01-Mar-2024 12:00:00.123 client',       '01-Mar-2024 07:00:00.123 client'),
+            ('[Fri, 01 Mar 2024 12:00:00.1 UTC]',     '[Fri, 01 Mar 2024 07:00:00.1 EST]'),
+            ('Fri Mar  1 12:00:00 2024 : Error',      'Fri Mar  1 07:00:00 2024 : Error'),
+            ('[Fri Mar 01 12:00:00.123456 2024]',     '[Fri Mar 01 07:00:00.123456 2024]'),
+            ('%Mar  1 12:00:00:000 2024 SW1',         '%Mar  1 07:00:00:000 2024 SW1'),
+            ('*Mar  1 12:00:00.123 UTC: %LINK',       '*Mar  1 07:00:00.123 EST: %LINK'),
+            ('date=2024-03-01 time=12:00:00 dev=x',   'date=2024-03-01 time=07:00:00 dev=x'),
+            ('time="2024-03-01 12:00:00" fw=1',       'time="2024-03-01 07:00:00" fw=1'),
+        ])
+
+    def test_date_rolls_back(self):
+        self.check([
+            ('2024-01-01T02:00:00Z',            '2023-12-31T21:00:00-05:00'),
+            ('Mon Jan  1 02:00:00 2024',        'Sun Dec 31 21:00:00 2023'),
+            ('Jan 10 03:00:00 h',               'Jan  9 22:00:00 h'),   # day field width kept
+            ('date=2024-03-01 time=02:00:00',   'date=2024-02-29 time=21:00:00'),
+        ])
+
+    def test_every_timestamp_in_line(self):
+        self.check([('<14>Mar  1 12:00:00 PA-1 1,2024/03/01 12:00:00,0132,TRAFFIC,deny,1,'
+                     '2024/03/01 12:00:00,203.0.113.5',
+                     '<14>Mar  1 07:00:00 PA-1 1,2024/03/01 07:00:00,0132,TRAFFIC,deny,1,'
+                     '2024/03/01 07:00:00,203.0.113.5')])
+
+    def test_left_alone(self):
+        for line in ('MAC=00:11:22:33:44:55 SRC=10.0.0.1', 'uptime 12:00:00',
+                     '1709294400.123    234 10.0.0.5 TCP_MISS/200', '2024-13-45 12:00:00',
+                     'AP[AP-1@11:22:33:44:55:66]', 'no colon here'):
+            with self.subTest(line=line):
+                self.assertEqual(netlog.utc_to_local(line), line)
+
+    def test_analysis_epoch_unchanged_by_offset_style(self):
+        # A Z timestamp rewritten to local still parses to the same instant.
+        src = '2024-03-01T12:00:00Z host sshd[1]: x'
+        self.assertEqual(netlog.parse_timestamp(netlog.utc_to_local(src)),
+                         netlog.parse_timestamp(src))
+
+    def test_every_format_example_still_parses(self):
+        for fmt in netlog.FORMATS:
+            for line, kind, fields in fmt.examples:
+                with self.subTest(fmt=fmt.id, line=line[:40]):
+                    p = netlog._parse_event(netlog.utc_to_local(line))
+                    self.assertIsNotNone(p)
+                    self.assertEqual(p.kind, kind)
+
+    def test_cli_flag(self):
+        self.assertIs(netlog.parse_cli(['-U', 'x.log']).xform, netlog.utc_to_local)
+        self.assertIsNone(netlog.parse_cli(['x.log']).xform)
+
+
 if __name__ == '__main__':
     unittest.main()

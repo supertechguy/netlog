@@ -41,7 +41,7 @@ try:
 except ImportError:
     HAS_GEOIP = False
 
-VERSION = '1.6.0'
+VERSION = '1.7.0'
 
 LARGE_FILE_THRESHOLD = 50 * 1024 * 1024   # bytes — above this, use mmap index
 
@@ -1615,12 +1615,14 @@ def _tui(stdscr, lines, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, 
 
 # ── Run modes ─────────────────────────────────────────────────────────────────
 
-def piped_mode(vendors, mac_map, ctr, prefs=None, keep=None):
+def piped_mode(vendors, mac_map, ctr, prefs=None, keep=None, xform=None):
     corr = LiveCorrelator(mac_map, ctr)
     emit = _Output(prefs if prefs is not None else {})
     try:
         for line in sys.stdin:
             line = line.rstrip('\n')
+            if xform:
+                line = xform(line)
             if keep and not keep(line):
                 continue
             emit(render_live(line, line, corr, vendors, mac_map, ctr))
@@ -1679,7 +1681,7 @@ def _read_new_lines(log_file, state):
 
 def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
               col_hidden=None, file_base=None, egrep_pat=None, prefs=None, keep=None,
-              grep=''):
+              grep='', xform=None):
     hidden_cols = (col_hidden or {}).get(file_base or '', 0)
     corr        = LiveCorrelator(mac_map, ctr)
     prefs       = prefs if prefs is not None else {}
@@ -1694,6 +1696,9 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
         print(_a(f'[filter: {egrep_pat}]', '0;36'), flush=True)
     if keep:
         print(_a(f'[grep: {grep}]', '0;36'), flush=True)
+    if xform:
+        print(_a(f'[times: UTC → {local_tz_label()}]', '0;36'), flush=True)
+    conv = xform or (lambda l: l)
 
     def wanted(line):
         return (egrep_re is None or egrep_re.search(line)) and (keep is None or keep(line))
@@ -1701,7 +1706,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
     if log_file.name.endswith('.gz'):
         with gzip.open(log_file, 'rt', errors='replace') as gz:
             all_lines = gz.read().splitlines()
-        all_lines = [l for l in all_lines if wanted(l)]
+        all_lines = [l for l in map(conv, all_lines) if wanted(l)]
         for line in all_lines[-tail_lines_count:]:
             out = _strip_cols(line, hidden_cols) if hidden_cols else line
             emit(render_live(line, out, corr, vendors, mac_map, ctr))
@@ -1709,7 +1714,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
         return   # can't follow a compressed file
 
     tail_lines = _tail_lines(log_file, tail_lines_count)
-    tail_lines = [l for l in tail_lines if wanted(l)]
+    tail_lines = [l for l in map(conv, tail_lines) if wanted(l)]
     for line in tail_lines:
         out = _strip_cols(line, hidden_cols) if hidden_cols else line
         emit(render_live(line, out, corr, vendors, mac_map, ctr))
@@ -1732,7 +1737,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
                 new_lines, rotated = _read_new_lines(log_file, state)
                 if rotated:
                     sys.stdout.write('\r\033[0;33m[Log rotated — resuming from new file]\033[0m\r\n')
-                for line in new_lines:
+                for line in map(conv, new_lines):
                     if not wanted(line):
                         continue
                     buf.append(line)
@@ -1795,7 +1800,7 @@ def tail_mode(log_file, tail_lines_count, vendors, mac_map, ctr, alert_pat=None,
             new_lines, rotated = _read_new_lines(log_file, state)
             if rotated:
                 sys.stdout.write('\r\033[0;33m[Log rotated — resuming from new file]\033[0m\r\n')
-            for line in new_lines:
+            for line in map(conv, new_lines):
                 if not wanted(line):
                     continue
                 buf.append(line)
@@ -1832,22 +1837,26 @@ def _decompress_gz(src):
     return Path(tf.name)
 
 
-def _prefilter(actual, keep, label):
-    """Copy the lines matching `keep` from each (real, display) file into one
-    temp file (with a separator line per file when there are several).
+def _prefilter(actual, keep, label, xform=None):
+    """Copy the lines matching `keep` (all lines if None) from each (real,
+    display) file into one temp file, rewritten by `xform` if given (with a
+    separator line per file when there are several).
     Returns (temp_path, matched, total)."""
     tf = tempfile.NamedTemporaryFile('w', delete=False, suffix='.log',
                                      encoding='utf-8', errors='replace')
     matched = total = 0
     try:
         for real, disp in actual:
-            print(f'Filtering {disp} for {label}…', file=sys.stderr, flush=True)
+            print(f'Filtering {disp} for {label}…' if keep else
+                  f'Converting {disp} to local time…', file=sys.stderr, flush=True)
             header = f'{"─"*4} {disp} {"─"*4}\n' if len(actual) > 1 else None
             with open(real, encoding='utf-8', errors='replace', newline='') as fh:
                 for line in fh:
                     total += 1
                     line = line.rstrip('\r\n')
-                    if keep(line):
+                    if xform:
+                        line = xform(line)
+                    if keep is None or keep(line):
                         if header:
                             tf.write(header)
                             header = None
@@ -1859,7 +1868,7 @@ def _prefilter(actual, keep, label):
 
 
 def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=None, file_base=None,
-                     prefs=None, keep=None, grep=''):
+                     prefs=None, keep=None, grep='', xform=None):
     # Decompress any .gz files to temp files first
     temps   = []   # temp paths to delete on exit
     actual  = []   # (real_path, display_path) pairs
@@ -1873,13 +1882,16 @@ def interactive_mode(files, vendors, mac_map, ctr, alert_pat=None, col_hidden=No
 
     try:
         msg = ''
-        if keep:
-            tmp, matched, total = _prefilter(actual, keep, grep)
+        if keep or xform:
+            tmp, matched, total = _prefilter(actual, keep, grep, xform)
             temps.append(tmp)
-            if not matched:
+            if keep and not matched:
                 sys.exit(f'No lines match {grep} ({total:,} lines searched)')
             actual = [(tmp, tmp)]
-            msg = f'{matched:,} of {total:,} lines loaded'
+            if keep:
+                msg = f'{matched:,} of {total:,} lines loaded'
+            if xform:
+                msg = ', '.join(filter(None, (msg, f'times in {local_tz_label()}')))
         real_files = [r for r, _ in actual]
         total_size = sum(r.stat().st_size for r in real_files)
 
@@ -2068,8 +2080,182 @@ def _bsd_epoch(text):
         return None
 
 
+# ── UTC → local time (-U) ─────────────────────────────────────────────────────
+#
+# Rewrites every recognised timestamp in a line from UTC to this machine's
+# local timezone (TZ / /etc/localtime, DST-aware per timestamp), keeping each
+# timestamp's own layout: padding, separators, fractional seconds and offset
+# style. Timestamps that carry an explicit offset (ISO 8601 '+02:00', web
+# access '+0000', a trailing 'UTC') are converted from that offset instead.
+# Numeric epochs (Squid, Meraki, auditd) are absolute and left as they are.
+
+_MON_ALT = 'Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec'
+_DOW_ALT = 'Mon|Tue|Wed|Thu|Fri|Sat|Sun'
+_MON_ABBR = ('Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+             'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec')
+_DOW_ABBR = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+_HMS = r'(?P<{0}h>\d\d):(?P<{0}mi>\d\d):(?P<{0}s>[0-5]\d)'
+
+_LOCALIZE_RE = re.compile('|'.join((
+    # ISO 8601 / RFC 3339 / Python logging: 2024-03-01T12:00:00.123Z,
+    # 2024-03-01 12:00:00,123, ISE's 2024-03-01 12:00:00.000 +00:00
+    r'(?P<iso>(?<![\d.\-/])(?P<iy>\d{4})-(?P<imo>\d\d)-(?P<id>\d\d)(?P<isep>[T ])' + _HMS.format('i')
+    + r'(?P<ifrac>[.,]\d+)?(?:(?P<itz>Z)|(?P<isp> ?)(?P<ioff>[+-]\d\d:?\d\d)(?![\d:]))?)',
+    # Fortinet / Sophos key=value pairs — date=2024-03-01 time=12:00:00
+    r'(?P<kv>\bdate=(?P<q>"?)(?P<ky>\d{4})-(?P<kmo>\d\d)-(?P<kd>\d\d)(?P=q) time=(?P=q)'
+    + _HMS.format('k') + r'(?P=q))',
+    # Slash dates: nginx error, Palo Alto, Samba headers — 2024/03/01 12:00:00
+    r'(?P<sl>(?<![\d/])(?P<sy>\d{4})/(?P<smo>\d\d)/(?P<sd>\d\d) ' + _HMS.format('s') + r')',
+    # Apache/nginx access (CLF) — 01/Mar/2024:12:00:00 +0000
+    r'(?P<clf>(?<!\d)(?P<cd>\d\d)/(?P<cmon>' + _MON_ALT + r')/(?P<cy>\d{4}):' + _HMS.format('c')
+    + r' (?P<coff>[+-]\d{4}))',
+    # BIND — 01-Mar-2024 12:00:00.123
+    r'(?P<dmy>(?<![\d\-])(?P<dd>\d{1,2})-(?P<dmon>' + _MON_ALT + r')-(?P<dy>\d{4})(?P<dsep>[ :])'
+    + _HMS.format('d') + r')',
+    # RFC 2822 (mail, Samba) — Fri, 01 Mar 2024 12:00:00.123456 UTC
+    r'(?P<rfc>(?:(?P<rdow>' + _DOW_ALT + r'), )?(?<!\d)(?P<rd>\d{1,2}) (?P<rmon>' + _MON_ALT
+    + r') (?P<ry>\d{4}) ' + _HMS.format('r')
+    + r'(?P<rfrac>\.\d+)?(?: (?P<rtz>UTC|GMT|UT|[+-]\d{4})\b)?)',
+    # BSD syslog / ctime / Cisco / Comware — Mar  1 12:00:00, *Mar 1 12:00:00.123 UTC,
+    # Fri Mar  1 12:00:00 2024, Mar 1 2024 12:00:00, Mar  1 12:00:00:000 2024
+    r'(?P<bsd>\b(?:(?P<bdow>' + _DOW_ALT + r')(?P<bsp0> +))?(?P<bmon>' + _MON_ALT
+    + r')(?P<bsp1> +)(?P<bd>\d{1,2})(?P<bsp2> +)(?:(?P<by0>\d{4}) )?' + _HMS.format('b')
+    + r'(?P<bfrac>[.:]\d+)?(?:(?P<bysp> +)(?P<by>\d{4})(?![\d:]))?(?: (?P<btz>UTC|GMT)\b)?)',
+)))
+_UTC = datetime.timezone.utc
+_LOCALIZE_CACHE = {}
+# HH:MM:SS that isn't three groups of a colon-separated MAC address.
+_HMS_ANCHOR    = re.compile(r'(?<![0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}:)\d\d:\d\d:\d\d(?!:[0-9A-Fa-f]{2}:)')
+
+
+def _local_dt(y, mo, d, h, mi, s, off='', tzinfo=None):
+    """Local-time datetime for wall-clock parts at UTC (or at offset `off`
+    like '+0100' / '-05:00')."""
+    if off and off not in ('Z', 'UTC', 'GMT', 'UT'):
+        digits = off[1:].replace(':', '')
+        delta  = datetime.timedelta(hours=int(digits[:2]), minutes=int(digits[2:]))
+        tzinfo = datetime.timezone(delta if off[0] == '+' else -delta)
+    return datetime.datetime(int(y), int(mo), int(d), int(h), int(mi), int(s),
+                             tzinfo=tzinfo or _UTC).astimezone()
+
+
+def _off_like(dt, orig):
+    """dt's UTC offset written in the style of the original zone text."""
+    z = dt.strftime('%z')
+    if orig in ('UTC', 'GMT', 'UT'):
+        return dt.tzname() or z
+    if orig == 'Z' and z == '+0000':
+        return 'Z'
+    return z if orig[-3:-2] != ':' and orig != 'Z' else f'{z[:3]}:{z[3:]}'
+
+
+def _day_like(d, orig):
+    """Day number zero-padded if the original was ('01'), else bare ('1')."""
+    return f'{d:02}' if len(orig) == 2 and orig[0] == '0' else str(d)
+
+
+def _localize_one(m):
+    g, kind = m.group, m.lastgroup
+    if kind == 'iso':
+        tz = g('itz') or g('ioff') or ''
+        t  = _local_dt(g('iy'), g('imo'), g('id'), g('ih'), g('imi'), g('is'), tz)
+        return (f'{t:%Y-%m-%d}{g("isep")}{t:%H:%M:%S}{g("ifrac") or ""}'
+                + (f'{g("isp") or ""}{_off_like(t, tz)}' if tz else ''))
+    if kind == 'kv':
+        t, q = _local_dt(g('ky'), g('kmo'), g('kd'), g('kh'), g('kmi'), g('ks')), g('q')
+        return f'date={q}{t:%Y-%m-%d}{q} time={q}{t:%H:%M:%S}{q}'
+    if kind == 'sl':
+        t = _local_dt(g('sy'), g('smo'), g('sd'), g('sh'), g('smi'), g('ss'))
+        return f'{t:%Y/%m/%d %H:%M:%S}'
+    if kind == 'clf':
+        t = _local_dt(g('cy'), _MONTHS[g('cmon').lower()], g('cd'), g('ch'), g('cmi'), g('cs'),
+                      g('coff'))
+        return f'{t.day:02}/{_MON_ABBR[t.month - 1]}/{t:%Y:%H:%M:%S} {_off_like(t, g("coff"))}'
+    if kind == 'dmy':
+        t = _local_dt(g('dy'), _MONTHS[g('dmon').lower()], g('dd'), g('dh'), g('dmi'), g('ds'))
+        return (f'{_day_like(t.day, g("dd"))}-{_MON_ABBR[t.month - 1]}-{t.year}'
+                f'{g("dsep")}{t:%H:%M:%S}')
+    if kind == 'rfc':
+        tz = g('rtz') or ''
+        t  = _local_dt(g('ry'), _MONTHS[g('rmon').lower()], g('rd'), g('rh'), g('rmi'),
+                       g('rs'), tz)
+        return ((f'{_DOW_ABBR[t.weekday()]}, ' if g('rdow') else '')
+                + f'{_day_like(t.day, g("rd"))} {_MON_ABBR[t.month - 1]} {t.year} '
+                + f'{t:%H:%M:%S}{g("rfrac") or ""}' + (f' {_off_like(t, tz)}' if tz else ''))
+    # BSD-style: no year means the most recent one that isn't > 1 day ahead.
+    mon  = _MONTHS[g('bmon').lower()]
+    year = g('by') or g('by0')
+    tz   = g('btz') or ''
+    parts = (mon, g('bd'), g('bh'), g('bmi'), g('bs'))
+    if year:
+        t = _local_dt(year, *parts)
+    else:
+        year = time.gmtime(_NOW).tm_year
+        try:
+            t = _local_dt(year, *parts)
+            if t.timestamp() > _NOW + 86400:
+                raise ValueError
+        except ValueError:
+            t = _local_dt(year - 1, *parts)
+    out = ''
+    if g('bdow'):
+        out = f'{_DOW_ABBR[t.weekday()]}{g("bsp0")}'
+    # Keep the day field's width, so 'Mar  1' / 'Mar 12' columns stay aligned.
+    field = g('bsp1') + g('bd')
+    out  += f'{_MON_ABBR[t.month - 1]} ' + _day_like(t.day, g('bd')).rjust(len(field) - 1)
+    out += g('bsp2') + (f'{t.year} ' if g('by0') else '') + f'{t:%H:%M:%S}' + (g('bfrac') or '')
+    if g('by'):
+        out += f'{g("bysp")}{t.year}'
+    return out + (f' {_off_like(t, tz)}' if tz else '')
+
+
+def _localize_sub(m):
+    text = m.group()
+    out  = _LOCALIZE_CACHE.get(text)
+    if out is None:
+        try:
+            out = _localize_one(m)
+        except (ValueError, OverflowError, OSError, KeyError):
+            out = text                       # impossible date: leave it alone
+        if len(_LOCALIZE_CACHE) > 8192:
+            _LOCALIZE_CACHE.clear()
+        _LOCALIZE_CACHE[text] = out
+    return out
+
+
+def utc_to_local(line):
+    """`line` with every recognised UTC timestamp shown in local time."""
+    # Every format has HH:MM:SS, so find those cheaply and only run the full
+    # pattern in a window around each (a whole-line sub is ~10x slower).
+    if ':' not in line:
+        return line
+    out, last, pos = [], 0, 0
+    while True:
+        h = _HMS_ANCHOR.search(line, pos)
+        if h is None:
+            break
+        m = _LOCALIZE_RE.search(line, max(last, h.start() - 26), h.end() + 48)
+        if m is None:
+            pos = h.end()
+            continue
+        out.append(line[last:m.start()])
+        out.append(_localize_sub(m))
+        last = pos = m.end()
+    if not out:
+        return line
+    out.append(line[last:])
+    return ''.join(out)
+
+
+def local_tz_label():
+    """'EST (UTC-05:00)' for the machine's current timezone."""
+    t = datetime.datetime.now().astimezone()
+    z = t.strftime('%z')
+    return f'{t.tzname()} (UTC{z[:3]}:{z[3:]})'
+
+
 _HAS_ALPHA  = re.compile(r'[A-Za-z]')
-ParsedEvent = namedtuple('ParsedEvent', 'name fields kind ts fmt vsev', defaults=('kv', None))
+ParsedEvent =namedtuple('ParsedEvent', 'name fields kind ts fmt vsev', defaults=('kv', None))
 
 
 def _parse_generic(line):
@@ -7445,12 +7631,14 @@ def iter_log_lines(files):
                 yield line.rstrip('\r\n')
 
 
-def analysis_mode(files, vendors, summary=False, client=None, keep=None, grep=''):
+def analysis_mode(files, vendors, summary=False, client=None, keep=None, grep='', xform=None):
     color = sys.stdout.isatty() and 'NO_COLOR' not in os.environ
     ctx   = {norm_mac(client)} if client and norm_mac(client) else None
     an    = Analyzer(context_macs=ctx)
     try:
         for line in iter_log_lines(files):
+            if xform:
+                line = xform(line)
             if keep is None or keep(line):
                 an.feed(line)
     except OSError as e:
@@ -7460,6 +7648,8 @@ def analysis_mode(files, vendors, summary=False, client=None, keep=None, grep=''
         sources = ', '.join(str(f) for f in files) if files else 'stdin'
         if keep:
             sources += f'  (grep: {grep})'
+        if xform:
+            sources += f'  (times: UTC → {local_tz_label()})'
         print(format_summary(rep, vendors, color, sources))
     if client:
         if summary:
@@ -7485,6 +7675,7 @@ def build_arg_parser():
             '  netlog -f --alert DENY /var/log/fw.log   Follow with alert bell\n'
             '  cat file.log | netlog                    Piped/ANSI mode\n'
             '  netlog -g 10.146. schools.log            Load only lines containing 10.146.\n'
+            '  netlog -U /var/log/fw.log                Show UTC timestamps in local time\n'
             '  netlog --summary /var/log/wlc.log        Health summary report\n'
             '  netlog --client alice /var/log/wlc.log   Timeline for one user or MAC\n'
             '  netlog --setup-geoip                     Configure MaxMind GeoIP'
@@ -7497,6 +7688,12 @@ def build_arg_parser():
                     help='Lines to show initially in follow mode (default: 10)')
     p.add_argument('--alert', dest='alert_pat', metavar='PATTERN',
                     help='Bell + highlight new lines matching this regex in follow mode')
+    p.add_argument('-U', '--utc-to-local', dest='utc_local', action='store_true',
+                    help='Treat log timestamps as UTC and show them in this machine\'s local '
+                         'timezone (TZ), in every mode. Every recognised layout is rewritten in '
+                         'place (syslog, ISO 8601, ctime, web access, BIND, nginx, Palo Alto, '
+                         'Fortinet date=/time=, ...); ones with an explicit offset are converted '
+                         'from that offset. Numeric epochs are left alone.')
     p.add_argument('--setup-geoip', dest='setup_geoip', action='store_true',
                     help='Configure (or reconfigure) MaxMind GeoIP credentials, then exit')
     w = p.add_mutually_exclusive_group()
@@ -7607,6 +7804,7 @@ def parse_cli(argv=None):
     except (ValueError, re.error) as e:
         p.error(f'invalid --grep pattern: {e}')
     ns.grep_label = grep_label(ns.grep)
+    ns.xform = utc_to_local if ns.utc_local else None
     try:
         re.compile(ns.legacy_ssid)
     except re.error as e:
@@ -7663,7 +7861,7 @@ def main():
             sys.exit('Usage: netlog --summary|--client MAC|USER <file> [file2 ...]  '
                      '(or pipe the log in)')
         analysis_mode(log_files, load_oui(OUI_FILE), opts.summary, opts.client,
-                      opts.keep, opts.grep_label)
+                      opts.keep, opts.grep_label, opts.xform)
         return
 
     vendors = load_oui(OUI_FILE)
@@ -7692,7 +7890,7 @@ def _run_view_mode(opts, prefs, vendors, mac_map, ctr, col_hidden):
     follow, tail_lines, log_files = opts.follow, opts.tail_lines, opts.log_files
     alert_pat, egrep_pat = opts.alert_pat, opts.egrep_pat
     if not sys.stdin.isatty():
-        piped_mode(vendors, mac_map, ctr, prefs, opts.keep)
+        piped_mode(vendors, mac_map, ctr, prefs, opts.keep, opts.xform)
     elif follow:
         if not log_files:
             sys.exit('Usage: netlog -f [-n N] [--alert PATTERN] ["egrep_pattern"] <file>')
@@ -7701,14 +7899,14 @@ def _run_view_mode(opts, prefs, vendors, mac_map, ctr, col_hidden):
             sys.exit(f"File not found: {lf}")
         file_base = _file_base(lf)
         tail_mode(lf, tail_lines, vendors, mac_map, ctr, alert_pat, col_hidden, file_base, egrep_pat,
-                  prefs, opts.keep, opts.grep_label)
+                  prefs, opts.keep, opts.grep_label, opts.xform)
     elif log_files:
         missing = [f for f in log_files if not f.exists()]
         if missing:
             sys.exit(f"File not found: {missing[0]}")
         file_base = _file_base(log_files[0])
         interactive_mode(log_files, vendors, mac_map, ctr, alert_pat, col_hidden, file_base,
-                         prefs, opts.keep, opts.grep_label)
+                         prefs, opts.keep, opts.grep_label, opts.xform)
     else:
         print('Usage: netlog [-f] [-n N] [--alert PATTERN] ["egrep_pattern"] <file> [file2 ...]',
               file=sys.stderr)
